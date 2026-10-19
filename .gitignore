@@ -1,0 +1,35 @@
+# 系统杂项
+.DS_Store
+Thumbs.db
+[Dd]esktop.ini
+
+# 编辑器临时文件；共享编辑器配置不整体忽略
+*.swp
+*.swo
+*~
+
+# 本地环境与凭证文件；脱敏示例可以版本管理
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+
+# 防止误放仓库根目录的私人数据进入 Git；不屏蔽同名源码或测试夹具
+/private/
+/data/
+/backups/
+
+# 临时和打包内容应存放在 README 约定的仓外目录
+/tmp/
+/temp/
+/logs/
+/test-results/
+/build/
+/dist/
+/dists/
+/mumu_lbcut_tool_dev/
+/mumu_lbcut_tool_tmp/
+/mumu_lbcut_tool_dists/
+
+# 技术栈确定后按实际工具补充依赖与缓存规则
