@@ -22,7 +22,7 @@
 1. **控制权独占与非阻塞主循环**：录制管线（`WorkerPipeline`）的所有生命周期操作（创建、切片切换、强制终止）以及外部 NDJSON 切片事件的发射，严格由 Worker 主线程单线程串行执行。所有耗时外部操作（HTTP 查询、截帧、身份读取、ffprobe 校验等）均不得在主线程中执行长等待同步阻塞，必须通过受控后台只读任务或带剩余预算的可轮询调用完成，确保主循环以秒级 tick 可靠感知子进程生命周期；
 2. **纯观察者看门狗与动作队列**：`StallWatchdog` 退化为纯观察者，仅负责周期采样与卡顿研判；当判定需要自愈切片或致命退出时，仅向线程安全的 `queue.Queue` 投递结构化动作请求（如 `ACTION_REFRESH_INTENT`、`ACTION_RECYCLE_SEGMENT`、`ACTION_FATAL_STALL`）；
 3. **代际 ID 强校验与动作去重**：主线程维护单调递增的整数 `generation_id` 并向看门狗发布只读快照。看门狗动作请求必须携带采样时的代际 ID；主线程出队时，旧代际请求（`req.generation_id < self.generation_id`）一律丢弃，同代际内的重复自愈动作进行合并去重；
-4. **严格状态流转与 STOPPING 优先级**：系统状态严格遵循 `PREFLIGHT` → `RECORDING` ↔ `RECOVERING` → `STOPPING` → `STOPPED`。一旦进入 `STOPPING`，所有恢复与新切片启动逻辑被强行阻断；
+4. **严格状态流转与 STOPPING 优先级**：系统状态严格遵循主方案完整迁移矩阵（`PREFLIGHT → RECORDING | STOPPING`、`RECORDING → RECOVERING | STOPPING`、`RECOVERING → RECORDING | STOPPING`、`STOPPING → STOPPED`）。一旦进入 `STOPPING`，所有恢复与新切片启动逻辑被强行阻断；退出事件 reason 严格按主方案契约精确区分，不再混淆未确诊与明确错房、也不再将多种失败笼统归为同一原因；
 5. **幂等清理收尾**：`cleanup()` 过程具备重入幂等保护，确保在任何退出路径下切片终态事件（`segment_finished` 或 `segment_aborted`）恰好发射一次，并对 OS 级别强杀（如 SIGKILL）明确保证边界。
 
 ## 3. 权衡与后果 (Consequences)
