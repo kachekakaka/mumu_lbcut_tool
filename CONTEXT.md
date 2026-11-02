@@ -49,7 +49,7 @@ Worker 针对已识别的抖音访客遮罩维护的白名单安全动作集合�
 _Avoid_: 自动弹窗关闭器, 暴力破解, 盲探脚本
 
 **Single-writer Pipeline Pattern (管线单写者模式)**:
-录制管线操作（启动、关停、切片重启及切片索引递增）独占归属于 Worker 主控制线程，看门狗等辅助线程仅通过动作队列投递动作请求，禁止多线程并发直接调用管线。
+录制管线操作（启动、关停、切片重启及切片索引递增）与生命周期事件独占归属于 Worker 主控制线程；耗时外部操作由只读后台任务或可轮询过程执行；看门狗仅通过动作队列投递带代际 ID 的动作请求，禁止多线程并发直接调用管线。
 _Avoid_: 多线程管线控制, 自由互斥锁控制
 
 **Pre-flight Stall (开录门禁超时未推流)**:
@@ -61,13 +61,17 @@ _Avoid_: 门禁登录失败, 开录假死
 _Avoid_: 打开房间失败, 门禁拦截
 
 **Worker Lifecycle State Machine (Worker 生命周期状态机)**:
-控制 Worker 从前置准备、正常切片录制、有界自愈恢复到终止收尾的有向状态模型（PREFLIGHT -> RECORDING <-> RECOVERING -> STOPPING -> STOPPED），约束心跳状态与事件发射时序。
+控制 Worker 生命周期演进的严格有向状态模型（PREFLIGHT -> RECORDING | STOPPING, RECORDING -> RECOVERING | STOPPING, RECOVERING -> RECORDING | STOPPING, STOPPING -> STOPPED），约束心跳上报、切片终态事件与非阻塞故障检测。
 _Avoid_: 任务状态, 控制循环
 
 **Segment Generation ID (切片代际 ID)**:
-主控制器维护的单调递增代际编号，随每次切片启动或管线重建自增，看门狗动作请求必须附带采样时的代际 ID，过期请求由主线程直接丢弃以防旧切片动作污染新切片。
+主控制器维护的单调递增代际编号，随每次切片启动或管线重建自增；看门狗动作请求必须附带采样时的代际 ID；主线程严格丢弃旧代际请求并对同代际重复请求去重合并，杜绝跨切片状态污染。
 _Avoid_: 切片序号, 任务批次
 
 **Target Room Identity Verification (目标直播间身份核验)**:
-在开录前置门禁与运行期，通过 UI 控件或局部 OCR 核验当前前台主播是否确为目标房间，杜绝因系统跳转或推荐流切换而误录其他主播。
+在开录前置门禁与运行期，通过稳定 UI 节点或兜底 OCR 核验当前前台主播是否确为目标房间，分为 VERIFIED、MISMATCH 与 UNCONFIRMED 三态，阻断录错房间风险。
 _Avoid_: 房间号匹配, 页面校验
+
+**Accepted Engineering Limitation (已接受工程限制)**:
+在当前架构权衡下明确被系统设计接受的已知物理限制（如 F-09 中断式重启导致的秒级切片空档），对其建立精确度量体系，不作未经验证的零缺口虚假承诺。
+_Avoid_: 系统设计缺陷, 临时放宽
