@@ -32,4 +32,17 @@ Thumbs.db
 /mumu_lbcut_tool_tmp/
 /mumu_lbcut_tool_dists/
 
+# Python 缓存与字节码
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# 本地调试与临时采样文件
+scripts/*.png
+scripts/*.jpg
+scripts/*.xml
+scripts/seg1_timeline/
+
 # 技术栈确定后按实际工具补充依赖与缓存规则

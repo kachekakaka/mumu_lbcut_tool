@@ -13,12 +13,23 @@ docs/
 ├─ 设计说明.md                      按需
 ├─ 待办.md                          按需
 ├─ 术语.md                          按需
-├─ 方案/                            按需
-│  └─ YYYYMMDD-任务名称.md
-├─ 证据/验证/                       按需
-│  └─ YYYYMMDD-任务名称.md
-└─ adr/                             按需
-   └─ NNNN-决定名称.md
+├─ 方案/
+│  ├─ [20261020-MVP技术可行性验证方案.md](方案/20261020-MVP技术可行性验证方案.md)
+│  ├─ [20261031-录播Worker规格与实施方案.md](方案/20261031-录播Worker规格与实施方案.md)
+│  ├─ [20261101-开录前置门禁与视觉看门狗实施方案.md](方案/20261101-开录前置门禁与视觉看门狗实施方案.md)
+│  └─ [20261101-未登录弹窗阻断治理与门禁加固方案.md](方案/20261101-未登录弹窗阻断治理与门禁加固方案.md)
+├─ 证据/验证/
+│  ├─ [20261020-MVP技术可行性验证.md](证据/验证/20261020-MVP技术可行性验证.md)
+│  ├─ [20261031-录播Worker技术验证.md](证据/验证/20261031-录播Worker技术验证.md)
+│  └─ [20261101-开录前置门禁与视觉看门狗技术验证.md](证据/验证/20261101-开录前置门禁与视觉看门狗技术验证.md)
+└─ adr/
+   ├─ [0001-scrcpy-pipeline-for-audio-video-isolation.md](adr/0001-scrcpy-pipeline-for-audio-video-isolation.md)
+   ├─ [0002-time-segmented-mp4-recording.md](adr/0002-time-segmented-mp4-recording.md)
+   ├─ [0003-hybrid-room-status-verification.md](adr/0003-hybrid-room-status-verification.md)
+   ├─ [0004-decoupling-worker-from-orchestrator.md](adr/0004-decoupling-worker-from-orchestrator.md)
+   ├─ [0005-ndjson-event-stream-contract.md](adr/0005-ndjson-event-stream-contract.md)
+   ├─ [0006-stall-watchdog-and-av-sync.md](adr/0006-stall-watchdog-and-av-sync.md)
+   └─ [0007-preflight-content-gate-and-visual-watchdog.md](adr/0007-preflight-content-gate-and-visual-watchdog.md)
 
 archive/docs/                       仓库根目录下，按需
 ├─ 方案/                            已退出活动管理的方案
@@ -33,9 +44,9 @@ archive/docs/                       仓库根目录下，按需
 | `docs/设计说明.md` | 当前架构、模块职责、数据与接口约束，以及代码和测试入口 | 技术设计确定后 |
 | `docs/待办.md` | 未完工作、已知缺陷、未验证事项及对应依据 | 出现需跨任务跟踪的事项时 |
 | `docs/术语.md` | 易混概念及业务术语，不重复实现参数 | 确有术语解释需要时 |
-| `docs/方案/YYYYMMDD-任务名称.md` | 待审阅、待实施、实施中、待验证或暂停的专项方案 | 用户要求或同意编写方案时 |
+| [docs/方案/](方案/) | 待审阅、待实施、实施中、待验证或暂停的专项方案 | 用户要求或同意编写方案时 |
 | `docs/证据/验证/YYYYMMDD-任务名称.md` | 需要长期保留的验证摘要、环境、结果、未测项与外部材料位置 | 形成有留存价值的验证结论时 |
-| `docs/adr/NNNN-决定名称.md` | 仍有效的重大取舍、原因和影响 | 存在值得长期解释的设计决定时 |
+| [docs/adr/](adr/) | 仍有效的重大取舍、原因和影响 | 存在值得长期解释的设计决定时 |
 | `tests/README.md` | 已建立的测试入口、场景、隔离方法及结果判定方式 | 测试体系建立后 |
 | `archive/docs/方案/` | 已退出活动管理的方案 | 满足下文归档条件时 |
 | `archive/docs/adr/` | 已失效或被替代的设计决定 | 决定失效或被替代时 |
