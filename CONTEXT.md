@@ -59,3 +59,15 @@ _Avoid_: 门禁登录失败, 开录假死
 **Navigation Failed (导航拉起失败)**:
 通过 ADB 拉起目标直播间 Intent 失败或目标 Activity 异常，在进入画面核验前即确诊的底层通信与设备故障。
 _Avoid_: 打开房间失败, 门禁拦截
+
+**Worker Lifecycle State Machine (Worker 生命周期状态机)**:
+控制 Worker 从前置准备、正常切片录制、有界自愈恢复到终止收尾的有向状态模型（PREFLIGHT -> RECORDING <-> RECOVERING -> STOPPING -> STOPPED），约束心跳状态与事件发射时序。
+_Avoid_: 任务状态, 控制循环
+
+**Segment Generation ID (切片代际 ID)**:
+主控制器维护的单调递增代际编号，随每次切片启动或管线重建自增，看门狗动作请求必须附带采样时的代际 ID，过期请求由主线程直接丢弃以防旧切片动作污染新切片。
+_Avoid_: 切片序号, 任务批次
+
+**Target Room Identity Verification (目标直播间身份核验)**:
+在开录前置门禁与运行期，通过 UI 控件或局部 OCR 核验当前前台主播是否确为目标房间，杜绝因系统跳转或推荐流切换而误录其他主播。
+_Avoid_: 房间号匹配, 页面校验
