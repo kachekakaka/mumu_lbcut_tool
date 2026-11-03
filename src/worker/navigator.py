@@ -6,6 +6,7 @@ import time
 import re
 
 from src.mvp.config import get_adb_exe
+from src.worker.adb_client import AdbDeviceClient
 
 logger = logging.getLogger(__name__)
 
@@ -20,17 +21,21 @@ class WorkerNavigator:
         self.adb_exe = adb_exe or get_adb_exe()
         if not self.adb_exe or not self.adb_exe.exists():
             raise FileNotFoundError(f"未找到 adb.exe: {self.adb_exe}")
+        self.adb_client = AdbDeviceClient(serial=self.serial, adb_exe=self.adb_exe)
 
-    def _adb(self, *args: str) -> str:
-        """执行 ADB 命令，遇到断连自动重连。"""
-        cmd = [str(self.adb_exe), "-s", self.serial, *args]
-        res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
-        output = res.stdout.strip() or res.stderr.strip()
-        if "not found" in output or "offline" in output:
-            subprocess.run([str(self.adb_exe), "connect", self.serial], capture_output=True, text=True)
-            res2 = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
-            output = res2.stdout.strip()
-        return output
+    def _adb(self, *args: str, timeout: float = 5.0) -> str:
+        """执行 ADB 命令，遇到断连自动有界重试。"""
+        try:
+            res = self.adb_client.run_adb(*args, timeout=timeout)
+            output = res.stdout.strip() or res.stderr.strip()
+            if "not found" in output or "offline" in output:
+                self.adb_client.ensure_connected(timeout=3.0)
+                res2 = self.adb_client.run_adb(*args, timeout=timeout)
+                output = res2.stdout.strip()
+            return output
+        except Exception as e:
+            logger.warning(f"执行 ADB 指令失败: {args}, 错误: {e}")
+            return ""
 
     def get_current_focus_package(self) -> str | None:
         """获取当前前台聚焦的应用包名。"""

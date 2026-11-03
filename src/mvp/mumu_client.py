@@ -149,11 +149,6 @@ class MuMuClient:
             if len(parts) >= 2 and parts[0] == serial and parts[1] == "device":
                 return serial
 
-        # 若已经在列表中
-        for line in lines[1:]:
-            parts = line.split()
-            if len(parts) >= 2 and parts[1] == "device":
-                if parts[0] == serial or len(lines) == 2:
-                    return parts[0]
-
-        return serial
+        # 严禁模糊匹配或串绑其他在线设备
+        logger.warning(f"实例 {vmindex} 的目标设备 {serial} 未处于 device 状态")
+        return None

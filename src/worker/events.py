@@ -4,16 +4,23 @@ import json
 import sys
 import time
 from typing import Any, TextIO
+import uuid
 
 
 @dataclass
 class BaseWorkerEvent:
     event: str
     timestamp: float = 0.0
+    mono_time: float = 0.0
+    event_id: str = ""
 
     def __post_init__(self):
         if not self.timestamp:
             self.timestamp = time.time()
+        if not self.mono_time:
+            self.mono_time = time.monotonic()
+        if not self.event_id:
+            self.event_id = uuid.uuid4().hex
 
 
 @dataclass
@@ -63,6 +70,14 @@ class SegmentFinishedEvent(BaseWorkerEvent):
     file_path: str = ""
     duration_sec: int = 0
     file_size_mb: float = 0.0
+
+
+@dataclass
+class SegmentAbortedEvent(BaseWorkerEvent):
+    event: str = "segment_aborted"
+    segment_index: int = 0
+    file_path: str = ""
+    reason: str = "unknown"
 
 
 @dataclass

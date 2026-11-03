@@ -5,20 +5,20 @@ from src.worker.navigator import WorkerNavigator
 
 
 class TestWorkerNavigator(unittest.TestCase):
-    @patch("subprocess.run")
+    @patch("src.worker.adb_client.AdbDeviceClient.run_adb")
     def test_launch_live_room(self, mock_run):
         mock_run.side_effect = [
-            MagicMock(returncode=0, stdout="Starting: Intent { act=android.intent.action.VIEW dat=snssdk1128://live/... }", stderr=""),
-            MagicMock(returncode=0, stdout="mCurrentFocus=Window{123 u0 com.ss.android.ugc.aweme/.live.LivePlayActivity}", stderr=""),
-            MagicMock(returncode=0, stdout="mCurrentFocus=Window{123 u0 com.ss.android.ugc.aweme/.live.LivePlayActivity}", stderr=""),
+            MagicMock(exit_code=0, stdout="Starting: Intent { act=android.intent.action.VIEW dat=snssdk1128://live/... }", stderr=""),
+            MagicMock(exit_code=0, stdout="mCurrentFocus=Window{123 u0 com.ss.android.ugc.aweme/.live.LivePlayActivity}", stderr=""),
+            MagicMock(exit_code=0, stdout="mCurrentFocus=Window{123 u0 com.ss.android.ugc.aweme/.live.LivePlayActivity}", stderr=""),
         ]
         nav = WorkerNavigator(serial="127.0.0.1:16448")
         ok = nav.launch_room("737141", wait_sec=0)
         self.assertTrue(ok)
 
-    @patch("subprocess.run")
+    @patch("src.worker.adb_client.AdbDeviceClient.run_adb")
     def test_refresh_current_room(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=0, stdout="Starting: Intent ...", stderr="")
+        mock_run.return_value = MagicMock(exit_code=0, stdout="Starting: Intent ...", stderr="")
         nav = WorkerNavigator(serial="127.0.0.1:16448")
         ok = nav.refresh_current_room("737141")
         self.assertTrue(ok)
@@ -39,13 +39,14 @@ class TestWorkerNavigator(unittest.TestCase):
         passed = nav.verify_preflight_content_gate(timeout_sec=2.0)
         self.assertTrue(passed)
 
-    @patch("subprocess.run")
+    @patch("src.worker.adb_client.AdbDeviceClient.run_adb")
     def test_dismiss_center_dialog(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        mock_run.return_value = MagicMock(exit_code=0, stdout="", stderr="")
         nav = WorkerNavigator(serial="127.0.0.1:16448")
         nav.dismiss_center_dialog()
         # 验证调用了 tap 330 1392 (点击拒绝按钮)
-        self.assertTrue(any("330" in str(arg) and "1392" in str(arg) for arg in mock_run.call_args[0]))
+        args_tuple = mock_run.call_args[0]
+        self.assertTrue("330" in args_tuple and "1392" in args_tuple)
 
     @patch("src.worker.navigator.WorkerNavigator.dismiss_center_dialog")
     @patch("src.worker.navigator.WorkerNavigator._capture_frame_array")

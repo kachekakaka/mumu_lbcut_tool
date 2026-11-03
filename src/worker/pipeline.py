@@ -7,6 +7,7 @@ import subprocess
 import time
 
 from src.mvp.config import SCRCPY_DIR, get_adb_exe
+from src.worker.scrcpy_probe import PipelineLogDrainer, parse_scrcpy_version_output, validate_scrcpy_policy
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,7 @@ class WorkerPipeline:
         self.current_segment_index: int = 0
         self.current_file_path: Path | None = None
         self._proc: subprocess.Popen | None = None
+        self._log_drainer: PipelineLogDrainer | None = None
         self._segment_start_time: float = 0.0
 
     def is_recording(self) -> bool:
@@ -42,6 +44,12 @@ class WorkerPipeline:
         if self._proc is None:
             return False
         return self._proc.poll() is None
+
+    def get_exit_code(self) -> int | None:
+        """获取录制子进程的退出码（若尚未退出返回 None）。"""
+        if self._proc is None:
+            return None
+        return self._proc.poll()
 
     def start_segment(self, segment_index: int) -> Path:
         """启动一个指定索引的独立切片 MP4 录制。"""
@@ -67,6 +75,7 @@ class WorkerPipeline:
             "--audio-source=playback",
             "--audio-codec=aac",
             "--video-codec=h264",
+            "--require-audio",
             "--display-id=0",
             f"--max-fps={self.max_fps}",
             f"--video-bit-rate={self.bit_rate}",
@@ -89,12 +98,17 @@ class WorkerPipeline:
             encoding="utf-8",
             errors="replace",
         )
+        # 挂接防背压排空器
+        self._log_drainer = PipelineLogDrainer(
+            self._proc,
+            on_log_line=lambda line: logger.debug(f"[scrcpy] {line}")
+        )
+        self._log_drainer.start()
         self._segment_start_time = time.time()
         time.sleep(1.5)  # 建立连接缓冲
 
         if not self.is_recording():
-            stdout, stderr = self._proc.communicate()
-            raise RuntimeError(f"切片 {segment_index} 启动失败 (code {self._proc.returncode}): {stderr or stdout}")
+            raise RuntimeError(f"切片 {segment_index} 启动失败 (code {self._proc.returncode})")
 
         logger.info(f"已开启新切片 #{segment_index}: {self.current_file_path.name}")
         return self.current_file_path
@@ -118,6 +132,10 @@ class WorkerPipeline:
                 self._proc.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 self._proc.kill()
+
+        if self._log_drainer:
+            self._log_drainer.join(timeout=1.0)
+            self._log_drainer = None
 
         # 等待 1 秒确保 Android 侧 scrcpy-server 彻底释放显存句柄
         time.sleep(1.0)
