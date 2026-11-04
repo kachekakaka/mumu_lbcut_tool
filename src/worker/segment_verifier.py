@@ -28,7 +28,7 @@ def verify_segment_file(
     file_path: Path,
     min_size_bytes: int = 100 * 1024,
     ffprobe_exe: Path | None = None,
-    timeout: float = 3.0,
+    timeout: float = 8.0,
     allow_short_tail: bool = False,
 ) -> SegmentValidationResult:
     """对生成的切片 MP4 执行三级完整性核验。
@@ -147,6 +147,7 @@ def finalize_segment(
     target_path: Path,
     ffprobe_exe: Path | None = None,
     allow_short_tail: bool = False,
+    timeout: float = 8.0,
 ) -> tuple[bool, Path, SegmentValidationResult]:
     """收尾并归档切片文件。
 
@@ -154,7 +155,7 @@ def finalize_segment(
     若目标已存在：绝不覆盖，拒绝成功，保留原文件并明确报错；
     若校验失败：更名为 <raw_path>.corrupted，阻止损坏文件流入下游。
     """
-    res = verify_segment_file(raw_path, ffprobe_exe=ffprobe_exe, allow_short_tail=allow_short_tail)
+    res = verify_segment_file(raw_path, ffprobe_exe=ffprobe_exe, allow_short_tail=allow_short_tail, timeout=timeout)
     target_path.parent.mkdir(parents=True, exist_ok=True)
 
     if res.is_valid:
