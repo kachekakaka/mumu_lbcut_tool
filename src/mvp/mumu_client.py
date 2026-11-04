@@ -129,25 +129,29 @@ class MuMuClient:
         calc_port = 16384 + 32 * int(vmindex)
         return f"{host}:{calc_port}"
 
-    def connect_adb(self, vmindex: int) -> str | None:
+    def connect_adb(self, vmindex: int, retries: int = 5, retry_interval_sec: float = 1.5) -> str | None:
         """建立 ADB 连接并返回设备 serial。"""
         serial = self.get_adb_serial(vmindex)
         logger.info(f"正在连接实例 {vmindex} 的 ADB: {serial}")
 
-        # 先通过 manager 触发连接
-        self._run_manager("adb", "-v", str(vmindex), "-c", "connect")
+        for attempt in range(1, retries + 1):
+            # 先通过 manager 触发连接
+            self._run_manager("adb", "-v", str(vmindex), "-c", "connect")
 
-        # 显式执行 adb connect
-        subprocess.run([str(self.adb_exe), "connect", serial], capture_output=True, text=True)
+            # 显式执行 adb connect
+            subprocess.run([str(self.adb_exe), "connect", serial], capture_output=True, text=True)
 
-        # 检查 devices
-        res = subprocess.run([str(self.adb_exe), "devices"], capture_output=True, text=True)
-        lines = [line.strip() for line in res.stdout.strip().splitlines() if line.strip()]
+            # 检查 devices
+            res = subprocess.run([str(self.adb_exe), "devices"], capture_output=True, text=True)
+            lines = [line.strip() for line in res.stdout.strip().splitlines() if line.strip()]
 
-        for line in lines[1:]:
-            parts = line.split()
-            if len(parts) >= 2 and parts[0] == serial and parts[1] == "device":
-                return serial
+            for line in lines[1:]:
+                parts = line.split()
+                if len(parts) >= 2 and parts[0] == serial and parts[1] == "device":
+                    return serial
+
+            if attempt < retries:
+                time.sleep(retry_interval_sec)
 
         # 严禁模糊匹配或串绑其他在线设备
         logger.warning(f"实例 {vmindex} 的目标设备 {serial} 未处于 device 状态")
