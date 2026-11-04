@@ -196,3 +196,35 @@ class WorkerNavigator:
 
         logger.error(f"开录前置门禁超时 ({timeout_sec}s)：画面仍为静止遮罩或未开始推流。")
         return False
+
+    def detect_current_room_identity(self) -> tuple[str | None, str | None]:
+        """从模拟器当前前台页面提取独立的主播身份证据 (UID 与 昵称)。
+
+        绝不拿目标待唤起的 ID 冒充观测结果！
+        若无法可靠取得稳定数字 UID，则 UID 返回 None，进入 UNCONFIRMED 判定流程。
+        """
+        try:
+            # 尝试通过 UI Automator dump 获取当前前台 UI 结构
+            res = self.adb_client.run_adb("exec-out", "uiautomator", "dump", "/dev/tty", timeout=4.0)
+            xml_content = res.stdout if (res.exit_code == 0 and "<node" in res.stdout) else ""
+            if not xml_content:
+                # 尝试标准 dump
+                self.adb_client.run_adb("shell", "uiautomator", "dump", "/sdcard/wp_ident.xml", timeout=5.0)
+                pull_res = self.adb_client.run_adb("shell", "cat", "/sdcard/wp_ident.xml", timeout=3.0)
+                xml_content = pull_res.stdout if pull_res.exit_code == 0 else ""
+
+            if xml_content:
+                # 寻找主播昵称节点
+                nick_match = re.search(r'<node[^>]*?resource-id="[^"]*?(?:user_name|author_name|name)[^"]*"[^>]*?text="([^"]+)"', xml_content)
+                detected_nick = nick_match.group(1).strip() if nick_match else None
+
+                # 寻找数字 UID（若有展示数字 ID）
+                uid_match = re.search(r'<node[^>]*?resource-id="[^"]*?(?:display_id|unique_id|author_id)[^"]*"[^>]*?text="(\d+)"', xml_content)
+                detected_uid = uid_match.group(1).strip() if uid_match else None
+
+                return detected_uid, detected_nick
+        except Exception as e:
+            logger.warning(f"探测前台主播身份证据异常: {e}")
+
+        # 未能取得或无法可靠识别时诚实返回 None，进入 UNCONFIRMED 分支
+        return None, None

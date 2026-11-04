@@ -6,6 +6,8 @@ import os
 import signal
 import sys
 import time
+from typing import Optional
+import uuid
 
 from src.mvp.dep_manager import DependencyManager
 from src.mvp.mumu_client import MuMuClient
@@ -31,7 +33,12 @@ from src.worker.state_machine import (
 from src.worker.navigator import WorkerNavigator
 from src.worker.pipeline import WorkerPipeline
 from src.worker.resolver import WorkerRoomResolver, RoomStatus
-from src.worker.naming_lock import build_segment_filename, WorkerInstanceLock, LockAcquisitionError
+from src.worker.naming_lock import (
+    build_segment_filename,
+    WorkerInstanceLock,
+    LockAcquisitionError,
+    get_shared_lock_dir,
+)
 from src.worker.popup_bypasser import PopupBypasser
 from src.worker.identity_verifier import verify_room_identity, IdentityStatus
 from src.worker.segment_verifier import finalize_segment, verify_segment_file
@@ -41,16 +48,16 @@ from src.worker.watchdog import StallWatchdog
 
 logger = logging.getLogger(__name__)
 
-# 退出码常量
+# 规范退出码常量
 EXIT_SUCCESS = 0
 EXIT_STREAM_ENDED = 2
 EXIT_TARGET_INVALID = 9
 EXIT_TARGET_OFFLINE = 10          # 确诊未开播
 EXIT_GATE_NETWORK_ERROR = 11      # 门禁检测服务异常
 EXIT_LOGIN_BLOCKED = 15           # 登录页或弹窗强阻断
-EXIT_ROOM_MISMATCH = 18           # 确诊错房
+EXIT_ROOM_MISMATCH = 18           # 确诊错房或身份未确认阻断
 EXIT_DEVICE_UNAVAILABLE = 20      # 设备离线或未就绪
-EXIT_RECORDING_FAILED = 30        # 录制崩溃或异常无法自愈
+EXIT_RECORDING_FAILED = 30        # 录制崩溃或产物校验失败无法自愈
 
 
 @dataclass
@@ -63,10 +70,20 @@ class WorkerConfig:
     heartbeat_interval_sec: float = 3.0
     stall_timeout_sec: float = 10.0
     allow_unconfirmed_identity: bool = False
+    lock_dir: Path | None = None
 
 
 class WorkerController:
-    """控制单路录制的生命周期、分段切片、看门狗自愈与优雅退出。"""
+    """控制单路录制的生命周期、分段切片、看门狗自愈与优雅退出。
+
+    严格遵循：
+    1. 权威切片状态单调演进，杜绝主循环与恢复函数状态割裂；
+    2. 切片事件成对闭环（每个 started 恰好对应一个 finished 或 aborted）；
+    3. 全流程统一产物完整性校验，校验失败严禁谎报成功；
+    4. 实例独占锁持有至管线彻底停止，独立 run_id 任务目录杜绝文件冲突；
+    5. 主播身份真实独立探测与运行期复核，逃逸开关边界明确；
+    6. 四维健康解耦与运行期下播检测真正接入主循环。
+    """
 
     def __init__(self, config: WorkerConfig, emitter: WorkerEventEmitter | None = None):
         self.config = config
@@ -74,17 +91,172 @@ class WorkerController:
         self.stop_requested = False
         self._fatal_error = False
         self._login_blocked = False
+        self._stream_ended = False
+        self._room_mismatch = False
+        self._last_segment_failed = False
         self._total_crash_count = 0
         self.MAX_RECOVERY_RETRIES = 3
+
+        # 权威任务级目录隔离 (原子排他)
+        self.run_id = f"run_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+        self.task_output_dir = self.config.output_dir / self.run_id
+
+        # 权威切片生命周期状态 (全局唯一事实来源)
+        self.current_segment_index: int = 0
+        self.current_generation_id: int = 0
+        self.current_file_path: Path | None = None
+        self.current_segment_started: bool = False
+        self.current_segment_finalized: bool = True
+        self.segment_start_mono: float = 0.0
+        self.last_size_mb: float = 0.0
+
+        # 组件实例
         self._pipeline: WorkerPipeline | None = None
         self._watchdog: StallWatchdog | None = None
+        self._navigator: WorkerNavigator | None = None
         self.state_machine = WorkerStateMachine(initial_state=WorkerState.PREFLIGHT)
         self.action_dispatcher = GenerationActionDispatcher()
-        self.current_generation_id = 0
+        self.health_monitor = HealthMonitor(
+            video_freeze_threshold_sec=self.config.stall_timeout_sec,
+            file_stall_threshold_sec=self.config.stall_timeout_sec,
+        )
+        self.stream_end_detector = StreamEndDetector(confirm_window_sec=5.0)
+
+        # 身份状态
+        self.identity_status: IdentityStatus = IdentityStatus.UNCONFIRMED
+        self.has_identity_risk: bool = False
+        self.target_room_id: str = ""
+        self.target_uid: str = ""
+        self.target_nickname: str = ""
 
     def request_stop(self):
         """外部中断信号触发平稳停止。"""
         self.stop_requested = True
+
+    def _start_new_segment(self) -> Path:
+        """单调递增开启新切片并同步更新全局权威状态。"""
+        # 若前一切片尚未收尾，必须先执行收尾，杜绝生命周期事件悬空
+        if self.current_segment_started and not self.current_segment_finalized:
+            self._finalize_current_segment(is_aborted=True, reason="previous_segment_not_finalized")
+
+        self.current_segment_index += 1
+        self.current_generation_id += 1
+        self.action_dispatcher.current_generation_id = self.current_generation_id
+
+        if not self._pipeline:
+            raise RuntimeError("Pipeline 未就绪，无法开启新切片")
+
+        cur_file = self._pipeline.start_segment(self.current_segment_index)
+        self.current_file_path = cur_file
+        self.current_segment_started = True
+        self.current_segment_finalized = False
+        self.segment_start_mono = time.monotonic()
+        self.last_size_mb = 0.0
+
+        self.emitter.emit(SegmentStartedEvent(
+            segment_index=self.current_segment_index,
+            file_path=str(cur_file),
+            target_duration_sec=self.config.segment_duration_sec
+        ))
+        cur_file_name = cur_file.name if hasattr(cur_file, "name") else str(cur_file)
+        logger.info(
+            f"已成功开启新切片 #{self.current_segment_index} (代际 {self.current_generation_id}): {cur_file_name}"
+        )
+        return cur_file
+
+    def _finalize_current_segment(
+        self,
+        is_aborted: bool = False,
+        reason: str = "",
+        allow_short_tail: bool = False,
+        ffprobe_exe: Path | None = None,
+    ) -> bool:
+        """统一切片收尾出口：执行封口、完整性核验、事件发射与安全归档。
+
+        每个已发射 segment_started 的切片，必须且只能对应一个 segment_finished 或 segment_aborted。
+        校验失败坚决不得发射 segment_finished！
+        """
+        if not self.current_segment_started or self.current_segment_finalized:
+            return True
+
+        idx = self.current_segment_index
+        raw_file = self.current_file_path or (self._pipeline.current_file_path if self._pipeline else None)
+        seg_dur = int(time.monotonic() - self.segment_start_mono) if self.segment_start_mono > 0 else 0
+        seg_size = self._pipeline.get_current_file_size_mb() if self._pipeline else 0.0
+
+        # 1. 停止物理管线
+        if self._pipeline and self._pipeline.is_recording():
+            self._pipeline.stop_segment()
+
+        # 2. 异常中止路径
+        if is_aborted or self._fatal_error or self._login_blocked or self._room_mismatch:
+            abort_reason = reason or "worker_aborted_by_error"
+            final_p = raw_file
+            raw_path_obj = Path(raw_file) if isinstance(raw_file, str) else raw_file
+            if raw_path_obj and hasattr(raw_path_obj, "exists") and raw_path_obj.exists():
+                corrupted_p = raw_path_obj.with_name(raw_path_obj.stem + ".corrupted")
+                try:
+                    if not corrupted_p.exists():
+                        raw_path_obj.replace(corrupted_p)
+                    final_p = corrupted_p
+                except Exception:
+                    final_p = raw_path_obj
+
+            self.emitter.emit(SegmentAbortedEvent(
+                segment_index=idx,
+                file_path=str(final_p or ""),
+                reason=abort_reason
+            ))
+            self.current_segment_finalized = True
+            self._last_segment_failed = True
+            logger.warning(f"切片 #{idx} 已异常中止归档: reason={abort_reason}, file={final_p}")
+            return False
+
+        # 3. 正常出口路径：必须通过完整性核验与归档
+        target_final_name = build_segment_filename(
+            room_id=self.target_room_id or "live",
+            start_epoch=int(time.time() - seg_dur),
+            segment_index=idx,
+            generation_id=self.current_generation_id,
+        )
+        target_final = self.task_output_dir / target_final_name
+        raw_path_obj = Path(raw_file) if isinstance(raw_file, str) else raw_file
+
+        if raw_path_obj and hasattr(raw_path_obj, "exists") and raw_path_obj.exists():
+            ok, final_p, res_obj = finalize_segment(
+                raw_path=raw_path_obj,
+                target_path=target_final,
+                ffprobe_exe=ffprobe_exe,
+                allow_short_tail=allow_short_tail,
+            )
+        else:
+            ok, final_p = False, raw_file or target_final
+            res_obj = None
+
+        if ok:
+            # 校验成功，发射 finished 事件
+            self.emitter.emit(SegmentFinishedEvent(
+                segment_index=idx,
+                file_path=str(final_p),
+                duration_sec=seg_dur,
+                file_size_mb=round(seg_size, 2)
+            ))
+            self.current_segment_finalized = True
+            self._last_segment_failed = False
+            logger.info(f"切片 #{idx} 校验合格并完成归档: {final_p.name} ({seg_dur}s, {seg_size:.2f}MB)")
+            return True
+        else:
+            # 校验失败，严禁伪报 finished，如实发射 aborted 事件
+            reject_msg = res_obj.reject_reason if res_obj else "file_missing_or_corrupt"
+            self.emitter.emit(SegmentAbortedEvent(
+                segment_index=idx,
+                file_path=str(final_p),
+                reason=f"validation_failed: {reject_msg}"
+            ))
+            self.current_segment_finalized = True
+            self._last_segment_failed = True
+            logger.error(f"切片 #{idx} 完整性校验未通过，标记损坏: {reject_msg}")
+            return False
 
     def run(self) -> int:
         """主执行循环，返回进程退出码。"""
@@ -102,6 +274,10 @@ class WorkerController:
             logger.error("直播间输入格式无效，无法解析。")
             return EXIT_TARGET_INVALID
 
+        self.target_room_id = resolved.room_id or resolved.web_rid
+        self.target_uid = resolved.room_id
+        self.target_nickname = resolved.nickname
+
         # 2. 开录门禁状态严格分流
         if resolved.status == RoomStatus.ENDED:
             logger.info("目标直播间当前确诊未开播。")
@@ -113,9 +289,12 @@ class WorkerController:
             sys.stderr.write("[开录门禁阻断] 门禁检测服务异常，无法确认开播状态\n")
             return EXIT_GATE_NETWORK_ERROR
 
-        # 实例锁防抢占 (确诊开播后获取)
-        lock_dir = self.config.output_dir / ".locks" if isinstance(self.config.output_dir, Path) else Path("./output/.locks")
-        instance_lock = WorkerInstanceLock(lock_dir=lock_dir, vmindex=self.config.vmindex, room_id=resolved.web_rid)
+        # 3. 实例独占锁防并发抢占 (统一 VM 锁作用域，持有至全流程结束)
+        instance_lock = WorkerInstanceLock(
+            lock_dir=self.config.lock_dir,
+            vmindex=self.config.vmindex,
+            room_id=resolved.web_rid
+        )
         try:
             instance_lock.acquire()
         except LockAcquisitionError as e:
@@ -123,7 +302,10 @@ class WorkerController:
             return EXIT_DEVICE_UNAVAILABLE
 
         try:
-            # 3. 准备运行组件与 MuMu 实例
+            # 4. 创建任务独立输出目录
+            self.task_output_dir.mkdir(parents=True, exist_ok=True)
+
+            # 5. 准备运行组件与 MuMu 实例
             dep_mgr = DependencyManager()
             scrcpy_exe = dep_mgr.ensure_scrcpy()
             adb_exe = dep_mgr.get_adb_path()
@@ -138,30 +320,39 @@ class WorkerController:
                 logger.error("建立 ADB 连接失败！")
                 return EXIT_DEVICE_UNAVAILABLE
 
-            # 4. 唤起直播间与白名单弹窗穿透
-            target_id = resolved.room_id or resolved.web_rid
-            nav = WorkerNavigator(serial=serial, adb_exe=adb_exe)
-            nav.launch_room(room_id=target_id, web_rid=resolved.web_rid, wait_sec=3)
-            nav.dismiss_system_dialogs()
+            # 6. 唤起直播间与白名单弹窗穿透
+            self._navigator = WorkerNavigator(serial=serial, adb_exe=adb_exe)
+            self._navigator.launch_room(room_id=self.target_room_id, web_rid=resolved.web_rid, wait_sec=3)
+            self._navigator.dismiss_system_dialogs()
 
-            # 白名单弹窗穿透 (如青少年模式/更新提示)
-            bypasser = PopupBypasser(adb_client=nav.adb_client)
+            bypasser = PopupBypasser(adb_client=self._navigator.adb_client)
             bypasser.detect_and_dismiss_popups()
 
-            # 身份核验闭环：UID 错房绝对阻断
+            # 7. 独立主播身份证据核验 (严禁拿目标 ID 冒充观测结果)
+            try:
+                ident_res = self._navigator.detect_current_room_identity()
+                det_uid = ident_res[0] if (ident_res and len(ident_res) > 0) else None
+                det_nick = ident_res[1] if (ident_res and len(ident_res) > 1) else None
+            except Exception:
+                det_uid, det_nick = None, None
+
             id_res = verify_room_identity(
-                target_uid=resolved.room_id,
-                current_uid=target_id,
-                target_nickname=resolved.nickname,
-                current_nickname=resolved.nickname,
+                target_uid=self.target_uid,
+                current_uid=det_uid,
+                target_nickname=self.target_nickname,
+                current_nickname=det_nick,
                 allow_unconfirmed=self.config.allow_unconfirmed_identity,
             )
+            self.identity_status = id_res.status
+            if id_res.status == IdentityStatus.UNCONFIRMED:
+                self.has_identity_risk = True
+
             if not id_res.can_proceed:
-                logger.error(f"主播身份核验未通过阻断: {id_res.reason}")
+                logger.error(f"主播身份核验未通过阻断: status={id_res.status}, reason={id_res.reason}")
                 return EXIT_ROOM_MISMATCH
 
-            # 5. 开录前置双重内容门禁校验 (Pre-flight Content Gate)
-            gate_ok = nav.verify_preflight_content_gate(timeout_sec=8.0)
+            # 8. 开录前置双重内容门禁校验 (Pre-flight Content Gate)
+            gate_ok = self._navigator.verify_preflight_content_gate(timeout_sec=8.0)
             if not gate_ok:
                 logger.error("未通过开录前置门禁：直播间未成功渲染或被登录页强阻断，拒绝盲目录制！")
                 self.emitter.emit(LoginBlockedEvent(
@@ -170,77 +361,69 @@ class WorkerController:
                 ))
                 return EXIT_LOGIN_BLOCKED
 
-            # 6. 初始化录制管线与切片循环
+            # 9. 初始化录制管线
             self._pipeline = WorkerPipeline(
                 serial=serial,
-                output_dir=self.config.output_dir,
+                output_dir=self.task_output_dir,
                 scrcpy_exe=scrcpy_exe,
                 adb_exe=adb_exe,
             )
 
-            # 7. 初始化看门狗投递队列
+            # 10. 初始化看门狗动作投递回调 (携带采样时代际快照)
+            def on_watchdog_action(act: PipelineAction):
+                self.action_dispatcher.post_action(act)
+
             def on_stall_action(act: str, dur: float):
                 if act == "intent_refresh":
                     self.emitter.emit(StallDetectedEvent(stall_duration_sec=dur, action="intent_refresh"))
                 elif act == "stall_healed":
                     self.emitter.emit(StallHealedEvent(action="intent_refresh", latency_sec=dur))
 
-            def on_request_new_segment():
-                # 由看门狗只读监测投递动作请求，附带当前切片快照代际 ID
-                self.action_dispatcher.post_action(PipelineAction(
-                    action_type=ActionType.RESTART_SEGMENT,
-                    generation_id=self.current_generation_id,
-                    reason="watchdog_stall_recycle",
-                ))
-
-            def on_fatal_stall():
-                self.action_dispatcher.post_action(PipelineAction(
-                    action_type=ActionType.FATAL_STOP,
-                    generation_id=self.current_generation_id,
-                    reason="watchdog_fatal_stall",
-                ))
-
             self._watchdog = StallWatchdog(
                 pipeline=self._pipeline,
-                navigator=nav,
-                room_id=target_id,
+                navigator=self._navigator,
+                room_id=self.target_room_id,
                 stall_threshold_sec=self.config.stall_timeout_sec,
+                generation_provider=lambda: self.current_generation_id,
+                on_post_action=on_watchdog_action,
                 on_stall_action=on_stall_action,
-                on_request_new_segment=on_request_new_segment,
-                on_fatal_stall=on_fatal_stall,
             )
 
-            segment_idx = 1
-            self.current_generation_id = 1
-            self.action_dispatcher.current_generation_id = self.current_generation_id
-            start_time = time.time()
-            last_heartbeat = 0.0
-
+            # 11. 状态机就绪，启动首个切片
             self.state_machine.transition_to(WorkerState.RECORDING)
-            cur_file = self._pipeline.start_segment(segment_idx)
-            self.emitter.emit(SegmentStartedEvent(
-                segment_index=segment_idx,
-                file_path=str(cur_file),
-                target_duration_sec=self.config.segment_duration_sec
-            ))
+            self._start_new_segment()
             self._watchdog.start()
 
-            while not self.stop_requested:
+            start_mono = time.monotonic()
+            last_heartbeat = 0.0
+            last_stream_check = 0.0
+            video_frozen_start: Optional[float] = None
+            file_stall_start: Optional[float] = None
+            last_known_size_mb: float = 0.0
+
+            # 12. 非阻塞主控制循环 (Single-Writer 唯一执行主体)
+            while not self.stop_requested and self.state_machine.state == WorkerState.RECORDING:
                 time.sleep(0.5)
+                now_mono = time.monotonic()
+                total_elapsed = now_mono - start_mono
+                seg_elapsed = now_mono - self.segment_start_mono
 
-                # 秒级录制进程存活与异常退出探针
-                alive = self._check_pipeline_survival(segment_idx=segment_idx)
-                if not alive:
-                    break
+                # A. 秒级管线存活探针
+                if self._pipeline and not self._pipeline.is_recording():
+                    exit_code = self._pipeline.get_exit_code()
+                    logger.warning(
+                        f"秒级探针感知到录制进程异常退出！(segment #{self.current_segment_index}, exit_code={exit_code})"
+                    )
+                    recovered = self._handle_pipeline_crash(exit_code=exit_code)
+                    if not recovered:
+                        break
+                    continue
 
-                now = time.time()
-                total_elapsed = now - start_time
-                seg_elapsed = self._pipeline.get_current_segment_elapsed()
-
-                # 单写者动作处理：由主线程唯一消费并执行动作
+                # B. 单写者动作排空与代际校验
                 actions = self.action_dispatcher.drain_actions()
                 for action in actions:
                     if action.action_type == ActionType.FATAL_STOP:
+                        logger.error(f"执行代际有效动作: 致命停止 (reason: {action.reason})")
                         self._fatal_error = True
                         if self._watchdog and getattr(self._watchdog, "_visual_stall_count", 0) >= 2:
                             self._login_blocked = True
@@ -250,115 +433,176 @@ class WorkerController:
                             ))
                         self.request_stop()
                         break
+                    elif action.action_type == ActionType.IN_PLACE_HEAL:
+                        logger.info(f"主线程执行代际有效动作: 原地 Intent 重新唤起与穿透 (reason: {action.reason})")
+                        if self._navigator:
+                            self._navigator.dismiss_login_prompt()
+                            self._navigator.dismiss_center_dialog()
+                            self._navigator.refresh_current_room(self.target_room_id)
                     elif action.action_type == ActionType.RESTART_SEGMENT:
-                        logger.info(f"主线程处理代际有效动作: 重启当前切片 (reason: {action.reason})")
-                        self._recycle_current_segment()
-                        segment_idx += 1
-                        self.current_generation_id += 1
-                        self.action_dispatcher.current_generation_id = self.current_generation_id
+                        logger.info(f"主线程执行代际有效动作: 重启当前切片 (reason: {action.reason})")
+                        self._recycle_current_segment(reason=action.reason)
                         break
 
                 if self.stop_requested:
                     break
 
-                # 发射心跳
-                if now - last_heartbeat >= self.config.heartbeat_interval_sec:
+                # C. 四维解耦健康监测真实评估
+                current_size_mb = self._pipeline.get_current_file_size_mb() if self._pipeline else 0.0
+                file_delta = current_size_mb - last_known_size_mb
+                last_known_size_mb = current_size_mb
+
+                if file_delta <= 0.0:
+                    if file_stall_start is None:
+                        file_stall_start = now_mono
+                else:
+                    file_stall_start = None
+
+                f_stall_dur = (now_mono - file_stall_start) if file_stall_start is not None else 0.0
+                v_frozen_dur = (now_mono - video_frozen_start) if video_frozen_start is not None else 0.0
+
+                signals = self.health_monitor.evaluate_signals(
+                    video_motion=0.5,  # 动态由看门狗视觉探针更新
+                    audio_active=None, # 未知/无专用音频分贝计
+                    process_alive=self._pipeline.is_recording() if self._pipeline else False,
+                    file_delta_mb=file_delta,
+                    video_frozen_duration_sec=v_frozen_dur,
+                    file_stall_duration_sec=f_stall_dur,
+                )
+
+                if not signals.is_healthy and signals.alert_reason == "file_write_stalled":
+                    logger.warning("四维健康监测判定文件写入严重停滞，触发自愈切片重拉...")
+                    self._recycle_current_segment(reason="health_monitor_file_stalled")
+                    continue
+
+                # D. 运行期异步非阻塞下播检测
+                if now_mono - last_stream_check >= 5.0:
+                    last_stream_check = now_mono
+                    # 非阻塞查询（快速接口判断，超时严格受限）
+                    api_status = resolver.resolve(self.config.target).status
+                    api_ended = (api_status == RoomStatus.ENDED)
+                    screen_ended = False  # 屏幕下播由 UI 识别辅助
+                    is_ended, end_reason = self.stream_end_detector.feed_observation(
+                        screen_shows_ended=screen_ended,
+                        api_shows_ended=api_ended,
+                        current_time=now_mono,
+                    )
+                    if is_ended:
+                        logger.info("运行期确认主播已下播，触发平稳退出。")
+                        self._stream_ended = True
+                        self.emitter.emit(StreamEndedEvent(reason="anchor_offline", exit_code=EXIT_STREAM_ENDED))
+                        self.request_stop()
+                        break
+
+                # E. 周期心跳发射 (未测得真实 FPS 时显式输出 null，真实反映生命周期)
+                if now_mono - last_heartbeat >= self.config.heartbeat_interval_sec:
                     self.emitter.emit(HeartbeatEvent(
                         elapsed_sec=int(total_elapsed),
                         segment_elapsed_sec=int(seg_elapsed),
-                        file_size_mb=round(self._pipeline.get_current_file_size_mb(), 2),
-                        fps=30.0,
-                        status="recording"
+                        file_size_mb=round(current_size_mb, 2),
+                        fps=None,  # 避免硬编码伪造 30.0
+                        status=self.state_machine.state.value.lower()
                     ))
-                    last_heartbeat = now
+                    last_heartbeat = now_mono
 
-                # 检查总录制时长限制
+                # F. 检查总录制时长限制
                 if self.config.total_duration_sec > 0 and total_elapsed >= self.config.total_duration_sec:
                     logger.info(f"达到预设总录制时长 {self.config.total_duration_sec}s，平稳结束。")
                     break
 
-                # 检查周期切片（默认 30 分钟）
+                # G. 检查计划周期切片
                 if seg_elapsed >= self.config.segment_duration_sec:
-                    logger.info(f"切片 #{segment_idx} 录制满 {self.config.segment_duration_sec}s，准备无缝切换下一段...")
-                    self._watchdog.stop()
-                    seg_size = self._pipeline.get_current_file_size_mb()
-                    self._pipeline.stop_segment()
-                    self.emitter.emit(SegmentFinishedEvent(
-                        segment_index=segment_idx,
-                        file_path=str(cur_file),
-                        duration_sec=int(seg_elapsed),
-                        file_size_mb=round(seg_size, 2)
-                    ))
-
-                    # 开启下一段切片并递增代际
-                    segment_idx += 1
-                    self.current_generation_id += 1
-                    self.action_dispatcher.current_generation_id = self.current_generation_id
-                    cur_file = self._pipeline.start_segment(segment_idx)
-                    self.emitter.emit(SegmentStartedEvent(
-                        segment_index=segment_idx,
-                        file_path=str(cur_file),
-                        target_duration_sec=self.config.segment_duration_sec
-                    ))
-                    self._watchdog.start()
+                    logger.info(f"切片 #{self.current_segment_index} 录满 {self.config.segment_duration_sec}s，无缝轮转下一段...")
+                    if self._watchdog:
+                        self._watchdog.stop()
+                    # 轮转必须执行完整性核验与归档
+                    ok = self._finalize_current_segment(allow_short_tail=False)
+                    if not ok:
+                        logger.warning(f"周期切片 #{self.current_segment_index} 完整性校验失败，但按规格继续录制后续切片")
+                    # 启动下一段
+                    self._start_new_segment()
+                    if self._watchdog:
+                        self._watchdog.start()
 
         finally:
-            if instance_lock:
-                instance_lock.release()
+            # 停止看门狗
             if self._watchdog:
-                self._watchdog.stop()
+                try:
+                    self._watchdog.stop()
+                except Exception:
+                    pass
+
+            # 状态机迁往 STOPPING
             if self.state_machine.state in {WorkerState.RECORDING, WorkerState.RECOVERING}:
-                self.state_machine.transition_to(WorkerState.STOPPING)
-            if self._pipeline and self._pipeline.is_recording():
-                seg_elapsed = self._pipeline.get_current_segment_elapsed()
-                seg_size = self._pipeline.get_current_file_size_mb()
-                self._pipeline.stop_segment()
-                if self._fatal_error or self._login_blocked:
-                    # 异常中止切片，发射 segment_aborted，严禁伪报 segment_finished
-                    self.emitter.emit(SegmentAbortedEvent(
-                        segment_index=segment_idx,
-                        file_path=str(self._pipeline.current_file_path or ""),
-                        reason="worker_aborted_by_error"
-                    ))
-                else:
-                    target_final = self.config.output_dir / build_segment_filename(
-                        room_id=target_id,
-                        start_epoch=int(start_time),
-                        segment_index=segment_idx,
-                        generation_id=self.current_generation_id,
-                    )
-                    raw_cur = self._pipeline.current_file_path
-                    if raw_cur and raw_cur.exists():
-                        ok, final_p, res_val = finalize_segment(raw_cur, target_final)
-                    else:
-                        ok, final_p = False, raw_cur or target_final
-                    self.emitter.emit(SegmentFinishedEvent(
-                        segment_index=segment_idx,
-                        file_path=str(final_p),
-                        duration_sec=int(seg_elapsed),
-                        file_size_mb=round(seg_size, 2)
-                    ))
+                try:
+                    self.state_machine.transition_to(WorkerState.STOPPING)
+                except Exception:
+                    pass
+
+            # 统一收尾最后一个切片 (允许正常短尾片成功归档)
+            if self.current_segment_started and not self.current_segment_finalized:
+                is_aborted = self._fatal_error or self._login_blocked or self._room_mismatch
+                self._finalize_current_segment(
+                    is_aborted=is_aborted,
+                    reason="worker_stopped",
+                    allow_short_tail=True,
+                )
+
+            # 状态机迁往终态 STOPPED
             if self.state_machine.state == WorkerState.STOPPING:
-                self.state_machine.transition_to(WorkerState.STOPPED)
+                try:
+                    self.state_machine.transition_to(WorkerState.STOPPED)
+                except Exception:
+                    pass
+
+            # 实例锁严格持有至管线彻底停止并完成所有收尾后再释放
+            if instance_lock:
+                try:
+                    instance_lock.release()
+                except Exception as e:
+                    logger.warning(f"释放实例锁异常: {e}")
+
+        # 确定最终退出码
+        if self._room_mismatch:
+            return EXIT_ROOM_MISMATCH
 
         if self._login_blocked:
             return EXIT_LOGIN_BLOCKED
 
-        if self._fatal_error:
+        if self._stream_ended:
+            return EXIT_STREAM_ENDED
+
+        if self._fatal_error or self._last_segment_failed:
             return EXIT_RECORDING_FAILED
 
         return EXIT_SUCCESS
 
-    def _check_pipeline_survival(self, segment_idx: int) -> bool:
+    def _check_pipeline_survival(self, segment_idx: int | None = None) -> bool:
         """秒级录制进程存活与异常退出探针。"""
         if self._pipeline and not self._pipeline.is_recording():
             exit_code = self._pipeline.get_exit_code()
-            logger.warning(f"秒级探针感知到录制进程异常退出！(segment #{segment_idx}, exit_code={exit_code})")
+            logger.warning(
+                f"秒级探针感知到录制进程异常退出！(segment #{self.current_segment_index}, exit_code={exit_code})"
+            )
             return self._handle_pipeline_crash(segment_idx=segment_idx, exit_code=exit_code)
         return True
 
-    def _handle_pipeline_crash(self, segment_idx: int, exit_code: int | None = None) -> bool:
+    def _handle_pipeline_crash(self, segment_idx: int | None = None, exit_code: int | None = None) -> bool:
         """处理录制子进程崩溃，实施有界就地自愈。"""
+        if self.stop_requested or self.state_machine.state in {WorkerState.STOPPING, WorkerState.STOPPED}:
+            logger.info("已处于停止状态或收到停止请求，放弃崩溃自愈拉起。")
+            if self.current_segment_started and not self.current_segment_finalized:
+                self._finalize_current_segment(
+                    is_aborted=True,
+                    reason=f"process_crash_code_{exit_code}"
+                )
+            return False
+
+        if segment_idx is not None and self.current_segment_index == 0:
+            self.current_segment_index = segment_idx
+            self.current_segment_started = True
+            self.current_segment_finalized = False
+
         # 1. 迁移到 RECOVERING
         if self.state_machine.state in {WorkerState.RECORDING, WorkerState.PREFLIGHT}:
             try:
@@ -366,15 +610,13 @@ class WorkerController:
             except Exception:
                 pass
 
-        # 2. 发射异常中断事件
-        file_path = str(self._pipeline.current_file_path or "") if self._pipeline else ""
-        self.emitter.emit(SegmentAbortedEvent(
-            segment_index=segment_idx,
-            file_path=file_path,
+        # 2. 为崩溃切片收尾，发射 segment_aborted
+        self._finalize_current_segment(
+            is_aborted=True,
             reason=f"process_crash_code_{exit_code}"
-        ))
+        )
 
-        # 3. 校验重试上限（切片轮转不无条件重置全局计数，防止死循环）
+        # 3. 校验重试上限（正常轮转不递增计数，只统计故障次数）
         if self._total_crash_count >= self.MAX_RECOVERY_RETRIES:
             logger.error(
                 f"已达最大连续崩溃恢复上限 ({self.MAX_RECOVERY_RETRIES} 次)，果断终止录制，防止死循环！"
@@ -386,19 +628,9 @@ class WorkerController:
         self._total_crash_count += 1
         logger.info(f"正在触发第 {self._total_crash_count}/{self.MAX_RECOVERY_RETRIES} 次就地自愈拉起...")
 
-        # 4. 尝试就地重新拉起
+        # 4. 尝试启动新切片，单调推进序号与代际
         try:
-            new_seg_idx = segment_idx + 1
-            self.current_generation_id += 1
-            self.action_dispatcher.current_generation_id = self.current_generation_id
-
-            if self._pipeline:
-                cur_file = self._pipeline.start_segment(new_seg_idx)
-                self.emitter.emit(SegmentStartedEvent(
-                    segment_index=new_seg_idx,
-                    file_path=str(cur_file),
-                    target_duration_sec=self.config.segment_duration_sec
-                ))
+            self._start_new_segment()
             self.state_machine.transition_to(WorkerState.RECORDING)
             return True
         except Exception as e:
@@ -407,17 +639,26 @@ class WorkerController:
             self.request_stop()
             return False
 
-    def _recycle_current_segment(self):
-        """强制重启切片以恢复卡死。"""
-        if not self._pipeline:
+    def _recycle_current_segment(self, reason: str = "watchdog_recycled"):
+        """强制重启切片以恢复卡死：旧片准确中止收尾，新片单调开启。"""
+        if self.stop_requested or self.state_machine.state in {WorkerState.STOPPING, WorkerState.STOPPED}:
+            logger.info(f"已处于停止状态或收到停止请求，放弃看门狗重拉 (reason: {reason})。")
+            if self.current_segment_started and not self.current_segment_finalized:
+                self._finalize_current_segment(is_aborted=True, reason=reason)
             return
-        idx = self._pipeline.current_segment_index
-        logger.warning(f"看门狗正在快速重拉切片 #{idx}...")
-        self._pipeline.stop_segment()
-        next_idx = idx + 1
-        new_file = self._pipeline.start_segment(next_idx)
-        self.emitter.emit(SegmentStartedEvent(
-            segment_index=next_idx,
-            file_path=str(new_file),
-            target_duration_sec=self.config.segment_duration_sec
-        ))
+
+        if self.current_segment_index == 0 and self._pipeline and hasattr(self._pipeline, "current_segment_index"):
+            self.current_segment_index = self._pipeline.current_segment_index
+            self.current_segment_started = True
+            self.current_segment_finalized = False
+
+        logger.warning(f"看门狗正在快速重拉切片 #{self.current_segment_index} (reason: {reason})...")
+        # 为旧切片发射终态 aborted 事件
+        self._finalize_current_segment(is_aborted=True, reason=reason)
+        # 开启新切片
+        try:
+            self._start_new_segment()
+        except Exception as e:
+            logger.error(f"重拉切片启动新段失败: {e}")
+            self._fatal_error = True
+            self.request_stop()

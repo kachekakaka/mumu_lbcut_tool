@@ -68,12 +68,12 @@ def verify_segment_file(
     # 尝试探测 ffprobe
     probe_bin = ffprobe_exe or shutil.which("ffprobe")
     if not probe_bin:
-        # 无 ffprobe 外部工具时基于文件大小放行但记录提示
         return SegmentValidationResult(
-            is_valid=True,
-            has_video=True,
-            has_audio=True,
+            is_valid=False,
+            has_video=False,
+            has_audio=False,
             size_mb=round(size_mb, 2),
+            reject_reason="未检测到 ffprobe 工具，无法核验音视频双轨有效性",
         )
 
     cmd = [
@@ -146,35 +146,43 @@ def finalize_segment(
     raw_path: Path,
     target_path: Path,
     ffprobe_exe: Path | None = None,
+    allow_short_tail: bool = False,
 ) -> tuple[bool, Path, SegmentValidationResult]:
     """收尾并归档切片文件。
 
-    若校验通过：原子更名为 target_path；
+    若校验通过：更名为 target_path；
+    若目标已存在：绝不覆盖，拒绝成功，保留原文件并明确报错；
     若校验失败：更名为 <raw_path>.corrupted，阻止损坏文件流入下游。
     """
-    res = verify_segment_file(raw_path, ffprobe_exe=ffprobe_exe)
+    res = verify_segment_file(raw_path, ffprobe_exe=ffprobe_exe, allow_short_tail=allow_short_tail)
     target_path.parent.mkdir(parents=True, exist_ok=True)
 
     if res.is_valid:
+        # 1. 目标文件存在性检查：绝不 unlink 或覆盖已有录像！
+        if hasattr(target_path, "exists") and target_path.exists():
+            err_msg = f"归档目标文件已存在 ({target_path})，拒绝覆盖已有产物"
+            logger.error(err_msg)
+            res.is_valid = False
+            res.reject_reason = err_msg
+            return False, raw_path, res
+
+        # 2. 执行更名并严格核查
         try:
-            if hasattr(target_path, "exists") and target_path.exists():
-                try:
-                    target_path.unlink()
-                except Exception:
-                    pass
             if hasattr(raw_path, "replace"):
-                try:
-                    raw_path.replace(target_path)
-                except Exception:
-                    pass
+                raw_path.replace(target_path)
+            if hasattr(target_path, "exists") and not target_path.exists():
+                raise OSError(f"更名后目标文件不存在: {target_path}")
             return True, target_path, res
         except Exception as e:
             logger.error(f"更名正式切片文件失败: {e}")
+            res.is_valid = False
+            res.reject_reason = f"更名归档失败: {e}"
             return False, raw_path, res
     else:
         corrupted_path = raw_path.with_name(raw_path.stem + ".corrupted")
         try:
-            raw_path.replace(corrupted_path)
+            if hasattr(raw_path, "replace") and not (hasattr(corrupted_path, "exists") and corrupted_path.exists()):
+                raw_path.replace(corrupted_path)
         except Exception:
             corrupted_path = raw_path
         return False, corrupted_path, res

@@ -98,6 +98,7 @@ def main(argv: list[str] | None = None) -> int:
         total_duration_sec=args.total_duration,
         stall_timeout_sec=args.stall_timeout,
         heartbeat_interval_sec=args.heartbeat_interval,
+        allow_unconfirmed_identity=args.allow_unconfirmed_identity,
     )
 
     controller = WorkerController(config=config)

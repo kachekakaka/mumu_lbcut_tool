@@ -11,6 +11,7 @@ from src.worker.resolver import RoomStatus, ResolvedRoom
 
 
 class TestWorkerController(unittest.TestCase):
+    @patch("src.worker.controller.finalize_segment")
     @patch("src.worker.controller.MuMuClient")
     @patch("src.worker.controller.WorkerRoomResolver")
     @patch("src.worker.controller.WorkerNavigator")
@@ -21,7 +22,9 @@ class TestWorkerController(unittest.TestCase):
         mock_navigator_cls,
         mock_resolver_cls,
         mock_mumu_cls,
+        mock_finalize,
     ):
+        mock_finalize.return_value = (True, Path("target.mp4"), MagicMock(is_valid=True))
         # 准备 mock
         stream = io.StringIO()
         emitter = WorkerEventEmitter(stream=stream)
@@ -41,9 +44,15 @@ class TestWorkerController(unittest.TestCase):
         mock_nav = mock_navigator_cls.return_value
         mock_nav.launch_room.return_value = True
         mock_nav.verify_preflight_content_gate.return_value = True
+        mock_nav.detect_current_room_identity.return_value = ("737141", "测试PK")
+
+        out_dir = Path("D:/test_output")
+        mock_file = MagicMock()
+        mock_file.name = "test_seg_001.mp4"
+        mock_file.exists.return_value = True
 
         mock_pipeline = mock_pipeline_cls.return_value
-        mock_pipeline.start_segment.return_value = Path("test_seg_001.mp4")
+        mock_pipeline.start_segment.return_value = mock_file
         mock_pipeline.is_recording.return_value = True
         mock_pipeline.stop_segment.return_value = True
         mock_pipeline.get_current_file_size_mb.return_value = 5.0
@@ -97,6 +106,7 @@ class TestWorkerController(unittest.TestCase):
 
         mock_nav = mock_navigator_cls.return_value
         mock_nav.launch_room.return_value = True
+        mock_nav.detect_current_room_identity.return_value = ("737141", "测试PK")
         # 模拟门禁检测失败（如处于登录页且无法绕过）
         mock_nav.verify_preflight_content_gate.return_value = False
 

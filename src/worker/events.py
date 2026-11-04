@@ -45,7 +45,7 @@ class HeartbeatEvent(BaseWorkerEvent):
     elapsed_sec: int = 0
     segment_elapsed_sec: int = 0
     file_size_mb: float = 0.0
-    fps: float = 0.0
+    fps: float | None = None
     status: str = "recording"
 
 
