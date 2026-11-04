@@ -38,6 +38,7 @@ class WorkerPipeline:
         self._proc: subprocess.Popen | None = None
         self._log_drainer: PipelineLogDrainer | None = None
         self._segment_start_time: float = 0.0
+        self._last_logs: list[str] = []
 
     def is_recording(self) -> bool:
         """检查当前切片录制进程是否仍在运行。"""
@@ -55,8 +56,14 @@ class WorkerPipeline:
         """启动一个指定索引的独立切片 MP4 录制。"""
         if self.is_recording():
             self.stop_segment()
+        else:
+            if self._log_drainer:
+                self._log_drainer.join(timeout=1.0)
+                self._log_drainer = None
+            time.sleep(1.0)
 
         self.current_segment_index = segment_index
+        self._last_logs.clear()
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         filename = f"record_{timestamp}_seg_{segment_index:03d}.mp4"
         self.current_file_path = self.output_dir / filename
@@ -99,16 +106,23 @@ class WorkerPipeline:
             errors="replace",
         )
         # 挂接防背压排空器
+        def _handle_scrcpy_log(line: str):
+            self._last_logs.append(line)
+            if len(self._last_logs) > 30:
+                self._last_logs.pop(0)
+            logger.info(f"[scrcpy] {line}")
+
         self._log_drainer = PipelineLogDrainer(
             self._proc,
-            on_log_line=lambda line: logger.debug(f"[scrcpy] {line}")
+            on_log_line=_handle_scrcpy_log
         )
         self._log_drainer.start()
         self._segment_start_time = time.time()
         time.sleep(1.5)  # 建立连接缓冲
 
         if not self.is_recording():
-            raise RuntimeError(f"切片 {segment_index} 启动失败 (code {self._proc.returncode})")
+            detail = "\n".join(self._last_logs[-5:]) if self._last_logs else "无日志输出"
+            raise RuntimeError(f"切片 {segment_index} 启动失败 (code {self._proc.returncode}):\n{detail}")
 
         logger.info(f"已开启新切片 #{segment_index}: {self.current_file_path.name}")
         return self.current_file_path
