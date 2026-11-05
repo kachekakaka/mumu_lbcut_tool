@@ -78,6 +78,14 @@ class TestWorkerController(unittest.TestCase):
         self.assertIn("segment_started", event_names)
         self.assertIn("heartbeat", event_names)
         self.assertIn("segment_finished", event_names)
+        mock_mumu.optimize_performance_for_recording.assert_called_with(
+            2,
+            mute=True,
+            disable_dynamic_fps=True,
+            window_mode="foreground",
+            pos_x=None,
+            pos_y=None,
+        )
 
     @patch("src.worker.controller.MuMuClient")
     @patch("src.worker.controller.WorkerRoomResolver")

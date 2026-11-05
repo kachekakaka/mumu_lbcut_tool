@@ -77,6 +77,13 @@ class StallWatchdog:
             self._thread.join(timeout=2)
         logger.info("卡顿看门狗已停止。")
 
+    def notify_segment_reset(self):
+        """切片轮转切换时，安全重置看门狗的字节基线与卡顿计时器，杜绝误判跨切片卡顿。"""
+        self._last_size_mb = 0.0
+        self._stall_start_time = None
+        self._action_taken_level = 0
+        self._visual_stall_count = 0
+
     def _run_loop(self):
         import numpy as np
 

@@ -21,7 +21,8 @@ class WorkerPipeline:
         output_dir: Path,
         scrcpy_exe: Path | None = None,
         adb_exe: Path | None = None,
-        max_fps: int = 30,
+        port: str | None = None,
+        max_fps: int | None = None,
         bit_rate: str = "4M",
         max_size: int = 1280,
     ):
@@ -29,6 +30,7 @@ class WorkerPipeline:
         self.output_dir = output_dir
         self.scrcpy_exe = scrcpy_exe or (SCRCPY_DIR / "scrcpy.exe")
         self.adb_exe = adb_exe or get_adb_exe()
+        self.port = port
         self.max_fps = max_fps
         self.bit_rate = bit_rate
         self.max_size = max_size
@@ -84,10 +86,13 @@ class WorkerPipeline:
             "--video-codec=h264",
             "--require-audio",
             "--display-id=0",
-            f"--max-fps={self.max_fps}",
             f"--video-bit-rate={self.bit_rate}",
             f"--max-size={self.max_size}",
         ]
+        if self.max_fps and self.max_fps > 0:
+            cmd.append(f"--max-fps={self.max_fps}")
+        if self.port:
+            cmd.append(f"--port={self.port}")
 
         env = os.environ.copy()
         if self.adb_exe and self.adb_exe.exists():
@@ -172,3 +177,108 @@ class WorkerPipeline:
         """紧急销毁进程。"""
         if self.is_recording():
             self.stop_segment(timeout_sec=3)
+
+
+class DualPipelineManager:
+    """管理 Primary 与 Secondary 两个交替录制管线，实现无缝秒级交叠轮转 (ADR 0009)。"""
+
+    def __init__(
+        self,
+        serial: str,
+        output_dir: Path,
+        scrcpy_exe: Path | None = None,
+        adb_exe: Path | None = None,
+        max_fps: int | None = None,
+        bit_rate: str = "4M",
+        max_size: int = 1280,
+        port_a: str = "27183:27190",
+        port_b: str = "27191:27200",
+    ):
+        self.serial = serial
+        self.output_dir = output_dir
+        self.scrcpy_exe = scrcpy_exe
+        self.adb_exe = adb_exe
+        self.max_fps = max_fps
+        self.bit_rate = bit_rate
+        self.max_size = max_size
+        self.ports = [port_a, port_b]
+        self._active_slot = 0  # 0 为 pipe_a, 1 为 pipe_b
+
+        self.pipe_a = WorkerPipeline(
+            serial=serial,
+            output_dir=output_dir,
+            scrcpy_exe=scrcpy_exe,
+            adb_exe=adb_exe,
+            port=port_a,
+            max_fps=max_fps,
+            bit_rate=bit_rate,
+            max_size=max_size,
+        )
+        self.pipe_b = WorkerPipeline(
+            serial=serial,
+            output_dir=output_dir,
+            scrcpy_exe=scrcpy_exe,
+            adb_exe=adb_exe,
+            port=port_b,
+            max_fps=max_fps,
+            bit_rate=bit_rate,
+            max_size=max_size,
+        )
+
+    def get_active_pipeline(self) -> WorkerPipeline:
+        """获取当前主录制管线。"""
+        return self.pipe_a if self._active_slot == 0 else self.pipe_b
+
+    def get_secondary_pipeline(self) -> WorkerPipeline:
+        """获取当前备用/交叠管线。"""
+        return self.pipe_b if self._active_slot == 0 else self.pipe_a
+
+    def start_initial_segment(self, segment_index: int) -> Path:
+        """启动第一段主切片录制。"""
+        active = self.get_active_pipeline()
+        return active.start_segment(segment_index)
+
+    def start_segment(self, segment_index: int) -> Path:
+        """兼容单管线接口，启动主切片。"""
+        return self.start_initial_segment(segment_index)
+
+    def start_overlapping_segment(self, segment_index: int) -> Path:
+        """在交叠窗口期启动次管线，与主管线并行捕获。"""
+        secondary = self.get_secondary_pipeline()
+        return secondary.start_segment(segment_index)
+
+    def promote_secondary(self) -> WorkerPipeline:
+        """提升次管线为主管线，并返回已录满的旧主管线（以便调用方执行封口与校验）。"""
+        old_primary = self.get_active_pipeline()
+        self._active_slot = 1 - self._active_slot
+        return old_primary
+
+    def is_recording(self) -> bool:
+        """当前主管线是否在录制。"""
+        return self.get_active_pipeline().is_recording()
+
+    def stop_segment(self, timeout_sec: int = 8) -> bool:
+        """优雅停止当前主管线切片。"""
+        return self.get_active_pipeline().stop_segment(timeout_sec=timeout_sec)
+
+    def get_exit_code(self) -> int | None:
+        return self.get_active_pipeline().get_exit_code()
+
+    @property
+    def current_segment_index(self) -> int:
+        return self.get_active_pipeline().current_segment_index
+
+    @property
+    def current_file_path(self) -> Path | None:
+        return self.get_active_pipeline().current_file_path
+
+    def get_current_file_size_mb(self) -> float:
+        return self.get_active_pipeline().get_current_file_size_mb()
+
+    def get_current_segment_elapsed(self) -> float:
+        return self.get_active_pipeline().get_current_segment_elapsed()
+
+    def teardown(self):
+        """紧急销毁所有管线进程。"""
+        self.pipe_a.teardown()
+        self.pipe_b.teardown()

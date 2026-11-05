@@ -74,3 +74,39 @@ def test_cli_parser_accepts_valid_parameters():
     ])
     # 正常不抛异常
     validate_args(args)
+
+
+def test_cli_parser_window_modes():
+    """验证窗口模式参数 (foreground/bottom/offscreen/hidden) 及位置坐标解析。"""
+    parser = build_arg_parser()
+
+    # 1. bottom 模式
+    args_bottom = parser.parse_args([
+        "--vmindex", "2",
+        "--target", "room_1",
+        "--output-dir", "./output",
+        "--window-mode", "bottom",
+    ])
+    assert args_bottom.window_mode == "bottom"
+
+    # 2. offscreen 模式加坐标
+    args_offscreen = parser.parse_args([
+        "--vmindex", "2",
+        "--target", "room_1",
+        "--output-dir", "./output",
+        "--window-mode", "offscreen",
+        "--window-pos-x", "-2500",
+        "--window-pos-y", "100",
+    ])
+    assert args_offscreen.window_mode == "offscreen"
+    assert args_offscreen.window_pos_x == -2500
+    assert args_offscreen.window_pos_y == 100
+
+    # 3. 非法窗口模式触发解析异常
+    with pytest.raises(SystemExit):
+        parser.parse_args([
+            "--vmindex", "2",
+            "--target", "room_1",
+            "--output-dir", "./output",
+            "--window-mode", "invalid_mode",
+        ])

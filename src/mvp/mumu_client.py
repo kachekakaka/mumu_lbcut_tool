@@ -2,6 +2,7 @@
 from pathlib import Path
 import json
 import logging
+import os
 import subprocess
 import time
 import re
@@ -67,13 +68,20 @@ class MuMuClient:
         res = subprocess.run(
             ["tasklist", "/fi", "IMAGENAME eq MuMuNxMain.exe"],
             capture_output=True,
-            text=True
+            encoding="utf-8",
+            errors="replace",
         )
-        if "MuMuNxMain.exe" not in res.stdout:
-            logger.info("MuMu 主程序未启动，正在拉起主程序...")
+        stdout_text = res.stdout or ""
+        if "MuMuNxMain.exe" not in stdout_text:
+            logger.info("MuMu 主程序未启动，正在独立拉起主程序...")
+            creationflags = 0
+            if os.name == "nt":
+                creationflags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
             subprocess.Popen(
                 [str(main_exe), "--from-shortcut"],
-                cwd=str(self.manager_exe.parent)
+                cwd=str(self.manager_exe.parent),
+                creationflags=creationflags,
+                close_fds=True,
             )
             time.sleep(5)
         return True
@@ -103,6 +111,177 @@ class MuMuClient:
         """关闭指定实例。"""
         logger.info(f"正在关闭 MuMu 实例 {vmindex}...")
         self._run_manager("control", "-v", str(vmindex), "shutdown")
+        return True
+
+    def mute_player(self, vmindex: int, mute: bool = True) -> bool:
+        """设置模拟器自身声卡外放静音（拦截外放声音，不影响 Android 内部音频流捕获）。"""
+        val = "true" if mute else "false"
+        logger.info(f"设置实例 {vmindex} 系统外放静音: {val}")
+        res = self._run_manager("setting", "-v", str(vmindex), "-k", "system_volume_close", "-val", val)
+        return '"system_volume_close"' in res or "system_volume_close" in res
+
+    def show_player_window(self, vmindex: int) -> bool:
+        """显示模拟器前台窗口，确保 DWM 渲染交换链维持满帧率。"""
+        self._run_manager("control", "-v", str(vmindex), "show_window")
+        return True
+
+    def hide_player_window(self, vmindex: int) -> bool:
+        """隐藏模拟器窗口，实现完全后台静默运行。"""
+        self._run_manager("control", "-v", str(vmindex), "hide_window")
+        return True
+
+    def get_player_hwnd(self, vmindex: int) -> int | None:
+        """获取指定模拟器实例的主窗口句柄 (HWND)。"""
+        out = self._run_manager("info", "-v", str(vmindex))
+        try:
+            data = json.loads(out)
+            if str(vmindex) in data:
+                data = data[str(vmindex)]
+            main_wnd_str = data.get("main_wnd")
+            if main_wnd_str:
+                hwnd = int(main_wnd_str, 16)
+                if os.name == "nt":
+                    import ctypes
+                    if ctypes.windll.user32.IsWindow(hwnd):
+                        return hwnd
+                return hwnd
+        except Exception as e:
+            logger.debug(f"获取实例 {vmindex} 窗口句柄失败: {e}")
+        return None
+
+    def layout_player_window(
+        self,
+        vmindex: int,
+        pos_x: int,
+        pos_y: int,
+        size_w: int | None = None,
+        size_h: int | None = None,
+    ) -> bool:
+        """设置模拟器窗口的位置与尺寸。"""
+        cmd = ["control", "-v", str(vmindex), "layout_window", "--pos_x", str(pos_x), "--pos_y", str(pos_y)]
+        if size_w is not None:
+            cmd.extend(["--size_w", str(size_w)])
+        if size_h is not None:
+            cmd.extend(["--size_h", str(size_h)])
+        self._run_manager(*cmd)
+
+        if os.name == "nt":
+            hwnd = self.get_player_hwnd(vmindex)
+            if hwnd:
+                import ctypes
+                SWP_NOZORDER = 0x0004
+                SWP_NOACTIVATE = 0x0010
+                SWP_ASYNCWINDOWPOS = 0x4000
+                flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS
+                if size_w is None or size_h is None:
+                    flags |= 0x0001  # SWP_NOSIZE
+                w = size_w or 0
+                h = size_h or 0
+                ctypes.windll.user32.SetWindowPos(hwnd, 0, pos_x, pos_y, w, h, flags)
+        return True
+
+    def send_player_to_bottom(self, vmindex: int) -> bool:
+        """将模拟器窗口放置在所有其他应用窗口的最底层 (HWND_BOTTOM)，且不抢占前台焦点。
+
+        效果：
+        1. 保持窗口显示 (Show) 状态，确保 Windows DWM 分配满帧率渲染视口；
+        2. 沉入所有普通窗口下方，不遮挡用户的日常办公/网页操作，也不抢占键盘鼠标焦点。
+        """
+        self.show_player_window(vmindex)
+        if os.name == "nt":
+            hwnd = self.get_player_hwnd(vmindex)
+            if hwnd:
+                import ctypes
+                HWND_BOTTOM = 1
+                SWP_NOSIZE = 0x0001
+                SWP_NOMOVE = 0x0002
+                SWP_NOACTIVATE = 0x0010
+                SWP_ASYNCWINDOWPOS = 0x4000
+                ctypes.windll.user32.SetWindowPos(
+                    hwnd,
+                    HWND_BOTTOM,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+                )
+                logger.info(f"已将实例 {vmindex} 窗口 (HWND: {hex(hwnd)}) 下沉置于其他窗口底层。")
+                return True
+        logger.info(f"已显示实例 {vmindex} 窗口（当前系统不支持或未获取到底层 HWND）。")
+        return True
+
+    def move_player_offscreen(
+        self,
+        vmindex: int,
+        pos_x: int | None = None,
+        pos_y: int | None = None,
+    ) -> bool:
+        """将模拟器窗口移出主屏幕工作区边缘（屏幕外位置），保持 DWM 视口激活但不在屏幕上可见。
+
+        默认坐标为 (-3200, 0)，确保移出绝大多数常见主副屏幕可视区域。
+        """
+        self.show_player_window(vmindex)
+        target_x = pos_x if pos_x is not None else -3200
+        target_y = pos_y if pos_y is not None else 0
+        logger.info(f"正在将实例 {vmindex} 窗口移出主工作区边缘至坐标 ({target_x}, {target_y})...")
+        return self.layout_player_window(vmindex, pos_x=target_x, pos_y=target_y)
+
+    def apply_window_display_mode(
+        self,
+        vmindex: int,
+        window_mode: str = "foreground",
+        pos_x: int | None = None,
+        pos_y: int | None = None,
+    ) -> bool:
+        """统一应用窗口显示模式：
+        - 'foreground': 正常前台展示；
+        - 'bottom': 放置在其他应用窗口底层且不抢焦点；
+        - 'offscreen': 移出主工作区边缘（支持自定义 pos_x, pos_y）；
+        - 'hidden' / 'background': 完全后台隐藏静默（帧率受限）。
+        """
+        mode = window_mode.lower().strip()
+        if mode in ("hidden", "background"):
+            return self.hide_player_window(vmindex)
+        elif mode == "bottom":
+            return self.send_player_to_bottom(vmindex)
+        elif mode in ("offscreen", "edge"):
+            return self.move_player_offscreen(vmindex, pos_x=pos_x, pos_y=pos_y)
+        else:
+            return self.show_player_window(vmindex)
+
+    def optimize_performance_for_recording(
+        self,
+        vmindex: int,
+        mute: bool = True,
+        disable_dynamic_fps: bool = True,
+        show_window: bool | None = None,
+        window_mode: str = "foreground",
+        pos_x: int | None = None,
+        pos_y: int | None = None,
+    ) -> bool:
+        """为录播环境执行模拟器底层调优：
+        1. 拦截 Windows 声卡外放静音，避免杂音干扰电脑；
+        2. 禁用动态省电降频 (dynamic_adjust_frame_rate: false)，杜绝掉帧卡顿；
+        3. 视口控制：支持 foreground / bottom / offscreen / hidden 多种模式。
+        """
+        if mute:
+            self.mute_player(vmindex, mute=True)
+        if disable_dynamic_fps:
+            logger.info(f"设置实例 {vmindex} 禁用省电降频: dynamic_adjust_frame_rate = false, max_frame_rate = 60")
+            self._run_manager("setting", "-v", str(vmindex), "-k", "dynamic_adjust_frame_rate", "-val", "false")
+            self._run_manager("setting", "-v", str(vmindex), "-k", "dynamic_low_frame_rate_limit", "-val", "30")
+            self._run_manager("setting", "-v", str(vmindex), "-k", "max_frame_rate", "-val", "60")
+            self._run_manager("setting", "-v", str(vmindex), "-k", "renderer_strategy", "-val", "perf")
+
+        # 兼容旧代码显式传入 show_window 的情况
+        effective_mode = window_mode
+        if show_window is False:
+            effective_mode = "hidden"
+        elif show_window is True and effective_mode == "hidden":
+            effective_mode = "foreground"
+
+        self.apply_window_display_mode(vmindex, window_mode=effective_mode, pos_x=pos_x, pos_y=pos_y)
         return True
 
     def get_adb_serial(self, vmindex: int) -> str:

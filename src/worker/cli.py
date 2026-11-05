@@ -46,6 +46,36 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=False,
         help="逃逸开关：当主播身份处于无法确认状态时允许临时录制（确诊错房仍强制阻断）"
     )
+    parser.add_argument(
+        "--overlap-duration",
+        type=float,
+        default=3.0,
+        help="双管线安全交叠窗口时长(秒)，默认 3.0，0 表示回退串行切片 (ADR 0009)"
+    )
+    parser.add_argument(
+        "--background",
+        action="store_true",
+        default=False,
+        help="后台静默录制别名（等同于 --window-mode hidden）"
+    )
+    parser.add_argument(
+        "--window-mode",
+        choices=["foreground", "bottom", "offscreen", "hidden"],
+        default=None,
+        help="模拟器窗口呈现模式：foreground(正常前台), bottom(放置在其他窗口底层且不抢焦点), offscreen(移出主工作区边缘), hidden(完全后台隐藏静默)"
+    )
+    parser.add_argument(
+        "--window-pos-x",
+        type=int,
+        default=None,
+        help="窗口 X 坐标（用于 offscreen 边缘模式或自定义摆放位置，负数或大坐标即移出屏幕）"
+    )
+    parser.add_argument(
+        "--window-pos-y",
+        type=int,
+        default=None,
+        help="窗口 Y 坐标（用于 offscreen 边缘模式或自定义摆放位置）"
+    )
     return parser
 
 
@@ -79,6 +109,14 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.heartbeat_interval <= 0:
         errors.append(f"--heartbeat-interval 必须为正数，当前为 {args.heartbeat_interval}")
 
+    if args.overlap_duration < 0:
+        errors.append(f"--overlap-duration 不能为负数，当前为 {args.overlap_duration}")
+
+    if args.overlap_duration >= args.segment_duration:
+        errors.append(
+            f"交叠时长 --overlap-duration ({args.overlap_duration}s) 必须小于切片时长 --segment-duration ({args.segment_duration}s)"
+        )
+
     if errors:
         for err in errors:
             sys.stderr.write(f"[参数错误] {err}\n")
@@ -90,6 +128,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     validate_args(args)
 
+    eff_window_mode = args.window_mode
+    if eff_window_mode is None:
+        eff_window_mode = "hidden" if args.background else "foreground"
+
     config = WorkerConfig(
         vmindex=args.vmindex,
         target=args.target,
@@ -99,6 +141,11 @@ def main(argv: list[str] | None = None) -> int:
         stall_timeout_sec=args.stall_timeout,
         heartbeat_interval_sec=args.heartbeat_interval,
         allow_unconfirmed_identity=args.allow_unconfirmed_identity,
+        overlap_duration_sec=args.overlap_duration,
+        background_mode=(eff_window_mode == "hidden"),
+        window_mode=eff_window_mode,
+        window_pos_x=args.window_pos_x,
+        window_pos_y=args.window_pos_y,
     )
 
     controller = WorkerController(config=config)

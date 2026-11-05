@@ -5,6 +5,7 @@ from html.parser import HTMLParser
 import json
 import logging
 import re
+import time
 import requests
 
 logger = logging.getLogger(__name__)
@@ -100,9 +101,10 @@ def _pace_payloads(page_html: str):
 class WorkerRoomResolver:
     """负责从用户输入的 URL/短链/文本中提取 web_rid，并检查其当前开播状态。"""
 
-    def __init__(self, timeout: int = 8):
+    def __init__(self, timeout: int = 15):
         self.timeout = timeout
         self.session = requests.Session()
+        self.session.trust_env = False  # 直连国内 CDN，避免代理干扰
         self.session.headers.update({
             "User-Agent": USER_AGENT,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -142,55 +144,61 @@ class WorkerRoomResolver:
         web_rid = self.extract_web_rid(input_target)
         url = f"https://live.douyin.com/{web_rid}"
 
-        try:
-            resp = self.session.get(url, timeout=self.timeout)
-            html = resp.text
+        for attempt in range(1, 3):
+            try:
+                resp = self.session.get(url, timeout=self.timeout)
+                html = resp.text
 
-            room_obj = None
-            for payload in _pace_payloads(html):
-                for path, val in _walk(payload):
-                    if path and path[-1] == "roomInfo" and isinstance(val, dict):
-                        candidate_room = val.get("room")
-                        if isinstance(candidate_room, dict) and "status" in candidate_room:
-                            room_obj = candidate_room
-                            break
+                room_obj = None
+                for payload in _pace_payloads(html):
+                    for path, val in _walk(payload):
+                        if path and path[-1] == "roomInfo" and isinstance(val, dict):
+                            candidate_room = val.get("room")
+                            if isinstance(candidate_room, dict) and "status" in candidate_room:
+                                room_obj = candidate_room
+                                break
+                    if room_obj:
+                        break
+
                 if room_obj:
-                    break
+                    raw_status = str(room_obj.get("status"))
+                    status = RoomStatus.LIVE if raw_status == "2" else (RoomStatus.ENDED if raw_status in ("4", "0") else RoomStatus.UNKNOWN)
+                    room_id = str(room_obj.get("id_str") or room_obj.get("id") or web_rid)
+                    title = room_obj.get("title")
+                    owner = room_obj.get("owner") if isinstance(room_obj.get("owner"), dict) else {}
+                    nickname = owner.get("nickname")
+                    return ResolvedRoom(
+                        web_rid=web_rid,
+                        status=status,
+                        room_id=room_id,
+                        title=title,
+                        nickname=nickname
+                    )
 
-            if room_obj:
-                raw_status = str(room_obj.get("status"))
-                status = RoomStatus.LIVE if raw_status == "2" else (RoomStatus.ENDED if raw_status in ("4", "0") else RoomStatus.UNKNOWN)
-                room_id = str(room_obj.get("id_str") or room_obj.get("id") or web_rid)
-                title = room_obj.get("title")
-                owner = room_obj.get("owner") if isinstance(room_obj.get("owner"), dict) else {}
-                nickname = owner.get("nickname")
-                return ResolvedRoom(
-                    web_rid=web_rid,
-                    status=status,
-                    room_id=room_id,
-                    title=title,
-                    nickname=nickname
-                )
+                status = RoomStatus.UNKNOWN
+                status_match = re.search(r'\\\"status\\\":\s*(\d+)', html) or re.search(r'"status":\s*(\d+)', html)
+                if status_match:
+                    code = status_match.group(1)
+                    if code == "2":
+                        status = RoomStatus.LIVE
+                    elif code in ("4", "0"):
+                        status = RoomStatus.ENDED
 
-            status = RoomStatus.UNKNOWN
-            status_match = re.search(r'\\\"status\\\":\s*(\d+)', html) or re.search(r'"status":\s*(\d+)', html)
-            if status_match:
-                code = status_match.group(1)
-                if code == "2":
-                    status = RoomStatus.LIVE
-                elif code in ("4", "0"):
-                    status = RoomStatus.ENDED
+                m_id = re.search(r'\\\"id_str\\\":\s*\\\"(\d+)\\\"', html) or re.search(r'"id_str":\s*"(\d+)"', html)
+                room_id = m_id.group(1) if m_id else web_rid
 
-            m_id = re.search(r'\\\"id_str\\\":\s*\\\"(\d+)\\\"', html) or re.search(r'"id_str":\s*"(\d+)"', html)
-            room_id = m_id.group(1) if m_id else web_rid
+                m_title = re.search(r'\\\"title\\\":\s*\\\"(.*?)\\\"', html) or re.search(r'"title":\s*"(.*?)"', html)
+                title = m_title.group(1) if m_title else None
 
-            m_title = re.search(r'\\\"title\\\":\s*\\\"(.*?)\\\"', html) or re.search(r'"title":\s*"(.*?)"', html)
-            title = m_title.group(1) if m_title else None
+                m_nick = re.search(r'\\\"nickname\\\":\s*\\\"(.*?)\\\"', html) or re.search(r'"nickname":\s*"(.*?)"', html)
+                nickname = m_nick.group(1) if m_nick else None
 
-            m_nick = re.search(r'\\\"nickname\\\":\s*\\\"(.*?)\\\"', html) or re.search(r'"nickname":\s*"(.*?)"', html)
-            nickname = m_nick.group(1) if m_nick else None
-
-            return ResolvedRoom(web_rid=web_rid, status=status, room_id=room_id, title=title, nickname=nickname)
-        except Exception as e:
-            logger.error(f"查询直播间 {web_rid} 失败: {e}")
-            return ResolvedRoom(web_rid=web_rid, status=RoomStatus.UNKNOWN)
+                return ResolvedRoom(web_rid=web_rid, status=status, room_id=room_id, title=title, nickname=nickname)
+            except Exception as e:
+                if attempt < 2:
+                    logger.warning(f"查询直播间 {web_rid} 第 {attempt} 次异常，准备重试: {e}")
+                    time.sleep(1.0)
+                else:
+                    logger.error(f"查询直播间 {web_rid} 失败: {e}")
+                    return ResolvedRoom(web_rid=web_rid, status=RoomStatus.UNKNOWN)
+        return ResolvedRoom(web_rid=web_rid, status=RoomStatus.UNKNOWN)

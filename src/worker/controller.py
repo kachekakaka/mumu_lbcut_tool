@@ -31,7 +31,7 @@ from src.worker.state_machine import (
     ActionType,
 )
 from src.worker.navigator import WorkerNavigator
-from src.worker.pipeline import WorkerPipeline
+from src.worker.pipeline import WorkerPipeline, DualPipelineManager
 from src.worker.resolver import WorkerRoomResolver, RoomStatus
 from src.worker.naming_lock import (
     build_segment_filename,
@@ -71,6 +71,11 @@ class WorkerConfig:
     stall_timeout_sec: float = 10.0
     allow_unconfirmed_identity: bool = False
     lock_dir: Path | None = None
+    overlap_duration_sec: float = 3.0  # 默认 3 秒双管线安全交叠 (ADR 0009)，0 表示串行模式
+    background_mode: bool = False      # 兼容旧开关：为 True 时映射为 hidden
+    window_mode: str = "foreground"    # 窗口呈现模式: "foreground" | "bottom" | "offscreen" | "hidden"
+    window_pos_x: int | None = None    # 窗口 X 坐标 (可选，用于 offscreen 边缘放置或自定义摆放)
+    window_pos_y: int | None = None    # 窗口 Y 坐标 (可选，用于 offscreen 边缘放置或自定义摆放)
 
 
 class WorkerController:
@@ -129,9 +134,92 @@ class WorkerController:
         self.target_uid: str = ""
         self.target_nickname: str = ""
 
+        # 双管线无缝交叠切片状态 (ADR 0009)
+        self._overlapping_started: bool = False
+        self._overlapping_seg_index: int = 0
+        self._overlapping_file_path: Path | None = None
+        self._overlapping_start_mono: float = 0.0
+
     def request_stop(self):
         """外部中断信号触发平稳停止。"""
         self.stop_requested = True
+
+    def _trigger_overlap_start_if_needed(self, current_elapsed: float) -> bool:
+        """检查并触发交叠次切片预热启动 (提前 overlap_duration_sec 开启次管线)。"""
+        if self._overlapping_started:
+            return False
+
+        overlap_window = self.config.overlap_duration_sec
+        if overlap_window <= 0:
+            return False
+
+        # 判断是否具备双管线能力 (避免纯单管线 mock 环境崩溃)
+        has_dual = isinstance(self._pipeline, DualPipelineManager) or hasattr(self._pipeline, "start_overlapping_segment")
+        if not has_dual:
+            return False
+
+        target_dur = self.config.segment_duration_sec
+        if overlap_window >= target_dur:
+            return False
+
+        if current_elapsed >= (target_dur - overlap_window):
+            next_idx = self.current_segment_index + 1
+            logger.info(
+                f"当前切片已录制 {current_elapsed:.1f}s，提前 {overlap_window}s 预热启动双管线交叠切片 #{next_idx}..."
+            )
+            try:
+                overlap_file = self._pipeline.start_overlapping_segment(next_idx)
+                self._overlapping_started = True
+                self._overlapping_seg_index = next_idx
+                self._overlapping_file_path = overlap_file
+                self._overlapping_start_mono = time.monotonic()
+
+                # 发射新切片 started 事件
+                self.emitter.emit(SegmentStartedEvent(
+                    segment_index=next_idx,
+                    file_path=str(overlap_file),
+                    target_duration_sec=self.config.segment_duration_sec
+                ))
+                logger.info(f"双管线交叠切片 #{next_idx} 预热成功: {Path(overlap_file).name}，两管线并行捕获中")
+                return True
+            except Exception as e:
+                logger.error(f"双管线预热启动异常: {e}，将回退串行轮转")
+                self._overlapping_started = False
+                return False
+        return False
+
+    def _finalize_overlap_transition(self) -> bool:
+        """完成双管线切片交替提升与旧切片封口归档。"""
+        if not self._overlapping_started:
+            return False
+
+        logger.info(f"切片 #{self.current_segment_index} 录满周期，执行双管线平滑提升交接...")
+        old_primary = None
+        if isinstance(self._pipeline, DualPipelineManager) or hasattr(self._pipeline, "promote_secondary"):
+            old_primary = self._pipeline.promote_secondary()
+
+        # 1. 关停旧主管线物理录制
+        if old_primary and hasattr(old_primary, "stop_segment"):
+            old_primary.stop_segment()
+
+        # 2. 封口归档旧切片 (注意：此时新切片正在活跃录制中，stop_pipeline=False 避免误关新切片)
+        ok = self._finalize_current_segment(is_aborted=False, stop_pipeline=False)
+
+        # 3. 将次管线参数顺位提升为当前主管线权威状态
+        self.current_segment_index = self._overlapping_seg_index
+        self.current_file_path = self._overlapping_file_path
+        self.current_generation_id += 1
+        self.action_dispatcher.current_generation_id = self.current_generation_id
+        self.current_segment_started = True
+        self.current_segment_finalized = False
+        self.segment_start_mono = self._overlapping_start_mono
+        self._overlapping_started = False
+        self.last_size_mb = 0.0
+        if self._watchdog:
+            self._watchdog.notify_segment_reset()
+
+        logger.info(f"双管线交接完成！切片 #{self.current_segment_index} 成为当前活跃主切片，实现零丢帧无缝切片。")
+        return ok
 
     def _start_new_segment(self) -> Path:
         """单调递增开启新切片并同步更新全局权威状态。"""
@@ -152,6 +240,8 @@ class WorkerController:
         self.current_segment_finalized = False
         self.segment_start_mono = time.monotonic()
         self.last_size_mb = 0.0
+        if self._watchdog:
+            self._watchdog.notify_segment_reset()
 
         self.emitter.emit(SegmentStartedEvent(
             segment_index=self.current_segment_index,
@@ -170,6 +260,7 @@ class WorkerController:
         reason: str = "",
         allow_short_tail: bool = False,
         ffprobe_exe: Path | None = None,
+        stop_pipeline: bool = True,
     ) -> bool:
         """统一切片收尾出口：执行封口、完整性核验、事件发射与安全归档。
 
@@ -182,10 +273,11 @@ class WorkerController:
         idx = self.current_segment_index
         raw_file = self.current_file_path or (self._pipeline.current_file_path if self._pipeline else None)
         seg_dur = int(time.monotonic() - self.segment_start_mono) if self.segment_start_mono > 0 else 0
-        seg_size = self._pipeline.get_current_file_size_mb() if self._pipeline else 0.0
+        raw_seg_size = self._pipeline.get_current_file_size_mb() if self._pipeline else 0.0
+        seg_size = float(raw_seg_size) if isinstance(raw_seg_size, (int, float)) else 0.0
 
-        # 1. 停止物理管线
-        if self._pipeline and self._pipeline.is_recording():
+        # 1. 停止物理管线 (交叠轮转时由 caller 负责停止旧管线，stop_pipeline=False 避免误关新主管线)
+        if stop_pipeline and self._pipeline and self._pipeline.is_recording():
             self._pipeline.stop_segment()
 
         # 2. 异常中止路径
@@ -320,6 +412,22 @@ class WorkerController:
                 logger.error("建立 ADB 连接失败！")
                 return EXIT_DEVICE_UNAVAILABLE
 
+            # 录播底层调优：拦截 Windows 声卡外放静音 + 禁用后台动态降频 + 灵活窗口模式 (foreground/bottom/offscreen/hidden)
+            try:
+                eff_mode = self.config.window_mode
+                if self.config.background_mode and eff_mode == "foreground":
+                    eff_mode = "hidden"
+                mumu.optimize_performance_for_recording(
+                    self.config.vmindex,
+                    mute=True,
+                    disable_dynamic_fps=True,
+                    window_mode=eff_mode,
+                    pos_x=self.config.window_pos_x,
+                    pos_y=self.config.window_pos_y,
+                )
+            except Exception as e:
+                logger.warning(f"设置模拟器录播环境调优异常 (不影响录制): {e}")
+
             # 6. 唤起直播间与白名单弹窗穿透
             self._navigator = WorkerNavigator(serial=serial, adb_exe=adb_exe)
             self._navigator.launch_room(room_id=self.target_room_id, web_rid=resolved.web_rid, wait_sec=3)
@@ -361,13 +469,21 @@ class WorkerController:
                 ))
                 return EXIT_LOGIN_BLOCKED
 
-            # 9. 初始化录制管线
-            self._pipeline = WorkerPipeline(
-                serial=serial,
-                output_dir=self.task_output_dir,
-                scrcpy_exe=scrcpy_exe,
-                adb_exe=adb_exe,
-            )
+            # 9. 初始化录制管线 (仅当切片时长大于交叠窗口时启用 DualPipelineManager ADR 0009)
+            if self.config.overlap_duration_sec > 0 and self.config.segment_duration_sec > self.config.overlap_duration_sec:
+                self._pipeline = DualPipelineManager(
+                    serial=serial,
+                    output_dir=self.task_output_dir,
+                    scrcpy_exe=scrcpy_exe,
+                    adb_exe=adb_exe,
+                )
+            else:
+                self._pipeline = WorkerPipeline(
+                    serial=serial,
+                    output_dir=self.task_output_dir,
+                    scrcpy_exe=scrcpy_exe,
+                    adb_exe=adb_exe,
+                )
 
             # 10. 初始化看门狗动作投递回调 (携带采样时代际快照)
             def on_watchdog_action(act: PipelineAction):
@@ -510,19 +626,26 @@ class WorkerController:
                     logger.info(f"达到预设总录制时长 {self.config.total_duration_sec}s，平稳结束。")
                     break
 
-                # G. 检查计划周期切片
+                # G. 检查计划周期切片 (ADR 0009 双管线交叠无缝切片)
+                if self.config.overlap_duration_sec > 0:
+                    self._trigger_overlap_start_if_needed(seg_elapsed)
+
                 if seg_elapsed >= self.config.segment_duration_sec:
-                    logger.info(f"切片 #{self.current_segment_index} 录满 {self.config.segment_duration_sec}s，无缝轮转下一段...")
-                    if self._watchdog:
-                        self._watchdog.stop()
-                    # 轮转必须执行完整性核验与归档
-                    ok = self._finalize_current_segment(allow_short_tail=False)
-                    if not ok:
-                        logger.warning(f"周期切片 #{self.current_segment_index} 完整性校验失败，但按规格继续录制后续切片")
-                    # 启动下一段
-                    self._start_new_segment()
-                    if self._watchdog:
-                        self._watchdog.start()
+                    if self._overlapping_started:
+                        # 双管线平滑提升交接与旧段收尾
+                        self._finalize_overlap_transition()
+                    else:
+                        logger.info(f"切片 #{self.current_segment_index} 录满 {self.config.segment_duration_sec}s，无缝轮转下一段...")
+                        if self._watchdog:
+                            self._watchdog.stop()
+                        # 轮转必须执行完整性核验与归档
+                        ok = self._finalize_current_segment(allow_short_tail=False)
+                        if not ok:
+                            logger.warning(f"周期切片 #{self.current_segment_index} 完整性校验失败，但按规格继续录制后续切片")
+                        # 启动下一段
+                        self._start_new_segment()
+                        if self._watchdog:
+                            self._watchdog.start()
 
         finally:
             # 停止看门狗
@@ -547,6 +670,43 @@ class WorkerController:
                     reason="worker_stopped",
                     allow_short_tail=True,
                 )
+
+            # 若退出时次切片已在交叠捕获中，一并安全封口并收尾归档
+            if self._overlapping_started and (isinstance(self._pipeline, DualPipelineManager) or hasattr(self._pipeline, "get_secondary_pipeline")):
+                try:
+                    secondary = self._pipeline.get_secondary_pipeline()
+                    if secondary and hasattr(secondary, "is_recording") and secondary.is_recording():
+                        secondary.stop_segment()
+                    raw_overlap = self._overlapping_file_path or (secondary.current_file_path if secondary else None)
+                    target_final_name = build_segment_filename(
+                        room_id=self.target_room_id or "live",
+                        start_epoch=int(time.time()),
+                        segment_index=self._overlapping_seg_index,
+                        generation_id=self.current_generation_id + 1,
+                    )
+                    target_final = self.task_output_dir / target_final_name
+                    if raw_overlap and Path(raw_overlap).exists():
+                        ok, final_p, _ = finalize_segment(
+                            raw_path=Path(raw_overlap),
+                            target_path=target_final,
+                            allow_short_tail=True,
+                        )
+                        if ok:
+                            self.emitter.emit(SegmentFinishedEvent(
+                                segment_index=self._overlapping_seg_index,
+                                file_path=str(final_p),
+                                duration_sec=int(time.monotonic() - self._overlapping_start_mono),
+                                file_size_mb=round(secondary.get_current_file_size_mb(), 2) if hasattr(secondary, "get_current_file_size_mb") else 0.0
+                            ))
+                        else:
+                            self.emitter.emit(SegmentAbortedEvent(
+                                segment_index=self._overlapping_seg_index,
+                                file_path=str(final_p),
+                                reason="exit_short_tail_failed"
+                            ))
+                except Exception as e:
+                    logger.warning(f"交叠次切片退出收尾异常: {e}")
+                self._overlapping_started = False
 
             # 状态机迁往终态 STOPPED
             if self.state_machine.state == WorkerState.STOPPING:

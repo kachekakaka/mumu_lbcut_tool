@@ -30,7 +30,8 @@ docs/
    ├─ [0005-ndjson-event-stream-contract.md](adr/0005-ndjson-event-stream-contract.md)
    ├─ [0006-stall-watchdog-and-av-sync.md](adr/0006-stall-watchdog-and-av-sync.md)
    ├─ [0007-preflight-content-gate-and-visual-watchdog.md](adr/0007-preflight-content-gate-and-visual-watchdog.md)
-   └─ [0008-single-writer-pipeline-action-queue.md](adr/0008-single-writer-pipeline-action-queue.md)
+   ├─ [0008-single-writer-pipeline-action-queue.md](adr/0008-single-writer-pipeline-action-queue.md)
+   └─ [0009-overlapping-dual-pipeline-seamless-slicing.md](adr/0009-overlapping-dual-pipeline-seamless-slicing.md)
 
 archive/docs/                       仓库根目录下，按需
 ├─ 方案/
