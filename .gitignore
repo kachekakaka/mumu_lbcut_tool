@@ -31,6 +31,7 @@ Thumbs.db
 /mumu_lbcut_tool_dev/
 /mumu_lbcut_tool_tmp/
 /mumu_lbcut_tool_dists/
+.scratch/
 
 # Python 缓存与字节码
 __pycache__/

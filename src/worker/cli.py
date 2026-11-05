@@ -157,6 +157,8 @@ def main(argv: list[str] | None = None) -> int:
 
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, _signal_handler)
 
     exit_code = controller.run()
     return exit_code

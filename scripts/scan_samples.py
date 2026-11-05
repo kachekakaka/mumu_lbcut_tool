@@ -8,7 +8,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.worker.resolver import WorkerRoomResolver, RoomStatus
+from src.mvp.room_resolver import RoomResolver as WorkerRoomResolver, RoomStatus
 
 
 def scan_single(r, resolver):

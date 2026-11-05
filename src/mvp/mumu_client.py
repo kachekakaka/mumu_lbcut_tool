@@ -40,6 +40,41 @@ class MuMuClient:
             logger.error(f"解析 MuMuManager info 失败: {out}")
             return {}
 
+    def list_available_instances(self) -> list[dict]:
+        """获取所有可用模拟器实例列表（供调度平台初始化实例池使用）。
+
+        返回格式规范：
+        [
+            {
+                "vmindex": 2,
+                "name": "lb1",
+                "is_running": False,
+                "android_version": "15.0",
+                "adb_host": "127.0.0.1",
+                "adb_port": 16448
+            }, ...
+        ]
+        """
+        all_info = self.get_all_players()
+        instances = []
+        for key, val in all_info.items():
+            try:
+                idx = int(val.get("index", key))
+            except (ValueError, TypeError):
+                continue
+            is_running = bool(val.get("is_android_started", False) or val.get("is_process_started", False))
+            instances.append({
+                "vmindex": idx,
+                "name": val.get("name", f"player_{idx}"),
+                "is_running": is_running,
+                "android_version": val.get("android_version", "12.0"),
+                "adb_host": val.get("adb_host_ip", "127.0.0.1"),
+                "adb_port": val.get("adb_port"),
+                "raw_info": val,
+            })
+        instances.sort(key=lambda x: x["vmindex"])
+        return instances
+
     def get_player_info(self, vmindex: int) -> dict:
         """获取单个实例信息字典。"""
         out = self._run_manager("info", "-v", str(vmindex))

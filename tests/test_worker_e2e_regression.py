@@ -47,7 +47,6 @@ from src.worker.health_monitor import HealthMonitor
 from src.worker.identity_verifier import IdentityStatus, verify_room_identity
 from src.worker.naming_lock import WorkerInstanceLock, LockAcquisitionError
 from src.worker.pipeline import PipelineLogDrainer, WorkerPipeline
-from src.worker.resolver import RoomStatus, ResolvedRoom
 from src.worker.segment_verifier import (
     verify_segment_file,
     finalize_segment,
@@ -246,18 +245,10 @@ class TestWorkerE2ERegression(unittest.TestCase):
         emitter = WorkerEventEmitter(stream=stream)
 
         with patch("src.worker.controller.MuMuClient") as mock_mumu, \
-             patch("src.worker.controller.WorkerRoomResolver") as mock_res, \
              patch("src.worker.controller.WorkerNavigator") as mock_nav_cls:
 
             mock_mumu.return_value.launch_player.return_value = True
             mock_mumu.return_value.connect_adb.return_value = "127.0.0.1:16448"
-
-            mock_res.return_value.resolve.return_value = ResolvedRoom(
-                web_rid="88888",
-                status=RoomStatus.LIVE,
-                room_id="UID_A_TARGET",
-                nickname="目标主播A"
-            )
 
             # 模拟器实际页面证据探测到了完全不同的 UID_B
             mock_nav = mock_nav_cls.return_value

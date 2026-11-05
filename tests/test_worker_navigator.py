@@ -17,6 +17,60 @@ class TestWorkerNavigator(unittest.TestCase):
         self.assertTrue(ok)
 
     @patch("src.worker.adb_client.AdbDeviceClient.run_adb")
+    def test_launch_room_with_19digit_internal_id(self, mock_run):
+        mock_run.side_effect = [
+            MagicMock(exit_code=0, stdout="Starting: Intent ...", stderr=""),
+            MagicMock(exit_code=0, stdout="mCurrentFocus=Window{123 u0 com.ss.android.ugc.aweme/.live.LivePlayActivity}", stderr=""),
+            MagicMock(exit_code=0, stdout="mCurrentFocus=Window{123 u0 com.ss.android.ugc.aweme/.live.LivePlayActivity}", stderr=""),
+        ]
+        nav = WorkerNavigator(serial="127.0.0.1:16448")
+        internal_room_id = "7704666294802123554"  # 19 位真实内部 ID
+        ok = nav.launch_room(internal_room_id, wait_sec=0)
+        self.assertTrue(ok)
+        
+        # 验证调用了 snssdk1128 直达 Intent
+        first_call_args = mock_run.call_args_list[0][0]
+        expected_uri = f"snssdk1128://live?room_id={internal_room_id}"
+        self.assertIn(expected_uri, first_call_args)
+
+    @patch("src.worker.adb_client.AdbDeviceClient.run_adb")
+    def test_launch_room_with_short_web_rid_fallback(self, mock_run):
+        mock_run.side_effect = [
+            MagicMock(exit_code=0, stdout="Starting: Intent ...", stderr=""),
+            MagicMock(exit_code=0, stdout="mCurrentFocus=Window{123 u0 com.ss.android.ugc.aweme/.live.LivePlayActivity}", stderr=""),
+            MagicMock(exit_code=0, stdout="mCurrentFocus=Window{123 u0 com.ss.android.ugc.aweme/.live.LivePlayActivity}", stderr=""),
+        ]
+        nav = WorkerNavigator(serial="127.0.0.1:16448")
+        short_id = "852703780"  # 展示短号
+        ok = nav.launch_room(short_id, wait_sec=0)
+        self.assertTrue(ok)
+        
+        # 验证 fallback 到带包名的 Web Intent
+        first_call_args = mock_run.call_args_list[0][0]
+        expected_web_uri = f"https://live.douyin.com/{short_id}"
+        self.assertIn(expected_web_uri, first_call_args)
+        self.assertIn("-p", first_call_args)
+        self.assertIn("com.ss.android.ugc.aweme", first_call_args)
+
+    @patch("src.worker.adb_client.AdbDeviceClient.run_adb")
+    def test_launch_room_with_full_web_url(self, mock_run):
+        mock_run.side_effect = [
+            MagicMock(exit_code=0, stdout="Starting: Intent ...", stderr=""),
+            MagicMock(exit_code=0, stdout="mCurrentFocus=Window{123 u0 com.ss.android.ugc.aweme/.live.LivePlayActivity}", stderr=""),
+            MagicMock(exit_code=0, stdout="mCurrentFocus=Window{123 u0 com.ss.android.ugc.aweme/.live.LivePlayActivity}", stderr=""),
+        ]
+        nav = WorkerNavigator(serial="127.0.0.1:16448")
+        full_url = "https://live.douyin.com/852703780"
+        ok = nav.launch_room(full_url, wait_sec=0)
+        self.assertTrue(ok)
+        
+        # 验证没有重复拼接前缀
+        first_call_args = mock_run.call_args_list[0][0]
+        self.assertIn(full_url, first_call_args)
+        self.assertIn("-p", first_call_args)
+        self.assertIn("com.ss.android.ugc.aweme", first_call_args)
+
+    @patch("src.worker.adb_client.AdbDeviceClient.run_adb")
     def test_refresh_current_room(self, mock_run):
         mock_run.return_value = MagicMock(exit_code=0, stdout="Starting: Intent ...", stderr="")
         nav = WorkerNavigator(serial="127.0.0.1:16448")
@@ -65,6 +119,25 @@ class TestWorkerNavigator(unittest.TestCase):
         self.assertFalse(passed)
         # 验证触发了 dismiss_center_dialog
         self.assertTrue(mock_dismiss_center.called)
+
+
+    @patch("src.worker.navigator.WorkerNavigator._capture_frame_array")
+    @patch("src.worker.navigator.WorkerNavigator.get_current_focus_activity")
+    def test_preflight_content_gate_rejects_main_activity_feed(self, mock_focus, mock_capture):
+        import numpy as np
+        nav = WorkerNavigator(serial="127.0.0.1:16448")
+        # 前台停留在首页推荐短视频 MainActivity
+        mock_focus.return_value = "com.ss.android.ugc.aweme.main.MainActivity"
+        
+        # 即使短视频中画面在动（动态变化）
+        frame1 = np.full((100, 100, 3), 100, dtype=np.uint8)
+        frame2 = np.full((100, 100, 3), 100, dtype=np.uint8)
+        frame2[10:40, 10:40, :] = 220
+        mock_capture.side_effect = [frame1, frame2, frame1, frame2]
+
+        passed = nav.verify_preflight_content_gate(timeout_sec=0.8)
+        # 坚决拒绝盲录短视频
+        self.assertFalse(passed)
 
 
 if __name__ == "__main__":

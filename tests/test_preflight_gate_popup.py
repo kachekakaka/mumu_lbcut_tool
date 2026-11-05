@@ -5,56 +5,22 @@ import pytest
 from src.worker.controller import (
     WorkerController,
     WorkerConfig,
-    EXIT_TARGET_OFFLINE,
-    EXIT_GATE_NETWORK_ERROR,
+    EXIT_TARGET_INVALID,
 )
-from src.worker.resolver import RoomStatus, ResolvedRoom
 
 
-def test_preflight_gate_anchor_offline_returns_exit_code_10(capsys):
-    """确诊主播未开播时，以退出码 10 退出，并输出'主播未开播'。"""
+def test_preflight_gate_unresolved_short_link_rejected(capsys):
+    """检测到未清洗的短链时，Worker 严格拒绝执行并返回 EXIT_TARGET_INVALID (2)。"""
     config = WorkerConfig(
         vmindex=0,
-        target="https://live.douyin.com/123456",
+        target="https://v.douyin.com/iANgXXXX/",
         output_dir=MagicMock(),
     )
     controller = WorkerController(config=config)
-
-    with patch("src.worker.controller.WorkerRoomResolver") as mock_resolver_cls:
-        mock_resolver = MagicMock()
-        mock_resolver.resolve.return_value = ResolvedRoom(
-            web_rid="123456",
-            status=RoomStatus.ENDED,  # 确诊下播
-        )
-        mock_resolver_cls.return_value = mock_resolver
-
-        code = controller.run()
-        assert code == EXIT_TARGET_OFFLINE  # 10
-        captured = capsys.readouterr()
-        assert "主播未开播" in captured.err or "未开播" in captured.err
-
-
-def test_preflight_gate_network_error_returns_exit_code_11(capsys):
-    """检测接口断网或返回 500 导致无法确定时，以退出码 11 退出，输出'门禁检测服务异常'。"""
-    config = WorkerConfig(
-        vmindex=0,
-        target="https://live.douyin.com/123456",
-        output_dir=MagicMock(),
-    )
-    controller = WorkerController(config=config)
-
-    with patch("src.worker.controller.WorkerRoomResolver") as mock_resolver_cls:
-        mock_resolver = MagicMock()
-        mock_resolver.resolve.return_value = ResolvedRoom(
-            web_rid="123456",
-            status=RoomStatus.UNKNOWN,  # 异常无法确认
-        )
-        mock_resolver_cls.return_value = mock_resolver
-
-        code = controller.run()
-        assert code == EXIT_GATE_NETWORK_ERROR  # 11
-        captured = capsys.readouterr()
-        assert "门禁检测服务异常" in captured.err or "服务异常" in captured.err
+    code = controller.run()
+    assert code == EXIT_TARGET_INVALID
+    captured = capsys.readouterr()
+    assert "目标非法阻断" in captured.err or "需由上层调度平台解析" in captured.err
 
 
 def test_popup_bypass_handles_youth_mode_dialog():

@@ -194,3 +194,25 @@ class RoomResolver:
         except Exception as e:
             logger.error(f"查询直播间 {web_rid} 失败: {e}")
             return ResolvedRoom(web_rid=web_rid, status=RoomStatus.UNKNOWN)
+
+    def batch_resolve(
+        self,
+        targets: list[str],
+        max_workers: int = 8,
+    ) -> dict[str, ResolvedRoom]:
+        """高并发批量探测多个直播间的开播状态（供调度平台高频轮询使用）。"""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        results: dict[str, ResolvedRoom] = {}
+        if not targets:
+            return results
+
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(targets))) as executor:
+            future_to_target = {executor.submit(self.resolve, t): t for t in targets}
+            for future in as_completed(future_to_target):
+                t = future_to_target[future]
+                try:
+                    results[t] = future.result()
+                except Exception as e:
+                    logger.error(f"批量解析房间 {t} 异常: {e}")
+                    results[t] = ResolvedRoom(web_rid=t, status=RoomStatus.UNKNOWN)
+        return results

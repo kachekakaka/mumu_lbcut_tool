@@ -1,25 +1,20 @@
-"""智能宽容直播间解析与开播检测器。"""
+"""Worker 离线目标标识清洗器 (Ticket 01)。
+
+职责：
+1. 纯本地正则清洗房间标识（纯数字房间号、标准直播间网页 URL）；
+2. 彻底剥离 requests 与所有公网 HTTP/HTTPS 代码；
+3. 严格拦截需要网络 302 重定向的未清洗短链，提示由调度平台解析。
+"""
 from dataclasses import dataclass
 from enum import Enum
-from html.parser import HTMLParser
-import json
 import logging
 import re
-import time
-import requests
 
 logger = logging.getLogger(__name__)
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0"
-)
-
-PACE_PUSH = re.compile(r"^\s*self\.__pace_f\.push\((\[.*\])\)\s*;?\s*$", re.DOTALL)
-
 
 class RoomStatus(Enum):
+    """直播间在播状态枚举。"""
     UNKNOWN = "unknown"
     LIVE = "live"
     ENDED = "ended"
@@ -27,178 +22,60 @@ class RoomStatus(Enum):
 
 @dataclass
 class ResolvedRoom:
+    """已清洗的标准直播间标识载荷。"""
     web_rid: str
-    status: RoomStatus
+    status: RoomStatus = RoomStatus.LIVE
     room_id: str | None = None
     title: str | None = None
     nickname: str | None = None
 
 
-class _ScriptCollector(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=False)
-        self._parts: list[str] | None = None
-        self.scripts: list[str] = []
+class OfflineRoomTargetCleaner:
+    """纯离线直播间目标清洗器。"""
 
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag.lower() == "script":
-            self._parts = []
+    @staticmethod
+    def clean(text: str) -> str:
+        """纯离线正则清洗直播间目标标识，提取标准 web_rid。
+        
+        支持格式：
+        - 纯数字房间号：'74400659583'
+        - 标准网页 URL：'https://live.douyin.com/74400659583'
+        - 带查询参数的网页 URL：'https://live.douyin.com/74400659583?extra=...'
+        
+        异常情况：
+        - 空或仅包含空白字符：抛出 ValueError
+        - 包含 v.douyin.com 短链：抛出 ValueError，提示由调度平台解析
+        - 无法提取合法标识：抛出 ValueError
+        """
+        if not text or not text.strip():
+            raise ValueError("直播间目标标识不能为空或空白字符")
 
-    def handle_data(self, data: str) -> None:
-        if self._parts is not None:
-            self._parts.append(data)
+        cleaned = text.strip()
 
-    def handle_endtag(self, tag: str) -> None:
-        if tag.lower() == "script" and self._parts is not None:
-            self.scripts.append("".join(self._parts))
-            self._parts = None
+        # 1. 显式拦截未解析短链 (ADR-0011 契约)
+        if "v.douyin.com" in cleaned:
+            raise ValueError(
+                f"检测到未清洗的短链标识: {cleaned}。遵循 ADR-0011 解耦契约，需由上层调度平台解析为标准房间号后再传入 Worker。"
+            )
 
+        # 2. 从 live.douyin.com/xxx 提取
+        live_match = re.search(r"live\.douyin\.com/([a-zA-Z0-9._~-]+)", cleaned)
+        if live_match:
+            return live_match.group(1).split("?")[0]
 
-def _walk(value: object, path: tuple[str, ...] = ()):
-    yield path, value
-    if isinstance(value, dict):
-        for key, child in value.items():
-            yield from _walk(child, (*path, str(key)))
-    elif isinstance(value, list):
-        for index, child in enumerate(value):
-            yield from _walk(child, (*path, str(index)))
-
-
-def _pace_payloads(page_html: str):
-    collector = _ScriptCollector()
-    collector.feed(page_html)
-    fragments: list[str] = []
-    for script in collector.scripts:
-        match = PACE_PUSH.fullmatch(script)
-        if match is None:
-            continue
-        try:
-            outer = json.loads(match.group(1))
-        except Exception:
-            continue
-        if not isinstance(outer, list) or len(outer) < 2 or not isinstance(outer[1], str):
-            continue
-        serialized = outer[1]
-        fragments.append(serialized)
-        separator = serialized.find(":")
-        if separator < 0:
-            continue
-        try:
-            yield json.loads(serialized[separator + 1 :])
-        except Exception:
-            continue
-
-    for record in "".join(fragments).splitlines():
-        _, separator, payload = record.partition(":")
-        if not separator:
-            continue
-        try:
-            yield json.loads(payload)
-        except Exception:
-            continue
-
-
-class WorkerRoomResolver:
-    """负责从用户输入的 URL/短链/文本中提取 web_rid，并检查其当前开播状态。"""
-
-    def __init__(self, timeout: int = 15):
-        self.timeout = timeout
-        self.session = requests.Session()
-        self.session.trust_env = False  # 直连国内 CDN，避免代理干扰
-        self.session.headers.update({
-            "User-Agent": USER_AGENT,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Cookie": "__ac_nonce=067140000000000000000;"
-        })
-
-    def extract_web_rid(self, text: str) -> str:
-        """从输入的文本或 URL 中提取 web_rid。"""
-        text = text.strip()
-        m = re.search(r"live\.douyin\.com/([a-zA-Z0-9._~-]+)", text)
-        if m:
-            return m.group(1).split("?")[0]
-
-        short_m = re.search(r"https?://v\.douyin\.com/[a-zA-Z0-9]+/?", text)
-        if short_m:
-            try:
-                resp = self.session.head(short_m.group(0), allow_redirects=True, timeout=self.timeout)
-                target_url = resp.url
-                m2 = re.search(r"live\.douyin\.com/([a-zA-Z0-9._~-]+)", target_url)
-                if m2:
-                    return m2.group(1).split("?")[0]
-                m_reflow = re.search(r"reflow/(\d+)", target_url)
-                if m_reflow:
-                    return m_reflow.group(1)
-            except Exception as e:
-                logger.warning(f"短链重定向解析失败: {e}")
-
-        # 匹配文本中包含的独立合法 web_rid token
-        token_match = re.search(r"[a-zA-Z0-9._~-]+", text)
+        # 3. 纯数字或标准 token
+        token_match = re.fullmatch(r"[a-zA-Z0-9._~-]+", cleaned)
         if token_match:
             return token_match.group(0)
 
-        return text
+        # 4. 尝试从混合文本中提取纯数字房间号
+        digit_match = re.search(r"\b(\d{8,15})\b", cleaned)
+        if digit_match:
+            return digit_match.group(1)
 
-    def resolve(self, input_target: str) -> ResolvedRoom:
-        """解析目标直播间并查询开播状态。"""
-        web_rid = self.extract_web_rid(input_target)
-        url = f"https://live.douyin.com/{web_rid}"
+        raise ValueError(f"无法从输入中提取有效房间标识: '{cleaned}'，需由上层调度平台解析后传入。")
 
-        for attempt in range(1, 3):
-            try:
-                resp = self.session.get(url, timeout=self.timeout)
-                html = resp.text
 
-                room_obj = None
-                for payload in _pace_payloads(html):
-                    for path, val in _walk(payload):
-                        if path and path[-1] == "roomInfo" and isinstance(val, dict):
-                            candidate_room = val.get("room")
-                            if isinstance(candidate_room, dict) and "status" in candidate_room:
-                                room_obj = candidate_room
-                                break
-                    if room_obj:
-                        break
-
-                if room_obj:
-                    raw_status = str(room_obj.get("status"))
-                    status = RoomStatus.LIVE if raw_status == "2" else (RoomStatus.ENDED if raw_status in ("4", "0") else RoomStatus.UNKNOWN)
-                    room_id = str(room_obj.get("id_str") or room_obj.get("id") or web_rid)
-                    title = room_obj.get("title")
-                    owner = room_obj.get("owner") if isinstance(room_obj.get("owner"), dict) else {}
-                    nickname = owner.get("nickname")
-                    return ResolvedRoom(
-                        web_rid=web_rid,
-                        status=status,
-                        room_id=room_id,
-                        title=title,
-                        nickname=nickname
-                    )
-
-                status = RoomStatus.UNKNOWN
-                status_match = re.search(r'\\\"status\\\":\s*(\d+)', html) or re.search(r'"status":\s*(\d+)', html)
-                if status_match:
-                    code = status_match.group(1)
-                    if code == "2":
-                        status = RoomStatus.LIVE
-                    elif code in ("4", "0"):
-                        status = RoomStatus.ENDED
-
-                m_id = re.search(r'\\\"id_str\\\":\s*\\\"(\d+)\\\"', html) or re.search(r'"id_str":\s*"(\d+)"', html)
-                room_id = m_id.group(1) if m_id else web_rid
-
-                m_title = re.search(r'\\\"title\\\":\s*\\\"(.*?)\\\"', html) or re.search(r'"title":\s*"(.*?)"', html)
-                title = m_title.group(1) if m_title else None
-
-                m_nick = re.search(r'\\\"nickname\\\":\s*\\\"(.*?)\\\"', html) or re.search(r'"nickname":\s*"(.*?)"', html)
-                nickname = m_nick.group(1) if m_nick else None
-
-                return ResolvedRoom(web_rid=web_rid, status=status, room_id=room_id, title=title, nickname=nickname)
-            except Exception as e:
-                if attempt < 2:
-                    logger.warning(f"查询直播间 {web_rid} 第 {attempt} 次异常，准备重试: {e}")
-                    time.sleep(1.0)
-                else:
-                    logger.error(f"查询直播间 {web_rid} 失败: {e}")
-                    return ResolvedRoom(web_rid=web_rid, status=RoomStatus.UNKNOWN)
-        return ResolvedRoom(web_rid=web_rid, status=RoomStatus.UNKNOWN)
+def clean_room_target(text: str) -> str:
+    """纯函数入口：清洗直播间目标标识。"""
+    return OfflineRoomTargetCleaner.clean(text)

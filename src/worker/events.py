@@ -70,6 +70,7 @@ class SegmentFinishedEvent(BaseWorkerEvent):
     file_path: str = ""
     duration_sec: int = 0
     file_size_mb: float = 0.0
+    is_final: bool = False
 
 
 @dataclass

@@ -61,15 +61,43 @@ class WorkerNavigator:
             return m2.group(1).replace("/", ".")
         return None
 
-    def launch_room(self, room_id: str, web_rid: str | None = None, wait_sec: int = 3) -> bool:
-        """通过 Intent 首次唤起进入指定直播间。"""
-        logger.info(f"Worker 唤起直播间: room_id={room_id}, web_rid={web_rid}")
-        intent_uri = f"snssdk1128://live?room_id={room_id}"
-        out = self._adb("shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", intent_uri)
+    def launch_room(
+        self,
+        room_id: str,
+        web_rid: str | None = None,
+        wait_sec: int = 3,
+        warmup_first: bool = False,
+    ) -> bool:
+        """通过 Intent 首次唤起进入指定直播间。
 
-        if "Error" in out and web_rid:
-            web_uri = f"https://live.douyin.com/{web_rid}"
-            self._adb("shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", web_uri)
+        自适应离线唤起策略：
+        1. 当 room_id 为 19 位纯数字（真实在播内部 ID）时，优先通过 snssdk1128://live?room_id={room_id} 秒级直达；
+        2. 当 room_id 为展示短号或非 19 位 ID 时，离线自适应通过带应用包名的 Web Intent:
+           am start -a android.intent.action.VIEW -d https://live.douyin.com/{target_id} -p com.ss.android.ugc.aweme
+           直达应用内 Web Router 解析进入直播间，彻底避免短视频误入；
+        3. 若指定了 web_rid 且内部 ID 唤起报错，同样降级到应用内 Web Intent。
+        """
+        logger.info(f"Worker 唤起直播间: room_id={room_id}, web_rid={web_rid}")
+        if warmup_first:
+            self._adb("shell", "am", "start", "-n", f"{DOUYIN_PACKAGE}/.main.MainActivity")
+            time.sleep(3.5)
+
+        target_web_rid = None
+        is_internal_19_id = bool(re.fullmatch(r"\d{19}", str(room_id).strip()))
+        if is_internal_19_id:
+            intent_uri = f"snssdk1128://live?room_id={room_id}"
+            out = self._adb("shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", intent_uri)
+            if "Error" in out and web_rid:
+                target_web_rid = web_rid
+        else:
+            target_web_rid = web_rid or room_id
+
+        if target_web_rid:
+            if str(target_web_rid).startswith("http://") or str(target_web_rid).startswith("https://"):
+                web_uri = str(target_web_rid)
+            else:
+                web_uri = f"https://live.douyin.com/{target_web_rid}"
+            self._adb("shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", web_uri, "-p", DOUYIN_PACKAGE)
 
         if wait_sec > 0:
             time.sleep(wait_sec)
@@ -144,13 +172,26 @@ class WorkerNavigator:
     def verify_preflight_content_gate(self, timeout_sec: float = 8.0) -> bool:
         """开录前置双重门禁：验证前台已脱离登录页且直播流真正开始动态渲染。"""
         import numpy as np
+        from src.worker.popup_bypasser import PopupBypasser
+        bypasser = PopupBypasser(adb_client=self.adb_client)
         start_t = time.time()
         logger.info(f"正在执行开录前置内容门禁核验 (阈值 {timeout_sec}s)...")
 
         while time.time() - start_t < timeout_sec:
+            # 优先穿透白名单弹窗 (如未成年人模式/青少年模式/隐私协议)
+            if bypasser.detect_and_dismiss_popups():
+                time.sleep(0.5)
+                continue
+
             act = self.get_current_focus_activity() or ""
             if "DYLoginActivity" in act or "login" in act.lower():
                 self.dismiss_login_prompt()
+                time.sleep(0.3)
+                continue
+
+            # 硬卡口：若前台处于短视频推荐流 MainActivity，坚决拦截，拒绝截帧浪费
+            if "MainActivity" in act:
+                logger.warning(f"门禁拦截：前台当前处于首页短视频推荐流 ({act})，坚决拦截出流！")
                 time.sleep(0.3)
                 continue
 
@@ -189,7 +230,14 @@ class WorkerNavigator:
             dynamic_ratio = float(np.mean(diff > 15))
 
             if dynamic_ratio > 0.005:  # 大于 0.5% 像素有动态变化
-                logger.info(f"开录前置门禁顺利通过！白底率={white_ratio:.1%}, 动态帧差率={dynamic_ratio:.2%}")
+                # 终极硬门禁校验：严禁在 MainActivity (首页短视频信息流) 放行出流
+                is_live_act = ("LivePlayActivity" in act or "live" in act.lower()) and ("MainActivity" not in act)
+                if not is_live_act:
+                    logger.warning(f"门禁拦截：检测到画面动态变化 (差分率 {dynamic_ratio:.2%})，但前台并非直播间 ({act})，坚决拦截！")
+                    time.sleep(0.3)
+                    continue
+
+                logger.info(f"开录前置门禁顺利通过！Activity={act}, 白底率={white_ratio:.1%}, 动态帧差率={dynamic_ratio:.2%}")
                 return True
 
             time.sleep(0.3)

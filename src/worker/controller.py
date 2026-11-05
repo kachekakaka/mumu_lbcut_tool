@@ -32,7 +32,7 @@ from src.worker.state_machine import (
 )
 from src.worker.navigator import WorkerNavigator
 from src.worker.pipeline import WorkerPipeline, DualPipelineManager
-from src.worker.resolver import WorkerRoomResolver, RoomStatus
+from src.worker.resolver import clean_room_target
 from src.worker.naming_lock import (
     build_segment_filename,
     WorkerInstanceLock,
@@ -141,8 +141,13 @@ class WorkerController:
         self._overlapping_start_mono: float = 0.0
 
     def request_stop(self):
-        """外部中断信号触发平稳停止。"""
+        """外部中断信号触发平稳停止，立即推进状态机。"""
         self.stop_requested = True
+        if self.state_machine.state in {WorkerState.RECORDING, WorkerState.RECOVERING}:
+            try:
+                self.state_machine.transition_to(WorkerState.STOPPING)
+            except Exception:
+                pass
 
     def _trigger_overlap_start_if_needed(self, current_elapsed: float) -> bool:
         """检查并触发交叠次切片预热启动 (提前 overlap_duration_sec 开启次管线)。"""
@@ -261,6 +266,7 @@ class WorkerController:
         allow_short_tail: bool = False,
         ffprobe_exe: Path | None = None,
         stop_pipeline: bool = True,
+        is_final: bool = False,
     ) -> bool:
         """统一切片收尾出口：执行封口、完整性核验、事件发射与安全归档。
 
@@ -331,7 +337,8 @@ class WorkerController:
                 segment_index=idx,
                 file_path=str(final_p),
                 duration_sec=seg_dur,
-                file_size_mb=round(seg_size, 2)
+                file_size_mb=round(seg_size, 2),
+                is_final=is_final,
             ))
             self.current_segment_finalized = True
             self._last_segment_failed = False
@@ -359,33 +366,23 @@ class WorkerController:
             pid=pid
         ))
 
-        # 1. 解析目标直播间
-        resolver = WorkerRoomResolver()
-        resolved = resolver.resolve(self.config.target)
-        if not resolved.web_rid:
-            logger.error("直播间输入格式无效，无法解析。")
+        # 1. 离线清洗目标直播间标识 (ADR-0011 契约：纯本地正则，零外网延迟)
+        try:
+            web_rid = clean_room_target(self.config.target)
+        except ValueError as e:
+            logger.error(f"直播间输入格式无效，无法解析: {e}")
+            sys.stderr.write(f"[目标非法阻断] {e}\n")
             return EXIT_TARGET_INVALID
 
-        self.target_room_id = resolved.room_id or resolved.web_rid
-        self.target_uid = resolved.room_id
-        self.target_nickname = resolved.nickname
-
-        # 2. 开录门禁状态严格分流
-        if resolved.status == RoomStatus.ENDED:
-            logger.info("目标直播间当前确诊未开播。")
-            sys.stderr.write("[开录门禁阻断] 主播未开播\n")
-            self.emitter.emit(StreamEndedEvent(reason="anchor_offline", exit_code=EXIT_TARGET_OFFLINE))
-            return EXIT_TARGET_OFFLINE
-        elif resolved.status != RoomStatus.LIVE:
-            logger.error("门禁接口返回异常或网络超时，无法确认开播状态，阻断盲录。")
-            sys.stderr.write("[开录门禁阻断] 门禁检测服务异常，无法确认开播状态\n")
-            return EXIT_GATE_NETWORK_ERROR
+        self.target_room_id = web_rid
+        self.target_uid = web_rid
+        self.target_nickname = None
 
         # 3. 实例独占锁防并发抢占 (统一 VM 锁作用域，持有至全流程结束)
         instance_lock = WorkerInstanceLock(
             lock_dir=self.config.lock_dir,
             vmindex=self.config.vmindex,
-            room_id=resolved.web_rid
+            room_id=web_rid
         )
         try:
             instance_lock.acquire()
@@ -430,7 +427,12 @@ class WorkerController:
 
             # 6. 唤起直播间与白名单弹窗穿透
             self._navigator = WorkerNavigator(serial=serial, adb_exe=adb_exe)
-            self._navigator.launch_room(room_id=self.target_room_id, web_rid=resolved.web_rid, wait_sec=3)
+            self._navigator.launch_room(
+                room_id=self.target_room_id,
+                web_rid=self.target_room_id,
+                wait_sec=3,
+                warmup_first=True,
+            )
             self._navigator.dismiss_system_dialogs()
 
             bypasser = PopupBypasser(adb_client=self._navigator.adb_client)
@@ -460,7 +462,7 @@ class WorkerController:
                 return EXIT_ROOM_MISMATCH
 
             # 8. 开录前置双重内容门禁校验 (Pre-flight Content Gate)
-            gate_ok = self._navigator.verify_preflight_content_gate(timeout_sec=8.0)
+            gate_ok = self._navigator.verify_preflight_content_gate(timeout_sec=15.0)
             if not gate_ok:
                 logger.error("未通过开录前置门禁：直播间未成功渲染或被登录页强阻断，拒绝盲目录制！")
                 self.emitter.emit(LoginBlockedEvent(
@@ -591,26 +593,7 @@ class WorkerController:
                     self._recycle_current_segment(reason="health_monitor_file_stalled")
                     continue
 
-                # D. 运行期异步非阻塞下播检测
-                if now_mono - last_stream_check >= 5.0:
-                    last_stream_check = now_mono
-                    # 非阻塞查询（快速接口判断，超时严格受限）
-                    api_status = resolver.resolve(self.config.target).status
-                    api_ended = (api_status == RoomStatus.ENDED)
-                    screen_ended = False  # 屏幕下播由 UI 识别辅助
-                    is_ended, end_reason = self.stream_end_detector.feed_observation(
-                        screen_shows_ended=screen_ended,
-                        api_shows_ended=api_ended,
-                        current_time=now_mono,
-                    )
-                    if is_ended:
-                        logger.info("运行期确认主播已下播，触发平稳退出。")
-                        self._stream_ended = True
-                        self.emitter.emit(StreamEndedEvent(reason="anchor_offline", exit_code=EXIT_STREAM_ENDED))
-                        self.request_stop()
-                        break
-
-                # E. 周期心跳发射 (未测得真实 FPS 时显式输出 null，真实反映生命周期)
+                # D. 周期心跳发射 (未测得真实 FPS 时显式输出 null，真实反映生命周期)
                 if now_mono - last_heartbeat >= self.config.heartbeat_interval_sec:
                     self.emitter.emit(HeartbeatEvent(
                         elapsed_sec=int(total_elapsed),
@@ -669,6 +652,7 @@ class WorkerController:
                     is_aborted=is_aborted,
                     reason="worker_stopped",
                     allow_short_tail=True,
+                    is_final=True,
                 )
 
             # 若退出时次切片已在交叠捕获中，一并安全封口并收尾归档
@@ -696,7 +680,8 @@ class WorkerController:
                                 segment_index=self._overlapping_seg_index,
                                 file_path=str(final_p),
                                 duration_sec=int(time.monotonic() - self._overlapping_start_mono),
-                                file_size_mb=round(secondary.get_current_file_size_mb(), 2) if hasattr(secondary, "get_current_file_size_mb") else 0.0
+                                file_size_mb=round(secondary.get_current_file_size_mb(), 2) if hasattr(secondary, "get_current_file_size_mb") else 0.0,
+                                is_final=True,
                             ))
                         else:
                             self.emitter.emit(SegmentAbortedEvent(

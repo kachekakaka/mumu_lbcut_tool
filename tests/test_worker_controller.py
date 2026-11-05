@@ -13,14 +13,12 @@ from src.worker.resolver import RoomStatus, ResolvedRoom
 class TestWorkerController(unittest.TestCase):
     @patch("src.worker.controller.finalize_segment")
     @patch("src.worker.controller.MuMuClient")
-    @patch("src.worker.controller.WorkerRoomResolver")
     @patch("src.worker.controller.WorkerNavigator")
     @patch("src.worker.controller.WorkerPipeline")
     def test_worker_run_normal_cycle(
         self,
         mock_pipeline_cls,
         mock_navigator_cls,
-        mock_resolver_cls,
         mock_mumu_cls,
         mock_finalize,
     ):
@@ -32,14 +30,6 @@ class TestWorkerController(unittest.TestCase):
         mock_mumu = mock_mumu_cls.return_value
         mock_mumu.launch_player.return_value = True
         mock_mumu.connect_adb.return_value = "127.0.0.1:16448"
-
-        mock_resolver = mock_resolver_cls.return_value
-        mock_resolver.resolve.return_value = ResolvedRoom(
-            web_rid="737141",
-            status=RoomStatus.LIVE,
-            room_id="737141",
-            title="测试PK",
-        )
 
         mock_nav = mock_navigator_cls.return_value
         mock_nav.launch_room.return_value = True
@@ -78,6 +68,12 @@ class TestWorkerController(unittest.TestCase):
         self.assertIn("segment_started", event_names)
         self.assertIn("heartbeat", event_names)
         self.assertIn("segment_finished", event_names)
+
+        # 检查最后一个 segment_finished 的 is_final 字段是否为 True
+        finished_events = [item for item in lines if item["event"] == "segment_finished"]
+        self.assertTrue(len(finished_events) >= 1)
+        self.assertTrue(finished_events[-1]["is_final"], "最终停机封口的切片必须标记 is_final=True")
+
         mock_mumu.optimize_performance_for_recording.assert_called_with(
             2,
             mute=True,
@@ -88,14 +84,12 @@ class TestWorkerController(unittest.TestCase):
         )
 
     @patch("src.worker.controller.MuMuClient")
-    @patch("src.worker.controller.WorkerRoomResolver")
     @patch("src.worker.controller.WorkerNavigator")
     @patch("src.worker.controller.WorkerPipeline")
     def test_worker_preflight_gate_blocked_refuses_recording(
         self,
         mock_pipeline_cls,
         mock_navigator_cls,
-        mock_resolver_cls,
         mock_mumu_cls,
     ):
         stream = io.StringIO()
@@ -104,13 +98,6 @@ class TestWorkerController(unittest.TestCase):
         mock_mumu = mock_mumu_cls.return_value
         mock_mumu.launch_player.return_value = True
         mock_mumu.connect_adb.return_value = "127.0.0.1:16448"
-
-        mock_resolver = mock_resolver_cls.return_value
-        mock_resolver.resolve.return_value = ResolvedRoom(
-            web_rid="737141",
-            status=RoomStatus.LIVE,
-            room_id="737141",
-        )
 
         mock_nav = mock_navigator_cls.return_value
         mock_nav.launch_room.return_value = True

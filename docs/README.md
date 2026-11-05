@@ -17,7 +17,10 @@ docs/
 │  ├─ [20261020-MVP技术可行性验证方案.md](方案/20261020-MVP技术可行性验证方案.md)
 │  ├─ [20261031-录播Worker规格与实施方案.md](方案/20261031-录播Worker规格与实施方案.md)
 │  ├─ [20261101-开录前置门禁与视觉看门狗实施方案.md](方案/20261101-开录前置门禁与视觉看门狗实施方案.md)
-│  └─ [20261102-Worker稳定性加固与异常治理综合方案.md](方案/20261102-Worker稳定性加固与异常治理综合方案.md)
+│  ├─ [20261102-Worker稳定性加固与异常治理综合方案.md](方案/20261102-Worker稳定性加固与异常治理综合方案.md)
+│  ├─ [20261105-录播调度平台架构与功能实施方案.md](方案/20261105-录播调度平台架构与功能实施方案.md)
+│  ├─ [20261105-录播Worker职责纯化与停机封口协同实施方案.md](方案/20261105-录播Worker职责纯化与停机封口协同实施方案.md)
+│  └─ [20261105-录播Worker真机准入与自适应唤起加固方案.md](方案/20261105-录播Worker真机准入与自适应唤起加固方案.md)
 ├─ 证据/验证/
 │  ├─ [20261020-MVP技术可行性验证.md](证据/验证/20261020-MVP技术可行性验证.md)
 │  ├─ [20261031-录播Worker技术验证.md](证据/验证/20261031-录播Worker技术验证.md)
@@ -31,7 +34,9 @@ docs/
    ├─ [0006-stall-watchdog-and-av-sync.md](adr/0006-stall-watchdog-and-av-sync.md)
    ├─ [0007-preflight-content-gate-and-visual-watchdog.md](adr/0007-preflight-content-gate-and-visual-watchdog.md)
    ├─ [0008-single-writer-pipeline-action-queue.md](adr/0008-single-writer-pipeline-action-queue.md)
-   └─ [0009-overlapping-dual-pipeline-seamless-slicing.md](adr/0009-overlapping-dual-pipeline-seamless-slicing.md)
+   ├─ [0009-overlapping-dual-pipeline-seamless-slicing.md](adr/0009-overlapping-dual-pipeline-seamless-slicing.md)
+   ├─ [0010-orchestrator-architecture-and-delivery-contract.md](adr/0010-orchestrator-architecture-and-delivery-contract.md)
+   └─ [0011-worker-responsibility-purification-and-offline-decoupling.md](adr/0011-worker-responsibility-purification-and-offline-decoupling.md)
 
 archive/docs/                       仓库根目录下，按需
 ├─ 方案/
