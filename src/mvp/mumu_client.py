@@ -180,31 +180,51 @@ class MuMuClient:
                 ctypes.windll.user32.SetWindowPos(hwnd, 0, pos_x, pos_y, w, h, flags)
         return True
 
-    def send_player_to_bottom(self, vmindex: int) -> bool:
+    def send_player_to_bottom(
+        self,
+        vmindex: int,
+        pos_x: int | None = None,
+        pos_y: int | None = None,
+    ) -> bool:
         """将模拟器窗口放置在所有其他应用窗口的最底层 (HWND_BOTTOM)，且不抢占前台焦点。
+
+        参数:
+        - vmindex: 实例索引
+        - pos_x: 可选指定 X 坐标（若指定则同步平移窗口，若为 None 则保持当前坐标）
+        - pos_y: 可选指定 Y 坐标
 
         效果：
         1. 保持窗口显示 (Show) 状态，确保 Windows DWM 分配满帧率渲染视口；
-        2. 沉入所有普通窗口下方，不遮挡用户的日常办公/网页操作，也不抢占键盘鼠标焦点。
+        2. 沉入所有普通窗口下方，不遮挡用户的日常办公/网页操作，也不抢占键盘鼠标焦点；
+        3. 可根据调度平台需要指定桌面位置坐标（如安全复位到可视区域）。
         """
         self.show_player_window(vmindex)
+        if pos_x is not None or pos_y is not None:
+            tx = pos_x if pos_x is not None else 0
+            ty = pos_y if pos_y is not None else 0
+            self.layout_player_window(vmindex, pos_x=tx, pos_y=ty)
+
         if os.name == "nt":
             hwnd = self.get_player_hwnd(vmindex)
             if hwnd:
                 import ctypes
                 HWND_BOTTOM = 1
                 SWP_NOSIZE = 0x0001
-                SWP_NOMOVE = 0x0002
                 SWP_NOACTIVATE = 0x0010
                 SWP_ASYNCWINDOWPOS = 0x4000
+                flags = SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS
+                if pos_x is None and pos_y is None:
+                    flags |= 0x0002  # SWP_NOMOVE
+                tx = pos_x or 0
+                ty = pos_y or 0
                 ctypes.windll.user32.SetWindowPos(
                     hwnd,
                     HWND_BOTTOM,
+                    tx,
+                    ty,
                     0,
                     0,
-                    0,
-                    0,
-                    SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+                    flags,
                 )
                 logger.info(f"已将实例 {vmindex} 窗口 (HWND: {hex(hwnd)}) 下沉置于其他窗口底层。")
                 return True
@@ -244,7 +264,7 @@ class MuMuClient:
         if mode in ("hidden", "background"):
             return self.hide_player_window(vmindex)
         elif mode == "bottom":
-            return self.send_player_to_bottom(vmindex)
+            return self.send_player_to_bottom(vmindex, pos_x=pos_x, pos_y=pos_y)
         elif mode in ("offscreen", "edge"):
             return self.move_player_offscreen(vmindex, pos_x=pos_x, pos_y=pos_y)
         else:

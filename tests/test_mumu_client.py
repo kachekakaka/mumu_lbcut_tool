@@ -60,7 +60,10 @@ class TestMuMuClient(unittest.TestCase):
 
         # bottom
         client.apply_window_display_mode(2, "bottom")
-        mock_bottom.assert_called_with(2)
+        mock_bottom.assert_called_with(2, pos_x=None, pos_y=None)
+
+        client.apply_window_display_mode(2, "bottom", pos_x=50, pos_y=50)
+        mock_bottom.assert_called_with(2, pos_x=50, pos_y=50)
 
         # offscreen
         client.apply_window_display_mode(2, "offscreen", pos_x=-2000, pos_y=100)
