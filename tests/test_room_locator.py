@@ -53,7 +53,7 @@ def test_wrong_room_is_corrected_instead_of_only_rejected():
     assert result.success and result.attempts==2
     assert nav.routes==['primary','reset']
     assert any(s['action']=='correct_wrong_room' for s in steps)
-    assert nav.ready_checks==3
+    assert nav.ready_checks==1  # 错房不做重复画面检查，只检查最终正确直播。
 
 
 def test_intent_accepted_but_home_page_changes_route():

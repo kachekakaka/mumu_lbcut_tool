@@ -51,6 +51,7 @@ class WorkerLaunchSpec:
     total_duration_sec: int = 0
     stall_timeout_sec: float = 10.0
     heartbeat_interval_sec: float = 3.0
+    navigation_timeout_sec: float = 300.0
     allow_unconfirmed_identity: bool = False
     overlap_duration_sec: float = 0.0  # 双管线专项验证前默认串行；显式配置才交叠
     target_kind: str = "auto"          # room_id / web_rid / auto（手工调试）

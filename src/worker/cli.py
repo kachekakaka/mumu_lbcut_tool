@@ -7,6 +7,7 @@ import signal
 import sys
 
 from src.worker.controller import WorkerConfig, WorkerController
+from src.worker.room_locator import validate_navigation_timeout
 
 # 日志输出至 stderr，确保 stdout 仅有纯净的 NDJSON 事件流
 logging.basicConfig(
@@ -38,6 +39,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0,
         help="总录制限制时长(秒)，0 表示持续录制"
     )
+    parser.add_argument("--navigation-timeout", type=float, default=300.0,
+                        help="定位、取证和画面就绪总时限（60～900秒），默认300秒；不含模拟器启动")
     parser.add_argument("--stall-timeout", type=float, default=10.0, help="卡顿自愈检测阈值(秒)，默认 10")
     parser.add_argument("--heartbeat-interval", type=float, default=3.0, help="心跳间隔(秒)，默认 3")
     parser.add_argument(
@@ -91,6 +94,10 @@ def validate_args(args: argparse.Namespace) -> None:
     若参数非法，输出错误提示至 stderr 并以退出码 2 终止。
     """
     errors = []
+    try:
+        validate_navigation_timeout(args.navigation_timeout)
+    except ValueError as exc:
+        errors.append(str(exc))
 
     if args.vmindex < 0:
         errors.append(f"--vmindex 必须是非负整数，当前为 {args.vmindex}")
@@ -145,6 +152,7 @@ def main(argv: list[str] | None = None) -> int:
         vmindex=args.vmindex,
         recording_mode=args.recording_mode,
         target=args.target,
+        navigation_timeout_sec=args.navigation_timeout,
         target_kind=args.target_kind,
         web_rid=args.web_rid,
         expected_anchor_uid=args.expected_anchor_uid,

@@ -79,63 +79,135 @@ def compare_evidence(evidence: RoomEvidence, room_id: str | None,
     return IdentityStatus.VERIFIED if comparable else IdentityStatus.UNCONFIRMED
 
 
+DEFAULT_NAVIGATION_TIMEOUT_SEC = 300.0
+
+
+def validate_navigation_timeout(value: float) -> None:
+    """对外配置必须有限、有界，不能用 NaN/inf 关闭超时保护。"""
+    import math
+    if not math.isfinite(value) or not 60 <= value <= 900:
+        raise ValueError('navigation_timeout_sec 必须在 60～900 秒之间')
+
+
 def locate_target(navigator, target: str, *, target_kind: str = 'auto',
                   web_rid: str | None = None, anchor_uid: str | None = None,
-                  timeout_sec: float = 100, max_attempts: int = 3,
+                  timeout_sec: float = DEFAULT_NAVIGATION_TIMEOUT_SEC, max_attempts: int = 3,
                   stop_requested=lambda: False, on_step=lambda **kw: None,
                   allow_unconfirmed: bool = False) -> LandingResult:
-    """定向进入→观察→必要时换入口/复位→取证→恢复直播画面→开始录制。"""
-    deadline = time.monotonic() + timeout_sec
+    """定位阶段共享总截止时间，但为最终返回/画面确认保留预算。
+
+    初始只确认直播 Activity；画面就绪在取得独立身份之后检查一次。
+    同页取证允许有界复检；已核验后暂时读不到页面/画面只等待当前步骤，
+    不重新打开资料页。明确离开直播页或身份不匹配才重新导航并作废旧证据。
+    """
+    import math
+    if not math.isfinite(timeout_sec) or timeout_sec <= 0 or max_attempts < 1:
+        raise ValueError('定位时限和尝试次数必须为有限正数')
+    started = time.monotonic()
+    deadline = started + timeout_sec
+    reserve = min(45.0, timeout_sec / 3)
+    preparation_deadline = deadline - reserve
     internal = target_kind == 'room_id' or (target_kind == 'auto' and bool(re.fullmatch(r'\d{19}', target)))
     expected_room = target if internal else None
     last_reason, last_status, last_evidence = 'navigation_failed', IdentityStatus.UNCONFIRMED, None
-    attempted = 0
-    for attempt in range(1, max_attempts + 1):
+    attempted, phase, route = 0, 'navigation', ''
+
+    def emit(action, reason='', evidence=None, stage_deadline=None):
+        now = time.monotonic()
+        on_step(attempt=attempted, action=action, route=route, phase=phase,
+                reason=reason, evidence=evidence, elapsed_sec=round(now-started, 3),
+                remaining_sec=round(max(0.0, deadline-now), 3),
+                stage_budget_sec=round(max(0.0, (stage_deadline or deadline)-now), 3))
+
+    def pause(seconds, until):
+        end = min(until, time.monotonic()+seconds)
+        while time.monotonic() < end:
+            if stop_requested():
+                return False
+            time.sleep(min(.1, max(0.0, end-time.monotonic())))
+        return not stop_requested()
+
+    def finish(success, reason):
         if stop_requested():
-            return LandingResult(False, 'cancelled', attempts=attempted)
-        if time.monotonic() >= deadline:
+            success, reason = False, 'cancelled'
+        return LandingResult(success, reason, last_status, last_evidence, attempted)
+
+    for attempt in range(1, max_attempts+1):
+        if stop_requested():
+            return finish(False, 'cancelled')
+        # 不把最后几秒分给另一次跳转；保留已知失败原因，不启动注定超时的命令。
+        if preparation_deadline-time.monotonic() < 8:
+            emit('budget_exhausted', last_reason)
             break
         attempted = attempt
         route = 'primary' if attempt == 1 else ('web' if attempt == 2 and web_rid else 'reset')
-        # 明确错房先退出错误页面，再定向进入；不反复检查同一错误画面。
         if last_status == IdentityStatus.MISMATCH:
             route = 'reset'
-        on_step(attempt=attempt, action='navigate', route=route, reason=last_reason)
-        if not navigator.navigate_route(target, web_rid, route, deadline, stop_requested):
+        # 每一次实际重新导航都使上一页身份依据失效，禁止跨页面复用。
+        last_status, last_evidence = IdentityStatus.UNCONFIRMED, None
+        phase = 'navigation'
+        until = min(preparation_deadline, time.monotonic()+30)
+        emit('navigate', last_reason, stage_deadline=until)
+        if not navigator.navigate_route(target, web_rid, route, until, stop_requested):
             last_reason = 'intent_failed'
             continue
-        if not navigator.wait_live_page(deadline=min(deadline, time.monotonic()+12), stop_requested=stop_requested):
-            last_reason = navigator.last_gate_reason
-            on_step(attempt=attempt, action='retry', route=route, reason=last_reason)
+        phase = 'live_page'
+        until = min(preparation_deadline, time.monotonic()+45)
+        emit('wait_live_page', 'wait_page_loading', stage_deadline=until)
+        if not navigator.wait_live_page(deadline=until, stop_requested=stop_requested):
+            last_reason = navigator.last_gate_reason or 'page_probe_unavailable'
+            emit('retry', last_reason)
             continue
-        # Live Activity 已出现不代表视频/头部资料入口已经完成加载。
-        on_step(attempt=attempt, action='wait_initial_picture', route=route, reason='wait_render')
-        if not navigator.wait_live_picture(deadline=min(deadline, time.monotonic()+16), stop_requested=stop_requested):
-            last_reason = navigator.last_gate_reason
-            continue
-        on_step(attempt=attempt, action='observe', route=route, reason='read_current_room')
-        evidence = navigator.observe_live_room(deadline=deadline, stop_requested=stop_requested)
-        last_status = compare_evidence(evidence, expected_room, anchor_uid)
-        if last_status == IdentityStatus.UNCONFIRMED and not stop_requested() and time.monotonic() < deadline:
-            # 先在已进入的直播页复检，避免因暂时缺失 UI 树不停重新导航。
-            on_step(attempt=attempt, action='retry_observation', route=route, reason='wait_current_page')
-            if navigator.wait_live_picture(deadline=min(deadline, time.monotonic()+6), stop_requested=stop_requested):
-                evidence = navigator.observe_live_room(deadline=deadline, stop_requested=stop_requested)
-                last_status = compare_evidence(evidence, expected_room, anchor_uid)
-        last_evidence = evidence
+
+        phase = 'identity'
+        # 单次取证最多60秒，包含返回自己打开的资料页的清理；不是拿走所有总预算。
+        for read_attempt in range(2):
+            if stop_requested():
+                return finish(False, 'cancelled')
+            if preparation_deadline-time.monotonic() < 12:
+                last_reason = 'room_evidence_unavailable'
+                break
+            until = min(preparation_deadline, time.monotonic()+60)
+            emit('observe' if read_attempt == 0 else 'retry_observation',
+                 'read_current_room' if read_attempt == 0 else 'wait_current_page', stage_deadline=until)
+            last_evidence = navigator.observe_live_room(deadline=until, stop_requested=stop_requested)
+            last_status = compare_evidence(last_evidence, expected_room, anchor_uid)
+            if last_status != IdentityStatus.UNCONFIRMED:
+                break
+            if read_attempt == 0 and not pause(1.0, preparation_deadline):
+                return finish(False, 'cancelled')
+        if stop_requested():
+            return finish(False, 'cancelled')
         if last_status == IdentityStatus.MISMATCH:
             last_reason = 'id_mismatch'
-            on_step(attempt=attempt, action='correct_wrong_room', route=route,
-                    reason=last_reason, evidence=evidence)
+            emit('correct_wrong_room', last_reason, last_evidence)
             continue
         if last_status == IdentityStatus.UNCONFIRMED and not allow_unconfirmed:
             last_reason = 'room_evidence_unavailable'
-            on_step(attempt=attempt, action='retry', route=route, reason=last_reason)
+            emit('retry', last_reason, last_evidence)
             continue
-        if stop_requested():
-            return LandingResult(False, 'cancelled', attempts=attempt)
-        on_step(attempt=attempt, action='wait_picture', route=route, reason='return_to_live')
-        if navigator.wait_live_picture(deadline=min(deadline, time.monotonic()+16), stop_requested=stop_requested):
-            return LandingResult(True, 'target_located', last_status, evidence, attempt)
-        last_reason = navigator.last_gate_reason
-    return LandingResult(False, last_reason, last_status, last_evidence, attempted)
+
+        phase = 'picture'
+        # 至少预留一个完整确认窗口；慢加载在本阶段复检，不重新点击/取证。
+        while deadline-time.monotonic() >= 5:
+            if stop_requested():
+                return finish(False, 'cancelled')
+            until = min(deadline, time.monotonic()+45)
+            emit('wait_picture', 'return_to_live', last_evidence, until)
+            if navigator.wait_live_picture(deadline=until, stop_requested=stop_requested,
+                                           return_from_profile=True):
+                return finish(True, 'target_located')
+            if stop_requested():
+                return finish(False, 'cancelled')
+            last_reason = navigator.last_gate_reason or 'page_probe_unavailable'
+            if last_reason in {'navigation_failed', 'login_blocked'}:
+                emit('page_changed', last_reason)
+                last_status, last_evidence = IdentityStatus.UNCONFIRMED, None
+                break  # 已明确离开目标页面；下一次导航不沿用原来的身份依据。
+            emit('retry_picture', last_reason, last_evidence)
+            if not pause(1.0, deadline):
+                return finish(False, 'cancelled')
+        else:
+            emit('budget_exhausted', last_reason, last_evidence)
+            return finish(False, last_reason)
+    return finish(False, last_reason)

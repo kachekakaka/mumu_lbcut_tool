@@ -131,6 +131,10 @@ class RoomNavigationEvent(BaseWorkerEvent):
     observed_anchor_uid: str | None = None
     evidence_source: str = "unavailable"
     evidence_observed_at: float = 0.0
+    phase: str = ""
+    elapsed_sec: float = 0.0
+    remaining_sec: float = 0.0
+    stage_budget_sec: float = 0.0
 
 
 class WorkerEventEmitter:

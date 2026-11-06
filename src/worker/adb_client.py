@@ -54,12 +54,16 @@ class AdbDeviceClient:
     def ensure_connected(self, timeout: float = 5.0) -> bool:
         """尝试显式连接目标端口并核验。"""
         cmd = [str(self.adb_exe), "connect", self.serial]
+        deadline = time.monotonic() + max(0.0, timeout)
+        if timeout < 1.0:
+            return False
         try:
             res = run_command(cmd, timeout=timeout)
             logger.debug(f"ADB connect {self.serial}: {res.stdout.strip()}")
         except Exception as e:
             logger.warning(f"ADB connect 异常: {e}")
-        return self.is_device_ready(timeout=2.0)
+        remaining = deadline-time.monotonic()
+        return remaining >= 1.0 and self.is_device_ready(timeout=min(2.0, remaining))
 
     def wait_for_device(self, timeout_sec: float = 15.0, poll_interval: float = 0.5) -> None:
         """基于单调时钟有界轮询目标设备是否就绪。

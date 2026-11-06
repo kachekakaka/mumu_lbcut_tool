@@ -89,7 +89,10 @@ class Scheduler:
                  scan_interval_sec: float = 30.0, max_attempts: int = 3,
                  ended_interval_sec: float = 10.0, auto_scan: bool = True,
                  segment_duration_sec: int = 1800, overlap_duration_sec: float = 0.0,
-                 recording_mode: str = "continuous"):
+                 recording_mode: str = "continuous", navigation_timeout_sec: float = 300.0):
+        from src.worker.room_locator import validate_navigation_timeout
+        validate_navigation_timeout(navigation_timeout_sec)
+        self.navigation_timeout = navigation_timeout_sec
         if not instance_indices or any(i < 0 for i in instance_indices):
             raise ValueError("必须明确配置允许使用的实例索引")
         self.store, self.clock = store, clock
@@ -312,7 +315,8 @@ class Scheduler:
             web_rid=room.web_rid, expected_anchor_uid=getattr(room, "anchor_uid", None),
             allow_unconfirmed_identity=bool(target["allow_unconfirmed"]), job_id=job_id,
             event_log_path=journal, segment_duration_sec=self.segment_duration,
-            overlap_duration_sec=self.overlap_duration, recording_mode=self.recording_mode)
+            overlap_duration_sec=self.overlap_duration, recording_mode=self.recording_mode,
+            navigation_timeout_sec=self.navigation_timeout)
         # 先保存启动意图和产物关联，覆盖 Popen 后写 PID 前的异常窗口。
         with self.store.transaction() as db:
             db.execute("UPDATE jobs SET room_id=?,event_log_path=? WHERE id=?", (room.room_id, str(journal), job_id))

@@ -36,14 +36,21 @@ class WorkerNavigator:
             self._last_adb_failed = False
             if self._operation_deadline is not None:
                 timeout = min(timeout, self._operation_deadline - time.monotonic())
-                if timeout <= 0:
+                if timeout < 1.0:
                     raise TimeoutError("导航流程预算耗尽")
             res = self.adb_client.run_adb(*args, timeout=timeout)
             self._last_adb_failed = res.exit_code != 0
             output = res.stdout.strip() or res.stderr.strip()
             if "not found" in output or "offline" in output:
-                self.adb_client.ensure_connected(timeout=3.0)
-                res2 = self.adb_client.run_adb(*args, timeout=timeout)
+                remaining = (self._operation_deadline - time.monotonic()) if self._operation_deadline is not None else 8.0
+                if remaining < 4.0:
+                    return ''
+                self.adb_client.ensure_connected(timeout=min(3.0, remaining-2.0))
+                retry_budget = min(timeout, self._operation_deadline-time.monotonic()) if self._operation_deadline is not None else timeout
+                if retry_budget < 1.0:
+                    return ''
+                res2 = self.adb_client.run_adb(*args, timeout=retry_budget)
+                self._last_adb_failed = res2.exit_code != 0
                 output = res2.stdout.strip()
             return output
         except Exception as e:
@@ -170,7 +177,7 @@ class WorkerNavigator:
             budget = 5.0
             if self._operation_deadline is not None:
                 budget = min(budget, self._operation_deadline - time.monotonic())
-                if budget <= 0:
+                if budget < 1.0:
                     return None
             res = subprocess.run(cmd, capture_output=True, timeout=budget)
             if res.returncode == 0 and len(res.stdout) > 0:
@@ -340,7 +347,7 @@ class WorkerNavigator:
         from src.worker.popup_bypasser import PopupBypasser
         old = self._operation_deadline
         self._operation_deadline = deadline
-        main_seen = 0
+        main_seen_since = None
         try:
             while time.monotonic() < deadline and not stop_requested():
                 act = self.get_current_focus_activity() or ''
@@ -351,12 +358,14 @@ class WorkerNavigator:
                     self.last_gate_reason = 'login_blocked'
                     self._adb('shell', 'input', 'keyevent', '4')
                 elif 'MainActivity' in act:
-                    main_seen += 1
+                    if main_seen_since is None:
+                        main_seen_since = time.monotonic()
                     self.last_gate_reason = 'navigation_failed'
-                    if main_seen >= 3:
+                    if time.monotonic()-main_seen_since >= 10:
                         return False
                 elif not act:
-                    self.last_gate_reason = 'device_unavailable'
+                    main_seen_since = None
+                    self.last_gate_reason = 'page_probe_unavailable'
                 else:
                     bypasser = PopupBypasser(self.adb_client)
                     bypasser.deadline = min(deadline, time.monotonic()+4)
@@ -393,6 +402,9 @@ class WorkerNavigator:
         from src.worker.popup_bypasser import PopupBypasser
         old = self._operation_deadline
         self._operation_deadline = deadline
+        cleanup_deadline = deadline
+        operation_deadline = deadline - min(10.0, max(2.0, (deadline-time.monotonic())*.2))
+        self._operation_deadline = operation_deadline
         card_open = False
         profile_open = False
         frame = None
@@ -409,11 +421,13 @@ class WorkerNavigator:
             # 先找实际显示的主播入口；刚进直播时顶栏可能还未加载或被清屏隐藏。
             # 已有资料卡则直接读取，不能再次点击背景把它关掉。
             avatars = []
+            bypasser.dump_timeout_sec = 8.0
+            entry_clicked = False
             # 三次点击后仍须读取一次结果，不能把刚打开的资料卡误当失败。
             for entry_attempt in range(4):
-                if stop_requested() or time.monotonic() >= deadline:
+                if stop_requested() or operation_deadline-time.monotonic() < 3:
                     return RoomEvidence(source='cancelled_or_deadline')
-                bypasser.deadline = min(deadline, time.monotonic()+8)
+                bypasser.deadline = min(operation_deadline, time.monotonic()+11)
                 xml = bypasser.get_ui_dump()
                 tree = ET.fromstring(xml) if xml else None
                 if tree is not None:
@@ -424,6 +438,10 @@ class WorkerNavigator:
                     point = self._anchor_entry_point(tree, w, h)
                 else:
                     point = None
+                if not xml and entry_clicked:
+                    # 点击后读取超时：只等结果，不再次盲点把刚打开的卡片关掉。
+                    self._navigation_sleep(1.0, operation_deadline, stop_requested)
+                    continue
                 if entry_attempt == 3:
                     break  # 最后一轮只确认第三次点击的结果，不产生第四次点击。
                 if point:
@@ -431,7 +449,8 @@ class WorkerNavigator:
                 else:
                     # 只在已适配竖屏直播页尝试左上主播头像；绝不点击中部活动/礼物区。
                     self._adb('shell','input','tap',str(int(w*.0833)),str(int(h*.0755)))
-                self._navigation_sleep(.8, deadline, stop_requested)
+                entry_clicked = True
+                self._navigation_sleep(.8, operation_deadline, stop_requested)
             if len(avatars) != 1:
                 logger.info('直播页已到达，但主播资料入口尚未就绪，将同页复检')
                 return RoomEvidence(source='anchor_card_not_ready')
@@ -450,7 +469,7 @@ class WorkerNavigator:
                 return RoomEvidence(nickname=nickname)
             self._adb('shell', 'input', 'tap', str((x1+x2)//2), str((y1+y2)//2))
             profile_open = True
-            until = min(deadline, time.monotonic()+6)
+            until = min(operation_deadline, time.monotonic()+12)
             while time.monotonic() < until and not stop_requested():
                 after = self._adb('shell','dumpsys','activity','activities')
                 evidence = fresh_profile_evidence(before, after, active.group(1), nickname)
@@ -462,8 +481,8 @@ class WorkerNavigator:
             logger.warning('当前房间取证未完成，将尝试纠偏: %s', exc)
             return RoomEvidence()
         finally:
-            # 页面取证属于导航阶段：清理拥有独立的有限预算，停止/超时也退出自己打开的页面。
-            cleanup_deadline = time.monotonic() + 6
+            # 清理最多10秒，取消时也不能把整个剩余取证时限都用于清理。
+            cleanup_deadline = min(cleanup_deadline, time.monotonic()+10.0)
             self._operation_deadline = cleanup_deadline
             if profile_open:
                 for _ in range(3):
@@ -481,33 +500,64 @@ class WorkerNavigator:
                 self.dismiss_live_overlay(cleanup_deadline, lambda: False)
             self._operation_deadline = old
 
-    def wait_live_picture(self, deadline, stop_requested, *, check_overlay=True):
-        """取证后确认真正回到直播并已有有效动态画面。"""
+    def wait_live_picture(self, deadline, stop_requested, *, check_overlay=True,
+                          return_from_profile=False):
+        """等待当前页就绪：空观测属于未知，不等同已离开直播间。
+
+        仅取证后的调用允许退出本流程打开的资料页；已经确认错误页面时仍返回失败。
+        遮挡检查与图像采样分配预算，避免UI查询吞掉两次完整截图所需的时间。
+        """
         import numpy as np
         old = self._operation_deadline
         self._operation_deadline = deadline
         previous = None
+        last_problem = 'render_timeout'
+        backs = 0
+        overlay_checked = not check_overlay
         try:
-            if check_overlay and not self.dismiss_live_overlay(deadline, stop_requested):
-                self.last_gate_reason = 'overlay_not_recovered'
-                return False
             while time.monotonic() < deadline and not stop_requested():
+                if deadline-time.monotonic() < 1.0:
+                    break
                 act = self.get_current_focus_activity() or ''
+                if not act:
+                    last_problem = 'page_probe_unavailable'
+                    self._navigation_sleep(.5, deadline, stop_requested)
+                    continue
                 if 'LivePlayActivity' not in act:
+                    if return_from_profile and backs < 3 and ('UserProfileActivity' in act or 'login' in act.lower()):
+                        self._adb('shell', 'input', 'keyevent', '4')
+                        backs += 1
+                        self._navigation_sleep(.6, deadline, stop_requested)
+                        continue
                     self.last_gate_reason = 'login_blocked' if 'login' in act.lower() else 'navigation_failed'
                     return False
+                if not overlay_checked:
+                    # 15秒检查/返回遮挡，至少留下10秒给两次截图；不以毫秒余额启动探针。
+                    overlay_deadline = min(deadline-10, time.monotonic()+15)
+                    if overlay_deadline-time.monotonic() < 2:
+                        last_problem = 'page_probe_unavailable'
+                        break
+                    if not self.dismiss_live_overlay(overlay_deadline, stop_requested):
+                        self.last_gate_reason = 'overlay_not_recovered'
+                        return False
+                    overlay_checked = True
+                    # 返回操作后重新读取Activity再采样，不使用点击前的页面状态。
+                    continue
                 frame = self._capture_frame_array()
-                if frame is not None:
+                if frame is None:
+                    last_problem = 'picture_probe_unavailable'
+                else:
+                    last_problem = 'render_timeout'
                     h,w = frame.shape[:2]
                     roi = frame[int(h*.15):int(h*.75),int(w*.08):int(w*.85):2]
                     if previous is not None and previous.shape == roi.shape:
                         motion = float(np.mean(np.abs(roi.astype(np.int16)-previous.astype(np.int16)) > 15))
                         if motion > .003 and float(np.std(roi)) > 5:
                             self.last_gate_reason = ''
-                            return True
+                            return not stop_requested()
                     previous = roi.copy()
                 self._navigation_sleep(.4, deadline, stop_requested)
-            self.last_gate_reason = 'render_timeout'
+            self.last_gate_reason = 'cancelled' if stop_requested() else last_problem
             return False
         finally:
             self._operation_deadline = old

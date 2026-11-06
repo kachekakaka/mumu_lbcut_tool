@@ -44,7 +44,7 @@ from src.worker.naming_lock import (
 )
 from src.worker.popup_bypasser import PopupBypasser
 from src.worker.identity_verifier import IdentityStatus
-from src.worker.room_locator import locate_target
+from src.worker.room_locator import locate_target, validate_navigation_timeout
 from src.worker.segment_verifier import finalize_segment, verify_segment_file
 from src.worker.watchdog import StallWatchdog
 
@@ -86,6 +86,7 @@ class WorkerConfig:
     web_rid: str | None = None
     expected_anchor_uid: str | None = None
     job_id: str | None = None
+    navigation_timeout_sec: float = 300.0  # 从目标定位到开录就绪的总时限
     identity_interval_sec: float = 120.0
     identity_recheck_timeout_sec: float = 30.0
 
@@ -103,6 +104,7 @@ class WorkerController:
     """
 
     def __init__(self, config: WorkerConfig, emitter: WorkerEventEmitter | None = None):
+        validate_navigation_timeout(config.navigation_timeout_sec)
         self.config = config
         self.emitter = emitter or WorkerEventEmitter(stream=sys.stdout)
         self.stop_requested = False
@@ -787,18 +789,26 @@ class WorkerController:
         return not self.stop_requested
 
     def _locate_target_room(self):
+        navigation_started = time.monotonic()
+        current_phase = ''
         def report(**step):
+            nonlocal current_phase
+            current_phase = step.get('phase', current_phase)
+            elapsed = time.monotonic() - navigation_started
             evidence = step.get('evidence')
             self.emitter.emit(RoomNavigationEvent(attempt=step.get('attempt', 0),
                 action=step.get('action', ''), route=step.get('route', ''), reason=step.get('reason', ''),
                 observed_room_id=evidence.room_id if evidence else None,
                 observed_anchor_uid=evidence.anchor_uid if evidence else None,
                 evidence_source=evidence.source if evidence else 'unavailable',
-                evidence_observed_at=evidence.observed_at if evidence else 0.0))
+                evidence_observed_at=evidence.observed_at if evidence else 0.0,
+                phase=current_phase, elapsed_sec=step.get('elapsed_sec', round(elapsed, 3)),
+                remaining_sec=step.get('remaining_sec', round(max(0.0, self.config.navigation_timeout_sec-elapsed), 3)),
+                stage_budget_sec=step.get('stage_budget_sec', 0.0)))
         result = locate_target(self._navigator, self.target_room_id,
             target_kind=self.config.target_kind, web_rid=self.config.web_rid,
-            anchor_uid=self.target_uid, timeout_sec=100, max_attempts=3,
-            stop_requested=lambda: self.stop_requested, on_step=report,
+            anchor_uid=self.target_uid, timeout_sec=self.config.navigation_timeout_sec, max_attempts=3,
+            stop_requested=lambda: not self._pipeline_wait_tick(), on_step=report,
             allow_unconfirmed=self.config.allow_unconfirmed_identity)
         self.identity_status = result.status
         self.emitter.set_context(room_identity_status=result.status.value.lower())
@@ -832,7 +842,7 @@ class WorkerController:
             return EXIT_DEVICE_UNAVAILABLE
         if reason in ('id_mismatch', 'room_evidence_unavailable'):
             return EXIT_ROOM_MISMATCH
-        if reason == 'render_timeout':
+        if reason in ('render_timeout', 'picture_probe_unavailable', 'overlay_not_recovered', 'page_probe_unavailable'):
             return EXIT_PREFLIGHT_STALL
         return EXIT_NAVIGATION_FAILED
 

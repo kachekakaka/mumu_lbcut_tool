@@ -26,12 +26,13 @@ class PopupBypasser:
     def __init__(self, adb_client: AdbDeviceClient):
         self.adb = adb_client
         self.deadline = None
+        self.dump_timeout_sec = 5.0
 
     def _budget(self, maximum: float) -> float:
         if self.deadline is None:
             return maximum
         remaining = self.deadline - time.monotonic()
-        if remaining <= 0:
+        if remaining < 1.0:
             raise TimeoutError("弹窗探针总预算耗尽")
         return min(maximum, remaining)
 
@@ -39,7 +40,7 @@ class PopupBypasser:
         """唯一临时路径保证新鲜度；兼容 MuMu 写出 XML 后 dumper 返回 139。"""
         remote = '/sdcard/wp_ui_' + uuid.uuid4().hex + '.xml'
         try:
-            self.adb.run_adb('shell', 'uiautomator', 'dump', remote, timeout=self._budget(5.0))
+            self.adb.run_adb('shell', 'uiautomator', 'dump', remote, timeout=self._budget(self.dump_timeout_sec))
             result = self.adb.run_adb('shell', 'cat', remote, timeout=self._budget(2.0))
             if result.exit_code != 0:
                 return ''

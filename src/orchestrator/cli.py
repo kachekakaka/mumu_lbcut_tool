@@ -33,6 +33,8 @@ def build_parser():
     run = sub.add_parser("run", help="运行调度；Ctrl+C 平滑停止本主控任务")
     run.add_argument("--instances", required=True, help="明确允许使用的实例，例如 2,3")
     run.add_argument("--output-dir", type=Path, required=True)
+    run.add_argument("--navigation-timeout", type=float, default=300.0,
+                     help="传给Worker的定位总时限（60～900秒），默认300秒")
     run.add_argument("--scan-interval", type=float, default=30.0)
     run.add_argument("--segment-duration", type=int, default=1800)
     run.add_argument("--overlap-duration", type=float, default=0.0)
@@ -49,6 +51,8 @@ def main(argv=None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if args.command == "run":
         try:
+            from src.worker.room_locator import validate_navigation_timeout
+            validate_navigation_timeout(args.navigation_timeout)
             indices = [int(x) for x in args.instances.split(",")]
             if not indices or any(i < 0 for i in indices):
                 raise ValueError()
@@ -79,7 +83,7 @@ def main(argv=None) -> int:
             scheduler = Scheduler(store, args.output_dir, indices,
                 scan_interval_sec=args.scan_interval, max_attempts=args.max_attempts,
                 segment_duration_sec=args.segment_duration, overlap_duration_sec=args.overlap_duration,
-                recording_mode=args.recording_mode)
+                recording_mode=args.recording_mode, navigation_timeout_sec=args.navigation_timeout)
             stop = threading.Event()
             def request_stop(signum, frame):
                 stop.set()
