@@ -30,9 +30,9 @@ def test_popup_bypass_handles_youth_mode_dialog():
     mock_adb = MagicMock()
     # 模拟 UI dump 包含青少年模式
     ui_dump_with_youth_mode = """
-    <node text="为呵护未成年人健康成长，抖音特别推出青少年模式" bounds="[100,500][900,1000]">
+    <hierarchy><node text="为呵护未成年人健康成长，抖音特别推出青少年模式" bounds="[100,500][900,1000]">
         <node text="我知道了" resource-id="com.ss.android.ugc.aweme:id/confirm_btn" bounds="[200,1100][800,1200]" />
-    </node>
+    </node></hierarchy>
     """
     mock_adb.run_adb.return_value = MagicMock(exit_code=0, stdout=ui_dump_with_youth_mode, stderr="")
 

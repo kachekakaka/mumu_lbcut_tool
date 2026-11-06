@@ -1,0 +1,296 @@
+"""单个 scrcpy 连续编码，命名管道传递 MKV，ffmpeg 无重编码分装 MP4。
+
+计划切片只由 segment muxer 在关键帧处分装；不重启采集、不复制重叠内容。
+实际切点依赖关键帧，不能承诺任意秒数精确切割。此传输当前仅支持 Windows。
+"""
+from collections import deque
+from dataclasses import dataclass
+import csv
+import ctypes
+import ctypes.wintypes as W
+import io
+import logging
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import subprocess
+import threading
+import time
+import uuid
+
+from src.worker.scrcpy_probe import PipelineLogDrainer
+
+log = logging.getLogger(__name__)
+
+
+class NamedPipeBridge:
+    """有界内存的单写者字节桥；不创建长期增长的中间录像文件。"""
+    def __init__(self):
+        if os.name != 'nt':
+            raise RuntimeError('连续采集命名管道当前只支持 Windows')
+        self.name = r'\\.\pipe\mumu_capture_' + uuid.uuid4().hex
+        self.bytes_forwarded = 0
+        self.error = None
+        self.done = threading.Event()
+        self.cancel = threading.Event()
+        self._thread = None
+        self.k = ctypes.WinDLL('kernel32', use_last_error=True)
+        self.k.CreateNamedPipeW.argtypes = [W.LPCWSTR,W.DWORD,W.DWORD,W.DWORD,W.DWORD,W.DWORD,W.DWORD,W.LPVOID]
+        self.k.CreateNamedPipeW.restype = W.HANDLE
+        self.k.ConnectNamedPipe.argtypes = [W.HANDLE,W.LPVOID]
+        self.k.ConnectNamedPipe.restype = W.BOOL
+        self.k.ReadFile.argtypes = [W.HANDLE,W.LPVOID,W.DWORD,ctypes.POINTER(W.DWORD),W.LPVOID]
+        self.k.ReadFile.restype = W.BOOL
+        self.k.CloseHandle.argtypes = [W.HANDLE]
+        self.k.CloseHandle.restype = W.BOOL
+        # PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE, BYTE/NOWAIT.
+        self.handle = self.k.CreateNamedPipeW(self.name, 0x80001, 1, 1, 1048576, 1048576, 0, None)
+        if self.handle == W.HANDLE(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def start(self, sink):
+        if self._thread:
+            raise RuntimeError('字节桥不允许重复启动')
+        def pump():
+            buf, count = ctypes.create_string_buffer(65536), W.DWORD()
+            try:
+                while not self.cancel.is_set():
+                    self.k.ConnectNamedPipe(self.handle, None)
+                    if self.k.ReadFile(self.handle, buf, len(buf), ctypes.byref(count), None):
+                        if not count.value:
+                            self.cancel.wait(.01)
+                            continue
+                        data = memoryview(buf.raw)[:count.value]
+                        while data:
+                            wrote = sink.write(data)
+                            if wrote is None or wrote <= 0:
+                                raise BrokenPipeError('分装进程拒绝输入')
+                            data = data[wrote:]
+                            self.bytes_forwarded += wrote
+                        sink.flush()
+                    else:
+                        error = ctypes.get_last_error()
+                        if error in (232,536):  # 暂无数据/等待唯一生产者连接。
+                            self.cancel.wait(.01)
+                            continue
+                        if error == 109:  # 生产者关闭；正常 EOF，不能抢先截断。
+                            break
+                        raise OSError(error, '命名管道读取失败')
+            except Exception as exc:
+                self.error = str(exc)
+            finally:
+                try:
+                    sink.close()
+                except OSError:
+                    pass
+                self.k.CloseHandle(self.handle)
+                self.handle = None
+                self.done.set()
+        self._thread = threading.Thread(target=pump, name='continuous-mkv-bridge', daemon=True)
+        self._thread.start()
+
+    def join(self, timeout):
+        if self._thread:
+            self._thread.join(timeout)
+            return not self._thread.is_alive()
+        if self.handle is not None:
+            self.k.CloseHandle(self.handle)
+            self.handle = None
+        self.done.set()
+        return True
+
+
+@dataclass(frozen=True)
+class Fragment:
+    index: int
+    path: Path
+    closed: bool
+    start_pts: float | None = None
+    end_pts: float | None = None
+
+
+def read_fragment_manifest(directory: Path) -> dict[int, Fragment]:
+    """仅换行完整的 CSV 记录表示 muxer 已封口；文件存在不是完成证据。"""
+    result = {}
+    path = directory / 'segments.csv'
+    if not path.exists():
+        return result
+    text = path.read_text(encoding='utf-8')
+    complete = text[:text.rfind('\n')+1]
+    for row in csv.reader(io.StringIO(complete)):
+        if len(row) != 3:
+            raise ValueError('分装完成清单格式错误')
+        name, start, end = row
+        match = re.fullmatch(r'part_(\d+)\.mp4', Path(name).name)
+        if not match:
+            raise ValueError('分装清单出现未知文件名')
+        idx = int(match.group(1))
+        result[idx] = Fragment(idx, directory / Path(name).name, True, float(start), float(end))
+    return result
+
+
+class ContinuousPipeline:
+    """一代采集会话只有一个 scrcpy 和一个 segmenter；故障恢复才另起一代。"""
+    def __init__(self, serial, output_dir, scrcpy_exe, adb_exe, segment_duration_sec,
+                 ffmpeg_exe=None, max_size=1280, bit_rate='4M', max_fps=None,
+                 start_index=1, producer_factory=None):
+        self.serial, self.output_dir = serial, Path(output_dir).resolve()
+        self.scrcpy_exe, self.adb_exe = Path(scrcpy_exe), Path(adb_exe)
+        self.ffmpeg_exe = str(ffmpeg_exe or shutil.which('ffmpeg') or '')
+        if not self.ffmpeg_exe or not shutil.which('ffprobe'):
+            raise FileNotFoundError('连续采集需要 ffmpeg 与 ffprobe；不会降级伪报成功')
+        if segment_duration_sec <= 0 or start_index < 1:
+            raise ValueError('分段时长和起始序号必须为正数')
+        self.segment_duration_sec = segment_duration_sec
+        self.start_index = start_index
+        self.max_size, self.bit_rate, self.max_fps = max_size, bit_rate, max_fps
+        self.producer_factory = producer_factory
+        self.directory = self.output_dir / ('capture_' + uuid.uuid4().hex)
+        self._proc = self._mux = None
+        self.bridge = None
+        self.wait_hook = None
+        self.started_at = 0.0
+        self._stopped = False
+        self.forced_stop = False
+        self._capture_drainer = None
+        self._progress_thread = None
+        self._mux_log = None
+        self.logs = deque(maxlen=40)
+        self.progress = {}
+        self.command = []
+        self._fragments = {}
+        self.current_file_path = None
+        self.current_segment_index = 0
+
+    def start(self, timeout_sec=25):
+        if self._proc or self._mux:
+            raise RuntimeError('连续采集实例不可重用')
+        self.directory.mkdir(parents=True, exist_ok=False)
+        self.bridge = NamedPipeBridge()
+        flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0
+        self._mux_log = (self.directory/'segmenter.stderr.log').open('xb')
+        mux_cmd = [self.ffmpeg_exe,'-hide_banner','-loglevel','warning','-nostdin','-n',
+            '-f','matroska','-i','pipe:0','-map','0:v:0','-map','0:a:0','-c','copy',
+            '-f','segment','-segment_time',str(self.segment_duration_sec),
+            '-segment_time_delta','0.05','-reset_timestamps','1',
+            '-segment_start_number',str(self.start_index),'-segment_format','mp4',
+            '-segment_list',str(self.directory/'segments.csv'),'-segment_list_type','csv',
+            '-progress','pipe:1',str(self.directory/'part_%06d.mp4')]
+        try:
+            self._mux = subprocess.Popen(mux_cmd,stdin=subprocess.PIPE,stdout=subprocess.PIPE,
+                stderr=self._mux_log,bufsize=0,creationflags=flags)
+            self.bridge.start(self._mux.stdin)
+            def progress():
+                try:
+                    for raw in iter(self._mux.stdout.readline,b''):
+                        key,sep,value=raw.decode('utf8','replace').strip().partition('=')
+                        if sep:self.progress[key]=value
+                finally:
+                    self._mux.stdout.close()
+            self._progress_thread=threading.Thread(target=progress,name='continuous-progress',daemon=True)
+            self._progress_thread.start()
+            cmd=[str(self.scrcpy_exe),'-s',self.serial,'--record='+self.bridge.name,
+                '--record-format=mkv','--no-playback','--no-window','--no-control',
+                '--audio-source=playback','--audio-codec=aac','--video-codec=h264',
+                '--require-audio','--display-id=0','--video-bit-rate='+self.bit_rate,
+                '--max-size='+str(self.max_size),'--video-codec-options=i-frame-interval=2']
+            if self.max_fps:cmd.append('--max-fps='+str(self.max_fps))
+            env=dict(os.environ,ADB=str(self.adb_exe))
+            env['PATH']=str(self.adb_exe.parent)+os.pathsep+env.get('PATH','')
+            self.command=cmd
+            if self.producer_factory:
+                self._proc=self.producer_factory(self.bridge.name,self.directory)
+            else:
+                self._proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+                    text=True,encoding='utf8',errors='replace',env=env,creationflags=flags)
+            def capture_log(line):
+                self.logs.append(line)
+                log.info('[capture] %s',line)
+            self._capture_drainer=PipelineLogDrainer(self._proc,on_log_line=capture_log)
+            self._capture_drainer.start()
+            self.started_at=time.monotonic()
+            until=self.started_at+timeout_sec
+            while time.monotonic()<until:
+                if self.wait_hook and self.wait_hook() is False:
+                    raise InterruptedError('启动连续采集时收到停止请求')
+                if not self.is_recording():
+                    raise RuntimeError('连续采集启动失败: '+self.failure_details())
+                fragments=self.fragments()
+                if any(f.path.exists() and f.path.stat().st_size>1024 for f in fragments):
+                    return
+                time.sleep(.05)
+            raise TimeoutError('持续采集未在预算内产生可见媒体进度')
+        except BaseException:
+            self.stop(timeout_sec=8)
+            raise
+
+    def fragments(self):
+        completed=read_fragment_manifest(self.directory)
+        for path in sorted(self.directory.glob('part_*.mp4')):
+            match=re.fullmatch(r'part_(\d+)\.mp4',path.name)
+            if match:
+                idx=int(match.group(1))
+                self._fragments.setdefault(idx,Fragment(idx,path,False))
+        self._fragments.update(completed)
+        if self._fragments:
+            newest=self._fragments[max(self._fragments)]
+            self.current_segment_index,self.current_file_path=newest.index,newest.path
+        return [self._fragments[i] for i in sorted(self._fragments)]
+
+    def is_recording(self):
+        return bool(self._proc and self._mux and self._proc.poll() is None
+                    and self._mux.poll() is None and self.bridge and not self.bridge.error)
+
+    def get_exit_code(self):
+        if self.forced_stop or (self.bridge and self.bridge.error):return 30
+        codes=[p.poll() for p in (self._proc,self._mux) if p]
+        if any(c not in (None,0) for c in codes):return next(c for c in codes if c not in (None,0))
+        return 0 if len(codes)==2 and all(c==0 for c in codes) else None
+
+    def get_current_file_size_mb(self):
+        # 传输进度单调累积，物理切片换文件不能触发文件倒退误报。
+        return (self.bridge.bytes_forwarded if self.bridge else 0)/1048576
+
+    def get_current_segment_elapsed(self):
+        return max(0,time.monotonic()-self.started_at)
+
+    def failure_details(self):
+        tail=''
+        try:tail=(self.directory/'segmenter.stderr.log').read_text(encoding='utf8',errors='replace')[-1200:]
+        except OSError:pass
+        return f'capture={self._proc.poll() if self._proc else None}, mux={self._mux.poll() if self._mux else None}; bridge={self.bridge.error if self.bridge else None}; '+tail+'; '+' | '.join(self.logs)[-1200:]
+
+    def stop(self, timeout_sec=15):
+        if self._stopped:return self.get_exit_code()==0
+        deadline=time.monotonic()+timeout_sec
+        # 先停止唯一采集进程，等 MKV 字节桥自然 EOF，再让封装器写完最后一片。
+        if self._proc and self._proc.poll() is None:
+            self._proc.send_signal(signal.CTRL_BREAK_EVENT if os.name=='nt' else signal.SIGINT)
+        while self._proc and self._proc.poll() is None and time.monotonic()<deadline:
+            if self.wait_hook:self.wait_hook()
+            time.sleep(.05)
+        if self._proc and self._proc.poll() is None:
+            self.forced_stop=True;self._proc.kill();self._proc.wait(timeout=3)
+        if self.bridge:
+            if not self.bridge.join(max(0,deadline-time.monotonic())):
+                self.forced_stop=True;self.bridge.cancel.set()
+        if self._mux:
+            try:self._mux.wait(timeout=max(.05,deadline-time.monotonic()))
+            except subprocess.TimeoutExpired:
+                self.forced_stop=True;self._mux.kill();self._mux.wait(timeout=3)
+        if self.bridge:
+            self.bridge.cancel.set()
+            if not self.bridge.join(2):raise RuntimeError('分装字节桥未退出，禁止释放实例')
+        if self._capture_drainer:self._capture_drainer.join(timeout=2)
+        if self._progress_thread:self._progress_thread.join(timeout=2)
+        if self._mux_log:self._mux_log.close()
+        self._stopped=True
+        return self.get_exit_code()==0
+
+    def stop_segment(self, timeout_sec=15):
+        return self.stop(timeout_sec)
+
+    def teardown(self):
+        return self.stop()

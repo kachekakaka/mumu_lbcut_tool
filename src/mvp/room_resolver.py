@@ -31,6 +31,7 @@ class ResolvedRoom:
     room_id: str | None = None
     title: str | None = None
     nickname: str | None = None
+    anchor_uid: str | None = None  # 主播稳定 UID，与场次 room_id 分开
 
 
 class _ScriptCollector(HTMLParser):
@@ -142,6 +143,7 @@ class RoomResolver:
 
         try:
             resp = self.session.get(url, timeout=self.timeout)
+            resp.raise_for_status()
             html = resp.text
 
             room_obj = None
@@ -168,29 +170,11 @@ class RoomResolver:
                     status=status,
                     room_id=room_id,
                     title=title,
-                    nickname=nickname
+                    nickname=nickname,
+                    anchor_uid=str(owner.get("id_str") or owner.get("id")) if (owner.get("id_str") or owner.get("id")) else None,
                 )
 
-            # 备用轻量正则
-            status = RoomStatus.UNKNOWN
-            status_match = re.search(r'\\\"status\\\":\s*(\d+)', html) or re.search(r'"status":\s*(\d+)', html)
-            if status_match:
-                code = status_match.group(1)
-                if code == "2":
-                    status = RoomStatus.LIVE
-                elif code in ("4", "0"):
-                    status = RoomStatus.ENDED
-
-            m_id = re.search(r'\\\"id_str\\\":\s*\\\"(\d+)\\\"', html) or re.search(r'"id_str":\s*"(\d+)"', html)
-            room_id = m_id.group(1) if m_id else web_rid
-
-            m_title = re.search(r'\\\"title\\\":\s*\\\"(.*?)\\\"', html) or re.search(r'"title":\s*"(.*?)"', html)
-            title = m_title.group(1) if m_title else None
-
-            m_nick = re.search(r'\\\"nickname\\\":\s*\\\"(.*?)\\\"', html) or re.search(r'"nickname":\s*"(.*?)"', html)
-            nickname = m_nick.group(1) if m_nick else None
-
-            return ResolvedRoom(web_rid=web_rid, status=status, room_id=room_id, title=title, nickname=nickname)
+            return ResolvedRoom(web_rid=web_rid, status=RoomStatus.UNKNOWN)
         except Exception as e:
             logger.error(f"查询直播间 {web_rid} 失败: {e}")
             return ResolvedRoom(web_rid=web_rid, status=RoomStatus.UNKNOWN)

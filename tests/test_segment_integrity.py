@@ -18,7 +18,7 @@ def test_verify_segment_file_rejects_zero_or_tiny_file(tmp_path):
 
     result = verify_segment_file(tiny_file, min_size_bytes=1024)
     assert not result.is_valid
-    assert "文件过小" in result.reject_reason or "size" in result.reject_reason
+    assert result.reject_reason  # 依据容器解析失败，而非固定大小门槛
 
 
 def test_verify_segment_file_rejects_missing_audio(tmp_path):
@@ -71,8 +71,8 @@ def test_verify_segment_file_accepts_valid_dual_track(tmp_path):
         assert result.duration == 180.5
 
 
-def test_finalize_segment_renames_on_success_and_marks_corrupted_on_failure(tmp_path):
-    """finalize_segment 校验通过时原子更名，校验失败时打上 .corrupted 标记。"""
+def test_finalize_segment_archives_success_and_preserves_failure(tmp_path):
+    """校验通过时无覆盖归档，失败时保留原始文件并准确返回失败。"""
     raw_file = tmp_path / "recording_tmp.mp4"
     raw_file.write_bytes(b"dummy_data_padding" * 100)
     target_final = tmp_path / "record_final_001.mp4"
@@ -109,6 +109,30 @@ def test_finalize_segment_renames_on_success_and_marks_corrupted_on_failure(tmp_
         )
         ok, final_path, res = finalize_segment(bad_raw, bad_target)
         assert ok is False
-        assert final_path.suffix == ".corrupted" or ".corrupted" in final_path.name
+        assert final_path == bad_raw
+        assert bad_raw.read_bytes() == b"bad_data"
         assert final_path.exists()
         assert not bad_target.exists()
+
+
+def test_valid_small_tail_uses_actual_ffprobe(tmp_path, valid_media):
+    import shutil
+    raw = tmp_path / "valid_small.mp4"
+    shutil.copyfile(valid_media, raw)
+    result = verify_segment_file(raw, min_size_bytes=10 * 1024 * 1024, allow_short_tail=True)
+    assert result.is_valid and result.has_video and result.has_audio
+    assert result.duration > 0
+    assert result.is_short_tail
+
+
+def test_archive_conflict_preserves_both_files(tmp_path, valid_media):
+    import shutil
+    raw = tmp_path / "raw.mp4"
+    target = tmp_path / "existing.mp4"
+    shutil.copyfile(valid_media, raw)
+    target.write_bytes(b"existing-valuable-recording")
+    before = raw.read_bytes()
+    ok, path, result = finalize_segment(raw, target, allow_short_tail=True)
+    assert not ok and path == raw
+    assert raw.read_bytes() == before
+    assert target.read_bytes() == b"existing-valuable-recording"

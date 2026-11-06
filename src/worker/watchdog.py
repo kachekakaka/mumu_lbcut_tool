@@ -1,214 +1,199 @@
-"""卡顿看门狗线程与原地自愈意图投递器。"""
+"""只读看门狗：真实 ROI 帧差、独立文件进度和有界探针失败处理。"""
+from dataclasses import dataclass
 import logging
 import threading
 import time
-from typing import Callable, Optional
+from typing import Callable
 
-from src.worker.navigator import WorkerNavigator
-from src.worker.pipeline import WorkerPipeline
-from src.worker.state_machine import ActionType, PipelineAction
+import numpy as np
+from src.worker.state_machine import PipelineAction, ActionType
 
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class WatchdogSnapshot:
+    generation_id: int
+    sampled_at: float
+    video_motion: float | None
+    video_frozen_sec: float
+    file_stall_sec: float
+    probe_failure_sec: float
+    login_blocked: bool = False
+
+
 class StallWatchdog:
-    """监测录制文件字节增长与画面动态，向主线程投递分级自愈意图。
-
-    严格遵循 ADR 0008 单写者队列设计：
-    看门狗作为只读观察者，仅投递带采样时代际快照的 PipelineAction，
-    严禁直接调用导航刷新或发射生命周期事件。
-    """
-
-    def __init__(
-        self,
-        pipeline: WorkerPipeline,
-        navigator: WorkerNavigator,
-        room_id: str,
-        check_interval_sec: float = 2.0,
-        stall_threshold_sec: float = 10.0,
-        segment_recycle_threshold_sec: float = 20.0,
-        fatal_threshold_sec: float = 45.0,
-        visual_probe_interval_sec: float = 30.0,
-        generation_provider: Callable[[], int] | None = None,
-        on_post_action: Callable[[PipelineAction], None] | None = None,
-        on_stall_action: Callable[[str, float], None] | None = None,
-        on_request_new_segment: Callable[[], None] | None = None,
-        on_fatal_stall: Callable[[], None] | None = None,
-    ):
-        self.pipeline = pipeline
-        self.navigator = navigator
-        self.room_id = room_id
+    """后台仅采样和投递意图；导航、重启和生命周期事件均归主控制器。"""
+    def __init__(self, pipeline, navigator, room_id: str,
+                 check_interval_sec: float = 2.0, stall_threshold_sec: float = 10.0,
+                 segment_recycle_threshold_sec: float = 20.0, fatal_threshold_sec: float = 45.0,
+                 visual_probe_interval_sec: float = 5.0,
+                 generation_provider: Callable[[], int] | None = None,
+                 on_post_action: Callable[[PipelineAction], None] | None = None,
+                 on_stall_action=None, on_request_new_segment=None, on_fatal_stall=None):
+        self.pipeline, self.navigator, self.room_id = pipeline, navigator, room_id
         self.check_interval_sec = check_interval_sec
         self.stall_threshold_sec = stall_threshold_sec
-        self.segment_recycle_threshold_sec = segment_recycle_threshold_sec
-        self.fatal_threshold_sec = fatal_threshold_sec
+        self.segment_recycle_threshold_sec = max(segment_recycle_threshold_sec, stall_threshold_sec * 2)
+        self.fatal_threshold_sec = max(fatal_threshold_sec, self.segment_recycle_threshold_sec + 5)
         self.visual_probe_interval_sec = visual_probe_interval_sec
-
         self.generation_provider = generation_provider or (lambda: 0)
         self.on_post_action = on_post_action
         self.on_stall_action = on_stall_action
         self.on_request_new_segment = on_request_new_segment
         self.on_fatal_stall = on_fatal_stall
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._thread = None
+        self._snapshot = None
+        self._sample_gen = None
+        self._reset()
 
-        self._running = False
-        self._thread: threading.Thread | None = None
-        self._last_size_mb: float = 0.0
-        self._stall_start_time: float | None = None
-        self._action_taken_level: int = 0
-        self._last_visual_probe_time: float = 0.0
-        self._visual_stall_count: int = 0
-
-    def start(self):
-        """启动监控线程。"""
-        self._running = True
+    def _reset(self):
+        self._previous_roi = None
+        self._last_size_mb = None
         self._stall_start_time = None
-        self._action_taken_level = 0
+        self._frozen_since = None
+        self._probe_failed_since = None
+        self._last_visual_probe_time = float('-inf')
+        self._low_motion_count = 0
         self._visual_stall_count = 0
-        self._last_visual_probe_time = time.time()
-        self._last_size_mb = self.pipeline.get_current_file_size_mb()
-        self._thread = threading.Thread(target=self._run_loop, daemon=True)
-        self._thread.start()
-        logger.info(f"卡顿看门狗已启动 (检查间隔 {self.check_interval_sec}s, 阈值 {self.stall_threshold_sec}s, 视觉探针 {self.visual_probe_interval_sec}s)")
-
-    def stop(self):
-        """停止监控。"""
-        self._running = False
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=2)
-        logger.info("卡顿看门狗已停止。")
+        self._action_taken_level = 0
+        self._motion = None
 
     def notify_segment_reset(self):
-        """切片轮转切换时，安全重置看门狗的字节基线与卡顿计时器，杜绝误判跨切片卡顿。"""
-        self._last_size_mb = 0.0
-        self._stall_start_time = None
-        self._action_taken_level = 0
-        self._visual_stall_count = 0
+        with self._lock:
+            self._sample_gen = None
+            self._snapshot = None
 
-    def _run_loop(self):
-        import numpy as np
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            raise RuntimeError("旧看门狗未退出，禁止创建重复监控线程")
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run_loop, daemon=True, name="recording-watchdog")
+        self._thread.start()
 
-        while self._running:
-            time.sleep(self.check_interval_sec)
-            if not self._running or not self.pipeline.is_recording():
-                continue
+    def stop(self):
+        self._stop.set()
+        if self._thread and self._thread is not threading.current_thread():
+            self._thread.join(timeout=1.0)
 
-            # 捕获采样当时的代际快照
-            sampled_gen = self.generation_provider()
+    def snapshot(self) -> WatchdogSnapshot | None:
+        with self._lock:
+            return self._snapshot
 
-            # 1. 周期性视觉动态抽样 (Visual Probe)
-            now = time.time()
-            if now - self._last_visual_probe_time >= self.visual_probe_interval_sec:
-                self._last_visual_probe_time = now
-                act = self.navigator.get_current_focus_activity() or ""
-                frame = self.navigator._capture_frame_array()
-                is_login_page = False
-                if "DYLoginActivity" in act or "login" in act.lower():
-                    is_login_page = True
-                elif frame is not None:
-                    # 1. 全屏白底与粉色按钮检测（全屏 DYLoginActivity）
-                    white_ratio = float(np.mean((frame[:, :, 0] > 235) & (frame[:, :, 1] > 235) & (frame[:, :, 2] > 235)))
-                    pink_pixels = int(np.sum((frame[:, :, 0] > 220) & (frame[:, :, 1] < 120) & (frame[:, :, 2] < 150)))
-                    # 2. 居中卡片区域白底检测（居中“发现抖音朋友”弹窗）
-                    h, w, _ = frame.shape
-                    center_crop = frame[int(h * 0.27):int(h * 0.76), int(w * 0.11):int(w * 0.89)]
-                    center_white = float(np.mean((center_crop[:, :, 0] > 235) & (center_crop[:, :, 1] > 235) & (center_crop[:, :, 2] > 235))) if center_crop.size > 0 else 0.0
+    @staticmethod
+    def _roi(frame):
+        if frame is None or not isinstance(frame, np.ndarray) or frame.ndim != 3:
+            return None
+        h, w = frame.shape[:2]
+        crop = frame[int(h * .15):int(h * .65), int(w * .05):int(w * .95)]
+        if crop.size == 0:
+            return None
+        # 降采样降低复制和差分开销，不处理底部弹幕区。
+        stride = max(1, crop.shape[1] // 240)
+        return crop[::stride, ::stride, :3].mean(axis=2).astype(np.float32)
 
-                    if (white_ratio > 0.65 and pink_pixels > 1000) or center_white > 0.70:
-                        is_login_page = True
+    def _post(self, kind: ActionType, gen: int, reason: str):
+        if self._stop.is_set() or gen != self.generation_provider():
+            return
+        if self.on_post_action:
+            self.on_post_action(PipelineAction(kind, gen, reason))
+        # 保留无副作用的通知接口，不再在后台直接点击或刷新导航。
+        if kind == ActionType.RESTART_SEGMENT and self.on_request_new_segment:
+            self.on_request_new_segment()
+        if kind == ActionType.FATAL_STOP and self.on_fatal_stall:
+            self.on_fatal_stall()
 
-                if is_login_page:
-                    self._visual_stall_count += 1
-                    logger.warning(f"视觉看门狗检测到登录/阻断弹窗遮罩 (连续命中 {self._visual_stall_count} 次)")
-                    if self._visual_stall_count == 1:
-                        # 尝试一级穿透自愈
-                        if self.on_post_action:
-                            self.on_post_action(PipelineAction(
-                                action_type=ActionType.IN_PLACE_HEAL,
-                                generation_id=sampled_gen,
-                                reason="watchdog_visual_login_detected",
-                            ))
-                        else:
-                            self.navigator.dismiss_login_prompt()
-                            self.navigator.dismiss_center_dialog()
-                            self.navigator.refresh_current_room(self.room_id)
-                        if self.on_stall_action:
-                            self.on_stall_action("visual_login_healed", self.visual_probe_interval_sec)
-                    elif self._visual_stall_count >= 2:
-                        logger.error("视觉看门狗连续检测到登录阻断且自愈失败，投递致命故障动作")
-                        if self.on_post_action:
-                            self.on_post_action(PipelineAction(
-                                action_type=ActionType.FATAL_STOP,
-                                generation_id=sampled_gen,
-                                reason="watchdog_visual_login_fatal",
-                            ))
-                        if self.on_fatal_stall:
-                            self.on_fatal_stall()
-                        return
-                else:
-                    self._visual_stall_count = 0
-
-            # 2. 物理流文件体积增长检测
-            current_size = self.pipeline.get_current_file_size_mb()
-
-            # 判断是否有字节增长
-            if current_size > self._last_size_mb:
-                # 正常增长，重置卡顿计时器
-                if self._stall_start_time is not None:
-                    recovered_dur = time.time() - self._stall_start_time
-                    logger.info(f"画面与录制流恢复正常，卡顿结束 (持续 {recovered_dur:.1f}s)")
-                    if self.on_stall_action:
-                        self.on_stall_action("stall_healed", recovered_dur)
-                    self._stall_start_time = None
-                    self._action_taken_level = 0
-                self._last_size_mb = current_size
-                continue
-
-            # 出现无增长
-            now = time.time()
+    def check_once(self, now: float | None = None):
+        """一次真实采样；公开测试接缝，不依赖线程调度即可故障注入。"""
+        now = time.monotonic() if now is None else now
+        gen = self.generation_provider()
+        with self._lock:
+            if self._sample_gen != gen:
+                self._reset()
+                self._sample_gen = gen
+        if not self.pipeline.is_recording():
+            return
+        size = self.pipeline.get_current_file_size_mb()
+        if self._last_size_mb is not None and size <= self._last_size_mb:
             if self._stall_start_time is None:
                 self._stall_start_time = now
+        else:
+            self._stall_start_time = None
+        self._last_size_mb = size
 
-            stall_duration = now - self._stall_start_time
-
-            # 一级自愈：卡顿超过 stall_threshold_sec，向主线程投递原地 Intent 刷新请求
-            if stall_duration >= self.stall_threshold_sec and self._action_taken_level < 1:
-                logger.warning(f"检测到画面卡顿达 {stall_duration:.1f}s，触发一级自愈：原地 Intent 重新唤起")
-                self._action_taken_level = 1
-                if self.on_post_action:
-                    self.on_post_action(PipelineAction(
-                        action_type=ActionType.IN_PLACE_HEAL,
-                        generation_id=sampled_gen,
-                        reason="watchdog_motion_stall",
-                    ))
+        if now - self._last_visual_probe_time >= self.visual_probe_interval_sec:
+            self._last_visual_probe_time = now
+            act = self.navigator.get_current_focus_activity() or ""
+            frame = self.navigator._capture_frame_array()
+            if gen != self.generation_provider() or self._stop.is_set():
+                return  # 旧采样不可污染新切片。
+            login = "login" in act.lower()
+            # 白色直播、展馆加载页和浅色面板不能仅凭颜色确诊为登录。
+            # 登录强结论使用实际 Activity；原生面板交由只读表面探针识别后返回关闭。
+            # ROI冻结、文件停滞、探针不可用的检测仍独立执行。
+            self._visual_stall_count = self._visual_stall_count + 1 if login else 0
+            roi = self._roi(frame)
+            if roi is None or not act:
+                if self._probe_failed_since is None:
+                    self._probe_failed_since = now
+                self._motion = None
+            else:
+                self._probe_failed_since = None
+                if self._previous_roi is not None and roi.shape == self._previous_roi.shape:
+                    self._motion = float(np.mean(np.abs(roi - self._previous_roi)) / 255.0)
+                    if self._motion < .003:
+                        self._low_motion_count += 1
+                        if self._frozen_since is None:
+                            self._frozen_since = now
+                    else:
+                        self._frozen_since = None
+                        self._low_motion_count = 0
                 else:
-                    self.navigator.refresh_current_room(self.room_id)
-                if self.on_stall_action:
-                    self.on_stall_action("intent_refresh", stall_duration)
+                    self._frozen_since = None
+                    self._low_motion_count = 0
+                self._previous_roi = roi
 
-            # 二级自愈：卡顿超过 segment_recycle_threshold_sec，向主线程投递切片重拉请求
-            elif stall_duration >= self.segment_recycle_threshold_sec and self._action_taken_level < 2:
-                logger.warning(f"卡顿持续达 {stall_duration:.1f}s，投递二级自愈：切片重拉")
-                self._action_taken_level = 2
-                if self.on_post_action:
-                    self.on_post_action(PipelineAction(
-                        action_type=ActionType.RESTART_SEGMENT,
-                        generation_id=sampled_gen,
-                        reason="watchdog_stall_recycle",
-                    ))
-                if self.on_request_new_segment:
-                    self.on_request_new_segment()
-                if self.on_stall_action:
-                    self.on_stall_action("segment_recycle", stall_duration)
+        frozen = now - self._frozen_since if self._frozen_since is not None else 0.0
+        stalled = now - self._stall_start_time if self._stall_start_time is not None else 0.0
+        failed = now - self._probe_failed_since if self._probe_failed_since is not None else 0.0
+        snapshot = WatchdogSnapshot(gen, now, self._motion, frozen, stalled, failed,
+                                    self._visual_stall_count > 0)
+        with self._lock:
+            self._snapshot = snapshot
+        if self._visual_stall_count >= 2:
+            self._post(ActionType.FATAL_STOP, gen, "login_blocked")
+            return
+        if failed >= max(15.0, self.stall_threshold_sec * 2):
+            self._post(ActionType.FATAL_STOP, gen, "visual_probe_unavailable")
+            return
+        duration = max(stalled, frozen if self._low_motion_count >= 2 else 0.0)
+        reason = "file_progress_stalled" if stalled >= frozen else "video_frozen"
+        if self._visual_stall_count == 1:
+            duration = max(duration, self.stall_threshold_sec)
+            reason = "login_prompt_detected"
+        if duration >= self.fatal_threshold_sec and self._action_taken_level < 3:
+            self._action_taken_level = 3
+            self._post(ActionType.FATAL_STOP, gen, reason)
+        elif duration >= self.segment_recycle_threshold_sec and self._action_taken_level < 2:
+            self._action_taken_level = 2
+            self._post(ActionType.RESTART_SEGMENT, gen, reason)
+        elif duration >= self.stall_threshold_sec and self._action_taken_level < 1:
+            self._action_taken_level = 1
+            self._post(ActionType.IN_PLACE_HEAL, gen, reason)
+        elif duration == 0 and not failed and not self._visual_stall_count:
+            self._action_taken_level = 0
 
-            # 三级自愈：超过 fatal_threshold_sec，向主线程投递致命故障
-            elif stall_duration >= self.fatal_threshold_sec and self._action_taken_level < 3:
-                logger.error(f"卡顿超过致命阈值 {stall_duration:.1f}s，投递致命故障动作")
-                self._action_taken_level = 3
-                if self.on_post_action:
-                    self.on_post_action(PipelineAction(
-                        action_type=ActionType.FATAL_STOP,
-                        generation_id=sampled_gen,
-                        reason="watchdog_fatal_stall",
-                    ))
-                if self.on_fatal_stall:
-                    self.on_fatal_stall()
+    def _run_loop(self):
+        failures = 0
+        while not self._stop.wait(self.check_interval_sec):
+            try:
+                self.check_once()
+                failures = 0
+            except Exception:
+                failures += 1
+                logger.exception("看门狗采样异常")
+                if failures >= 3:
+                    self._post(ActionType.FATAL_STOP, self.generation_provider(), "watchdog_probe_failed")
+                    return

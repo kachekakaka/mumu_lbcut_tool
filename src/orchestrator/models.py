@@ -43,6 +43,7 @@ class WorkerLaunchSpec:
     vmindex: int
     target: str
     output_dir: Path
+    recording_mode: str = "continuous"
     window_mode: str = "bottom"
     window_pos_x: int | None = None
     window_pos_y: int | None = None
@@ -51,4 +52,9 @@ class WorkerLaunchSpec:
     stall_timeout_sec: float = 10.0
     heartbeat_interval_sec: float = 3.0
     allow_unconfirmed_identity: bool = False
-    overlap_duration_sec: float = 3.0
+    overlap_duration_sec: float = 0.0  # 双管线专项验证前默认串行；显式配置才交叠
+    target_kind: str = "auto"          # room_id / web_rid / auto（手工调试）
+    web_rid: str | None = None
+    expected_anchor_uid: str | None = None
+    job_id: str | None = None
+    event_log_path: Path | None = None

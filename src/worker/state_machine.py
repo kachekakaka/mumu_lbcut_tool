@@ -121,4 +121,5 @@ class GenerationActionDispatcher:
                     f"丢弃过期代际动作: action={action.action_type.value}, "
                     f"action_gen={action.generation_id}, current_gen={self.current_generation_id}, reason={action.reason}"
                 )
-        return valid_actions
+        priority = {ActionType.FATAL_STOP: 0, ActionType.RESTART_SEGMENT: 1, ActionType.IN_PLACE_HEAL: 2}
+        return sorted(valid_actions, key=lambda action: priority[action.action_type])

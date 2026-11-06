@@ -49,8 +49,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--overlap-duration",
         type=float,
-        default=3.0,
-        help="双管线安全交叠窗口时长(秒)，默认 3.0，0 表示回退串行切片 (ADR 0009)"
+        default=0.0,
+        help="双管线安全交叠窗口时长(秒)，默认 0（串行）；大于 0 显式开启交叠 (ADR 0009)"
     )
     parser.add_argument(
         "--background",
@@ -76,6 +76,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="窗口 Y 坐标（用于 offscreen 边缘模式或自定义摆放位置）"
     )
+    parser.add_argument("--recording-mode", choices=["continuous", "restart"], default="continuous",
+                        help="默认持续采集无重编码分段；restart 仅用于对照诊断")
+    parser.add_argument("--target-kind", choices=["auto", "room_id", "web_rid"], default="auto")
+    parser.add_argument("--web-rid", default=None, help="内部场次 ID 的网页入口备用值")
+    parser.add_argument("--expected-anchor-uid", default=None, help="独立解析的主播 UID，不是 room_id")
+    parser.add_argument("--job-id", default=None, help="调度任务关联标识")
     return parser
 
 
@@ -109,6 +115,9 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.heartbeat_interval <= 0:
         errors.append(f"--heartbeat-interval 必须为正数，当前为 {args.heartbeat_interval}")
 
+    if args.recording_mode == 'continuous' and args.overlap_duration > 0:
+        errors.append('continuous 不使用交叠；必须显式选择 restart 才能诊断旧双管线')
+
     if args.overlap_duration < 0:
         errors.append(f"--overlap-duration 不能为负数，当前为 {args.overlap_duration}")
 
@@ -134,7 +143,12 @@ def main(argv: list[str] | None = None) -> int:
 
     config = WorkerConfig(
         vmindex=args.vmindex,
+        recording_mode=args.recording_mode,
         target=args.target,
+        target_kind=args.target_kind,
+        web_rid=args.web_rid,
+        expected_anchor_uid=args.expected_anchor_uid,
+        job_id=args.job_id,
         output_dir=Path(args.output_dir),
         segment_duration_sec=args.segment_duration,
         total_duration_sec=args.total_duration,

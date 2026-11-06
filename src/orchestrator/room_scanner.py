@@ -1,13 +1,8 @@
-"""多直播间批量扫描与开播状态监测器 (RoomScanner)。
-
-职责：
-1. 高并发轮询监控目标直播间列表（基于 RoomResolver.batch_resolve）；
-2. 识别新开播房间与下播房间，计算状态差异；
-3. 为调度器派发开播与停播事件通知。
-"""
-from dataclasses import dataclass
+"""调度层房间扫描：本轮观测与最后可信状态分离，UNKNOWN 不抹掉 LIVE。"""
+from dataclasses import dataclass, field
 import logging
-from typing import Callable, Optional
+import time
+from typing import Callable
 
 from src.mvp.room_resolver import RoomResolver, RoomStatus, ResolvedRoom
 
@@ -16,87 +11,80 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ScanResult:
-    """批量扫描结果快照。"""
     timestamp: float
     total_count: int
     live_rooms: list[ResolvedRoom]
     ended_rooms: list[ResolvedRoom]
     unknown_rooms: list[ResolvedRoom]
+    # 保留原始目标键，避免短链、网页地址与 web_rid 的索引混淆。
+    observations: dict[str, ResolvedRoom] = field(default_factory=dict)
 
 
 class RoomScanner:
-    """直播间高并发状态扫描器。"""
+    """只读扫描器；调度器另用持久化状态作下播连续确认和任务幂等核对。"""
 
-    def __init__(
-        self,
-        resolver: Optional[RoomResolver] = None,
-        max_workers: int = 8,
-    ) -> None:
+    def __init__(self, resolver: RoomResolver | None = None, max_workers: int = 8):
+        if max_workers < 1:
+            raise ValueError("max_workers 必须大于 0")
         self.resolver = resolver or RoomResolver()
         self.max_workers = max_workers
-        self._last_live_targets: set[str] = set()
+        self._trusted: dict[str, RoomStatus] = {}
+        self._confirmed_at: dict[str, float] = {}
 
     def scan(self, targets: list[str]) -> ScanResult:
-        """执行一次全量并发扫描并汇总。"""
-        import time
-
-        start_t = time.time()
-        resolved_map = self.resolver.batch_resolve(targets, max_workers=self.max_workers)
-
-        live = []
-        ended = []
-        unknown = []
-
-        for target in targets:
-            room = resolved_map.get(target)
-            if not room:
-                continue
-            st_val = room.status.value if hasattr(room.status, "value") else str(room.status)
-            if room.status == RoomStatus.LIVE or st_val == "live":
+        targets = list(dict.fromkeys(targets))
+        start = time.monotonic()
+        try:
+            resolved = self.resolver.batch_resolve(targets, max_workers=self.max_workers)
+        except Exception:
+            logger.exception("本轮扫描失败，保留最后可信状态")
+            resolved = {}
+        observations = {
+            t: resolved.get(t) or ResolvedRoom(web_rid=t, status=RoomStatus.UNKNOWN)
+            for t in targets
+        }
+        live, ended, unknown = [], [], []
+        for room in observations.values():
+            status = getattr(room.status, "value", room.status)
+            if status == RoomStatus.LIVE.value:
                 live.append(room)
-            elif room.status == RoomStatus.ENDED or st_val == "ended":
+            elif status == RoomStatus.ENDED.value:
                 ended.append(room)
             else:
                 unknown.append(room)
-
-        logger.info(
-            f"扫描完成: 目标 {len(targets)} 个 | 在播 {len(live)} | 下播 {len(ended)} | 未知 {len(unknown)} (耗时 {time.time() - start_t:.2f}s)"
-        )
-        return ScanResult(
-            timestamp=time.time(),
-            total_count=len(targets),
-            live_rooms=live,
-            ended_rooms=ended,
-            unknown_rooms=unknown,
-        )
+        logger.info("扫描完成: %s 在播 / %s 下播 / %s 未知，耗时 %.2fs",
+                    len(live), len(ended), len(unknown), time.monotonic() - start)
+        return ScanResult(time.time(), len(targets), live, ended, unknown, observations)
 
     def detect_changes(
-        self,
-        targets: list[str],
-        on_newly_live: Optional[Callable[[ResolvedRoom], None]] = None,
-        on_newly_ended: Optional[Callable[[ResolvedRoom], None]] = None,
+        self, targets: list[str],
+        on_newly_live: Callable[[ResolvedRoom], None] | None = None,
+        on_newly_ended: Callable[[ResolvedRoom], None] | None = None,
     ) -> ScanResult:
-        """执行扫描并比对与上一次扫描的状态差异，触发状态变更回调。"""
         snapshot = self.scan(targets)
-        current_live_targets = {r.web_rid for r in snapshot.live_rooms}
-
-        # 发现新开播
-        newly_live_targets = current_live_targets - self._last_live_targets
-        for room in snapshot.live_rooms:
-            if room.web_rid in newly_live_targets and on_newly_live:
-                try:
-                    on_newly_live(room)
-                except Exception as e:
-                    logger.warning(f"新开播回调异常: {e}")
-
-        # 发现新下播
-        newly_ended_targets = self._last_live_targets - current_live_targets
-        for room in snapshot.ended_rooms:
-            if room.web_rid in newly_ended_targets and on_newly_ended:
-                try:
-                    on_newly_ended(room)
-                except Exception as e:
-                    logger.warning(f"新下播回调异常: {e}")
-
-        self._last_live_targets = current_live_targets
+        for target, room in snapshot.observations.items():
+            value = getattr(room.status, "value", room.status)
+            if value not in ("live", "ended"):
+                continue
+            status = RoomStatus(value)
+            previous = self._trusted.get(target)
+            callback = None
+            if status == RoomStatus.LIVE and previous != RoomStatus.LIVE:
+                callback = on_newly_live
+            elif status == RoomStatus.ENDED and previous == RoomStatus.LIVE:
+                callback = on_newly_ended
+            try:
+                if callback:
+                    callback(room)
+            except Exception:
+                # 未确认交付，下一次可信观测继续通知。调度端仍须幂等处理。
+                logger.exception("状态回调失败，保留未交付的状态变更: %s", target)
+                continue
+            self._trusted[target] = status
+            self._confirmed_at[target] = snapshot.timestamp
         return snapshot
+
+    def forget(self, target: str) -> None:
+        """显式移除监控，不生成假的下播事件。"""
+        self._trusted.pop(target, None)
+        self._confirmed_at.pop(target, None)

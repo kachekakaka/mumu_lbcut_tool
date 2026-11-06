@@ -5,6 +5,7 @@ import os
 import signal
 import subprocess
 import time
+from collections import deque
 
 from src.mvp.config import SCRCPY_DIR, get_adb_exe
 from src.worker.scrcpy_probe import PipelineLogDrainer, parse_scrcpy_version_output, validate_scrcpy_policy
@@ -40,7 +41,9 @@ class WorkerPipeline:
         self._proc: subprocess.Popen | None = None
         self._log_drainer: PipelineLogDrainer | None = None
         self._segment_start_time: float = 0.0
-        self._last_logs: list[str] = []
+        self._last_logs = deque(maxlen=30)
+        self.wait_hook = None
+        self.startup_timeout_sec = 10.0
 
     def is_recording(self) -> bool:
         """检查当前切片录制进程是否仍在运行。"""
@@ -62,14 +65,15 @@ class WorkerPipeline:
             if self._log_drainer:
                 self._log_drainer.join(timeout=1.0)
                 self._log_drainer = None
-            time.sleep(1.0)
 
         self.current_segment_index = segment_index
         self._last_logs.clear()
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         filename = f"record_{timestamp}_seg_{segment_index:03d}.mp4"
-        self.current_file_path = self.output_dir / filename
+        self.current_file_path = self.output_dir.resolve() / filename
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        if self.current_file_path.exists():
+            raise FileExistsError(f"拒绝覆盖录制文件: {self.current_file_path}")
 
         # 启动 scrcpy:
         # --audio-source=playback: 内部数字音频流
@@ -110,55 +114,61 @@ class WorkerPipeline:
             encoding="utf-8",
             errors="replace",
         )
-        # 挂接防背压排空器
+        # 每个进程独立日志缓冲，旧线程不能写入新一代诊断信息。
+        logs = deque(maxlen=30)
+        self._last_logs = logs
         def _handle_scrcpy_log(line: str):
-            self._last_logs.append(line)
-            if len(self._last_logs) > 30:
-                self._last_logs.pop(0)
-            logger.info(f"[scrcpy] {line}")
-
-        self._log_drainer = PipelineLogDrainer(
-            self._proc,
-            on_log_line=_handle_scrcpy_log
-        )
+            logs.append(line)
+            logger.info("[scrcpy] %s", line)
+        self._log_drainer = PipelineLogDrainer(self._proc, on_log_line=_handle_scrcpy_log)
         self._log_drainer.start()
-        self._segment_start_time = time.time()
-        time.sleep(1.5)  # 建立连接缓冲
-
-        if not self.is_recording():
-            detail = "\n".join(self._last_logs[-5:]) if self._last_logs else "无日志输出"
-            raise RuntimeError(f"切片 {segment_index} 启动失败 (code {self._proc.returncode}):\n{detail}")
+        self._segment_start_time = time.monotonic()
+        deadline = self._segment_start_time + self.startup_timeout_sec
+        previous_size = 0
+        try:
+            while time.monotonic() < deadline:
+                if self.wait_hook and self.wait_hook() is False:
+                    raise InterruptedError("录制启动收到停止请求")
+                if not self.is_recording():
+                    detail = "\n".join(list(logs)[-5:])
+                    raise RuntimeError(f"切片 {segment_index} 启动退出 (code {self._proc.returncode}): {detail}")
+                size = self.current_file_path.stat().st_size if self.current_file_path.exists() else 0
+                if previous_size > 0 and size > max(previous_size, 1024):
+                    break
+                previous_size = size
+                time.sleep(0.1)
+            else:
+                raise TimeoutError("录制进程存活但未确认媒体文件持续增长")
+        except Exception:
+            self.stop_segment(timeout_sec=3)
+            raise
 
         logger.info(f"已开启新切片 #{segment_index}: {self.current_file_path.name}")
         return self.current_file_path
 
     def stop_segment(self, timeout_sec: int = 8) -> bool:
-        """优雅停止当前切片，完成 MP4 尾部索引封装。"""
-        if not self.is_recording():
-            return True
-
-        logger.info(f"正在封口切片 #{self.current_segment_index}...")
-        try:
-            if os.name == "nt":
-                self._proc.send_signal(signal.CTRL_BREAK_EVENT)
-            else:
-                self._proc.send_signal(signal.SIGINT)
-            self._proc.wait(timeout=timeout_sec)
-        except (subprocess.TimeoutExpired, OSError) as e:
-            logger.warning(f"等待切片封装超时 ({e})，强制终止...")
-            self._proc.terminate()
+        """有界停止：短轮询保持停止响应和状态可见，回收确认属于本管线的进程。"""
+        proc = self._proc
+        if proc and proc.poll() is None:
             try:
-                self._proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                self._proc.kill()
-
+                proc.send_signal(signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGINT)
+            except OSError:
+                proc.terminate()
+            deadline = time.monotonic() + timeout_sec
+            while proc.poll() is None and time.monotonic() < deadline:
+                if self.wait_hook:
+                    self.wait_hook()
+                time.sleep(0.1)
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=2)
         if self._log_drainer:
             self._log_drainer.join(timeout=1.0)
             self._log_drainer = None
-
-        # 等待 1 秒确保 Android 侧 scrcpy-server 彻底释放显存句柄
-        time.sleep(1.0)
-
         return self.current_file_path is not None and self.current_file_path.exists()
 
     def get_current_file_size_mb(self) -> float:
@@ -170,13 +180,12 @@ class WorkerPipeline:
     def get_current_segment_elapsed(self) -> float:
         """当前切片已录制秒数。"""
         if self._segment_start_time > 0:
-            return time.time() - self._segment_start_time
+            return time.monotonic() - self._segment_start_time
         return 0.0
 
     def teardown(self):
         """紧急销毁进程。"""
-        if self.is_recording():
-            self.stop_segment(timeout_sec=3)
+        self.stop_segment(timeout_sec=3)
 
 
 class DualPipelineManager:

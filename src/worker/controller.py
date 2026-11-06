@@ -8,6 +8,8 @@ import sys
 import time
 from typing import Optional
 import uuid
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 from src.mvp.dep_manager import DependencyManager
 from src.mvp.mumu_client import MuMuClient
@@ -22,6 +24,7 @@ from src.worker.events import (
     SegmentAbortedEvent,
     StreamEndedEvent,
     LoginBlockedEvent,
+    WorkerStoppedEvent, WorkerFailedEvent, SegmentQualityWarningEvent, RoomNavigationEvent,
 )
 from src.worker.state_machine import (
     WorkerState,
@@ -40,10 +43,9 @@ from src.worker.naming_lock import (
     get_shared_lock_dir,
 )
 from src.worker.popup_bypasser import PopupBypasser
-from src.worker.identity_verifier import verify_room_identity, IdentityStatus
+from src.worker.identity_verifier import IdentityStatus
+from src.worker.room_locator import locate_target
 from src.worker.segment_verifier import finalize_segment, verify_segment_file
-from src.worker.health_monitor import HealthMonitor, HealthSignals
-from src.worker.stream_end_detector import StreamEndDetector
 from src.worker.watchdog import StallWatchdog
 
 logger = logging.getLogger(__name__)
@@ -54,6 +56,8 @@ EXIT_STREAM_ENDED = 2
 EXIT_TARGET_INVALID = 9
 EXIT_TARGET_OFFLINE = 10          # 确诊未开播
 EXIT_GATE_NETWORK_ERROR = 11      # 门禁检测服务异常
+EXIT_PREFLIGHT_STALL = 16
+EXIT_NAVIGATION_FAILED = 17
 EXIT_LOGIN_BLOCKED = 15           # 登录页或弹窗强阻断
 EXIT_ROOM_MISMATCH = 18           # 确诊错房或身份未确认阻断
 EXIT_DEVICE_UNAVAILABLE = 20      # 设备离线或未就绪
@@ -65,17 +69,25 @@ class WorkerConfig:
     vmindex: int
     target: str
     output_dir: Path
-    segment_duration_sec: int = 1800  # 默认 30 分钟切片，消灭累积漂移
+    recording_mode: str = "continuous"  # continuous / restart（诊断旧切片）
+    segment_duration_sec: int = 1800  # 默认 30 分钟切片；音画同步效果需实测
     total_duration_sec: int = 0       # 0 表示持续录制直到停止信号或下播
     heartbeat_interval_sec: float = 3.0
     stall_timeout_sec: float = 10.0
     allow_unconfirmed_identity: bool = False
     lock_dir: Path | None = None
-    overlap_duration_sec: float = 3.0  # 默认 3 秒双管线安全交叠 (ADR 0009)，0 表示串行模式
+    overlap_duration_sec: float = 0.0  # restart 诊断模式的交叠参数；continuous 必须为 0
     background_mode: bool = False      # 兼容旧开关：为 True 时映射为 hidden
     window_mode: str = "foreground"    # 窗口呈现模式: "foreground" | "bottom" | "offscreen" | "hidden"
     window_pos_x: int | None = None    # 窗口 X 坐标 (可选，用于 offscreen 边缘放置或自定义摆放)
     window_pos_y: int | None = None    # 窗口 Y 坐标 (可选，用于 offscreen 边缘放置或自定义摆放)
+
+    target_kind: str = "auto"
+    web_rid: str | None = None
+    expected_anchor_uid: str | None = None
+    job_id: str | None = None
+    identity_interval_sec: float = 120.0
+    identity_recheck_timeout_sec: float = 30.0
 
 
 class WorkerController:
@@ -87,7 +99,7 @@ class WorkerController:
     3. 全流程统一产物完整性校验，校验失败严禁谎报成功；
     4. 实例独占锁持有至管线彻底停止，独立 run_id 任务目录杜绝文件冲突；
     5. 主播身份真实独立探测与运行期复核，逃逸开关边界明确；
-    6. 四维健康解耦与运行期下播检测真正接入主循环。
+    6. 本地视频与文件健康独立监测；开下播由调度层决定。
     """
 
     def __init__(self, config: WorkerConfig, emitter: WorkerEventEmitter | None = None):
@@ -103,8 +115,28 @@ class WorkerController:
         self.MAX_RECOVERY_RETRIES = 3
 
         # 权威任务级目录隔离 (原子排他)
-        self.run_id = f"run_{int(time.time())}_{uuid.uuid4().hex[:6]}"
-        self.task_output_dir = self.config.output_dir / self.run_id
+        self.run_id = f"run_{int(time.time())}_{uuid.uuid4().hex}"
+        self.task_output_dir = self.config.output_dir.resolve() / self.run_id
+        self.emitter.set_context(run_id=self.run_id, job_id=self.config.job_id or self.run_id)
+        self._failure_reason = ""
+        self._had_segment_errors = False
+        self._recovery_times = deque()
+        self._highest_segment_index = 0
+        self._overlap_disabled = False
+        self._task_start_mono = time.monotonic()
+        self._last_wait_heartbeat = 0.0
+        self._probe_executor = None
+        self._identity_future = None
+        self._identity_future_generation = 0
+        self._heal_future = None
+        self._heal_ready_at = None
+        self._last_identity_check = 0.0
+        self._identity_deadline = None
+        self._last_verified_index = 1
+        self._last_verified_time = 0.0
+        self._last_verified_mono = 0.0
+        self._bad_page_count = 0
+        self._resources_stopped = False
 
         # 权威切片生命周期状态 (全局唯一事实来源)
         self.current_segment_index: int = 0
@@ -121,11 +153,6 @@ class WorkerController:
         self._navigator: WorkerNavigator | None = None
         self.state_machine = WorkerStateMachine(initial_state=WorkerState.PREFLIGHT)
         self.action_dispatcher = GenerationActionDispatcher()
-        self.health_monitor = HealthMonitor(
-            video_freeze_threshold_sec=self.config.stall_timeout_sec,
-            file_stall_threshold_sec=self.config.stall_timeout_sec,
-        )
-        self.stream_end_detector = StreamEndDetector(confirm_window_sec=5.0)
 
         # 身份状态
         self.identity_status: IdentityStatus = IdentityStatus.UNCONFIRMED
@@ -154,6 +181,8 @@ class WorkerController:
         if self._overlapping_started:
             return False
 
+        if self.stop_requested or self._overlap_disabled:
+            return False
         overlap_window = self.config.overlap_duration_sec
         if overlap_window <= 0:
             return False
@@ -168,7 +197,8 @@ class WorkerController:
             return False
 
         if current_elapsed >= (target_dur - overlap_window):
-            next_idx = self.current_segment_index + 1
+            next_idx = self._highest_segment_index + 1
+            self._highest_segment_index = next_idx
             logger.info(
                 f"当前切片已录制 {current_elapsed:.1f}s，提前 {overlap_window}s 预热启动双管线交叠切片 #{next_idx}..."
             )
@@ -190,6 +220,8 @@ class WorkerController:
             except Exception as e:
                 logger.error(f"双管线预热启动异常: {e}，将回退串行轮转")
                 self._overlapping_started = False
+                self._overlap_disabled = True
+                self._pipeline.get_secondary_pipeline().teardown()
                 return False
         return False
 
@@ -198,6 +230,12 @@ class WorkerController:
         if not self._overlapping_started:
             return False
 
+        if self.stop_requested:
+            return False
+        if not self._pipeline.get_secondary_pipeline().is_recording():
+            self._finish_overlapping_segment(is_aborted=True, reason="secondary_exited")
+            self._overlap_disabled = True
+            return False
         logger.info(f"切片 #{self.current_segment_index} 录满周期，执行双管线平滑提升交接...")
         old_primary = None
         if isinstance(self._pipeline, DualPipelineManager) or hasattr(self._pipeline, "promote_secondary"):
@@ -208,7 +246,7 @@ class WorkerController:
             old_primary.stop_segment()
 
         # 2. 封口归档旧切片 (注意：此时新切片正在活跃录制中，stop_pipeline=False 避免误关新切片)
-        ok = self._finalize_current_segment(is_aborted=False, stop_pipeline=False)
+        ok = self._finalize_current_segment(is_aborted=False, stop_pipeline=False, source_pipeline=old_primary)
 
         # 3. 将次管线参数顺位提升为当前主管线权威状态
         self.current_segment_index = self._overlapping_seg_index
@@ -223,7 +261,7 @@ class WorkerController:
         if self._watchdog:
             self._watchdog.notify_segment_reset()
 
-        logger.info(f"双管线交接完成！切片 #{self.current_segment_index} 成为当前活跃主切片，实现零丢帧无缝切片。")
+        logger.info(f"双管线交接完成！切片 #{self.current_segment_index} 成为当前活跃主切片，已交接，真实媒体交叠效果须实测。")
         return ok
 
     def _start_new_segment(self) -> Path:
@@ -232,7 +270,10 @@ class WorkerController:
         if self.current_segment_started and not self.current_segment_finalized:
             self._finalize_current_segment(is_aborted=True, reason="previous_segment_not_finalized")
 
-        self.current_segment_index += 1
+        if self.stop_requested or self.state_machine.state in {WorkerState.STOPPING, WorkerState.STOPPED}:
+            raise InterruptedError("停止状态禁止启动新切片")
+        self._highest_segment_index = max(self._highest_segment_index, self.current_segment_index) + 1
+        self.current_segment_index = self._highest_segment_index
         self.current_generation_id += 1
         self.action_dispatcher.current_generation_id = self.current_generation_id
 
@@ -267,6 +308,7 @@ class WorkerController:
         ffprobe_exe: Path | None = None,
         stop_pipeline: bool = True,
         is_final: bool = False,
+        source_pipeline=None,
     ) -> bool:
         """统一切片收尾出口：执行封口、完整性核验、事件发射与安全归档。
 
@@ -279,7 +321,8 @@ class WorkerController:
         idx = self.current_segment_index
         raw_file = self.current_file_path or (self._pipeline.current_file_path if self._pipeline else None)
         seg_dur = int(time.monotonic() - self.segment_start_mono) if self.segment_start_mono > 0 else 0
-        raw_seg_size = self._pipeline.get_current_file_size_mb() if self._pipeline else 0.0
+        source = source_pipeline or self._pipeline
+        raw_seg_size = source.get_current_file_size_mb() if source else 0.0
         seg_size = float(raw_seg_size) if isinstance(raw_seg_size, (int, float)) else 0.0
 
         # 1. 停止物理管线 (交叠轮转时由 caller 负责停止旧管线，stop_pipeline=False 避免误关新主管线)
@@ -289,16 +332,8 @@ class WorkerController:
         # 2. 异常中止路径
         if is_aborted or self._fatal_error or self._login_blocked or self._room_mismatch:
             abort_reason = reason or "worker_aborted_by_error"
+            # 逻辑中止不等同物理损坏，保留原始录像和真实路径。
             final_p = raw_file
-            raw_path_obj = Path(raw_file) if isinstance(raw_file, str) else raw_file
-            if raw_path_obj and hasattr(raw_path_obj, "exists") and raw_path_obj.exists():
-                corrupted_p = raw_path_obj.with_name(raw_path_obj.stem + ".corrupted")
-                try:
-                    if not corrupted_p.exists():
-                        raw_path_obj.replace(corrupted_p)
-                    final_p = corrupted_p
-                except Exception:
-                    final_p = raw_path_obj
 
             self.emitter.emit(SegmentAbortedEvent(
                 segment_index=idx,
@@ -307,6 +342,7 @@ class WorkerController:
             ))
             self.current_segment_finalized = True
             self._last_segment_failed = True
+            self._had_segment_errors = True
             logger.warning(f"切片 #{idx} 已异常中止归档: reason={abort_reason}, file={final_p}")
             return False
 
@@ -336,8 +372,8 @@ class WorkerController:
             self.emitter.emit(SegmentFinishedEvent(
                 segment_index=idx,
                 file_path=str(final_p),
-                duration_sec=seg_dur,
-                file_size_mb=round(seg_size, 2),
+                duration_sec=res_obj.duration,
+                file_size_mb=res_obj.size_mb,
                 is_final=is_final,
             ))
             self.current_segment_finalized = True
@@ -354,10 +390,35 @@ class WorkerController:
             ))
             self.current_segment_finalized = True
             self._last_segment_failed = True
+            self._had_segment_errors = True
             logger.error(f"切片 #{idx} 完整性校验未通过，标记损坏: {reject_msg}")
             return False
 
     def run(self) -> int:
+        """运行并发射任务级终态；不把预检失败伪报为登录问题。"""
+        code = EXIT_RECORDING_FAILED
+        try:
+            code = self._run_inner()
+        except InterruptedError:
+            code = EXIT_SUCCESS if self.stop_requested else EXIT_RECORDING_FAILED
+            self._failure_reason = "stop_requested" if self.stop_requested else "startup_interrupted"
+        except Exception as exc:
+            logger.exception("Worker 未处理异常")
+            self._fatal_error = True
+            self._failure_reason = self._failure_reason or f"worker_exception: {exc}"
+            self.request_stop()
+        if self.state_machine.state not in {WorkerState.STOPPING, WorkerState.STOPPED}:
+            self.state_machine.transition_to(WorkerState.STOPPING)
+        if self.state_machine.state == WorkerState.STOPPING:
+            self.state_machine.transition_to(WorkerState.STOPPED)
+        if code:
+            self.emitter.emit(WorkerFailedEvent(exit_code=code, reason=self._failure_reason or "worker_failed"))
+        self.emitter.emit(WorkerStoppedEvent(exit_code=code,
+            reason=self._failure_reason or ("stop_requested" if self.stop_requested else "completed"),
+            had_segment_errors=self._had_segment_errors))
+        return code
+
+    def _run_inner(self) -> int:
         """主执行循环，返回进程退出码。"""
         pid = os.getpid()
         self.emitter.emit(WorkerStartedEvent(
@@ -366,6 +427,8 @@ class WorkerController:
             pid=pid
         ))
 
+        if self.stop_requested:
+            return EXIT_SUCCESS
         # 1. 离线清洗目标直播间标识 (ADR-0011 契约：纯本地正则，零外网延迟)
         try:
             web_rid = clean_room_target(self.config.target)
@@ -375,7 +438,8 @@ class WorkerController:
             return EXIT_TARGET_INVALID
 
         self.target_room_id = web_rid
-        self.target_uid = web_rid
+        # room_id/web_rid 不是主播 UID。稳定标识必须由上层单独传入。
+        self.target_uid = self.config.expected_anchor_uid
         self.target_nickname = None
 
         # 3. 实例独占锁防并发抢占 (统一 VM 锁作用域，持有至全流程结束)
@@ -392,7 +456,7 @@ class WorkerController:
 
         try:
             # 4. 创建任务独立输出目录
-            self.task_output_dir.mkdir(parents=True, exist_ok=True)
+            self.task_output_dir.mkdir(parents=True, exist_ok=False)
 
             # 5. 准备运行组件与 MuMu 实例
             dep_mgr = DependencyManager()
@@ -425,51 +489,20 @@ class WorkerController:
             except Exception as e:
                 logger.warning(f"设置模拟器录播环境调优异常 (不影响录制): {e}")
 
-            # 6. 唤起直播间与白名单弹窗穿透
+            # 6. 先找到实际目标画面，再开录；无 UI UID 时主动读取当前房间的资料跳转证据。
             self._navigator = WorkerNavigator(serial=serial, adb_exe=adb_exe)
-            self._navigator.launch_room(
-                room_id=self.target_room_id,
-                web_rid=self.target_room_id,
-                wait_sec=3,
-                warmup_first=True,
-            )
-            self._navigator.dismiss_system_dialogs()
+            self._navigator.configure_target(self.config.target_kind, self.config.web_rid)
+            landing = self._locate_target_room()
+            if self.stop_requested:
+                return EXIT_SUCCESS
+            if not landing.success:
+                return self._landing_exit_code(landing.reason)
 
-            bypasser = PopupBypasser(adb_client=self._navigator.adb_client)
-            bypasser.detect_and_dismiss_popups()
-
-            # 7. 独立主播身份证据核验 (严禁拿目标 ID 冒充观测结果)
-            try:
-                ident_res = self._navigator.detect_current_room_identity()
-                det_uid = ident_res[0] if (ident_res and len(ident_res) > 0) else None
-                det_nick = ident_res[1] if (ident_res and len(ident_res) > 1) else None
-            except Exception:
-                det_uid, det_nick = None, None
-
-            id_res = verify_room_identity(
-                target_uid=self.target_uid,
-                current_uid=det_uid,
-                target_nickname=self.target_nickname,
-                current_nickname=det_nick,
-                allow_unconfirmed=self.config.allow_unconfirmed_identity,
-            )
-            self.identity_status = id_res.status
-            if id_res.status == IdentityStatus.UNCONFIRMED:
-                self.has_identity_risk = True
-
-            if not id_res.can_proceed:
-                logger.error(f"主播身份核验未通过阻断: status={id_res.status}, reason={id_res.reason}")
-                return EXIT_ROOM_MISMATCH
-
-            # 8. 开录前置双重内容门禁校验 (Pre-flight Content Gate)
-            gate_ok = self._navigator.verify_preflight_content_gate(timeout_sec=15.0)
-            if not gate_ok:
-                logger.error("未通过开录前置门禁：直播间未成功渲染或被登录页强阻断，拒绝盲目录制！")
-                self.emitter.emit(LoginBlockedEvent(
-                    reason="preflight_gate_failed",
-                    vmindex=self.config.vmindex
-                ))
-                return EXIT_LOGIN_BLOCKED
+            if self.config.recording_mode == 'continuous':
+                if self.config.overlap_duration_sec:
+                    raise ValueError('连续分装不需要交叠；诊断交叠须显式选择 restart')
+                from src.worker.continuous_session import ContinuousSession
+                return ContinuousSession(self, serial, scrcpy_exe, adb_exe).run()
 
             # 9. 初始化录制管线 (仅当切片时长大于交叠窗口时启用 DualPipelineManager ADR 0009)
             if self.config.overlap_duration_sec > 0 and self.config.segment_duration_sec > self.config.overlap_duration_sec:
@@ -491,11 +524,6 @@ class WorkerController:
             def on_watchdog_action(act: PipelineAction):
                 self.action_dispatcher.post_action(act)
 
-            def on_stall_action(act: str, dur: float):
-                if act == "intent_refresh":
-                    self.emitter.emit(StallDetectedEvent(stall_duration_sec=dur, action="intent_refresh"))
-                elif act == "stall_healed":
-                    self.emitter.emit(StallHealedEvent(action="intent_refresh", latency_sec=dur))
 
             self._watchdog = StallWatchdog(
                 pipeline=self._pipeline,
@@ -504,9 +532,13 @@ class WorkerController:
                 stall_threshold_sec=self.config.stall_timeout_sec,
                 generation_provider=lambda: self.current_generation_id,
                 on_post_action=on_watchdog_action,
-                on_stall_action=on_stall_action,
             )
 
+            pipes = (self._pipeline.pipe_a, self._pipeline.pipe_b) if isinstance(self._pipeline, DualPipelineManager) else (self._pipeline,)
+            for pipe in pipes:
+                pipe.wait_hook = self._pipeline_wait_tick
+            self._probe_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="worker-probe")
+            self._last_identity_check = time.monotonic()
             # 11. 状态机就绪，启动首个切片
             self.state_machine.transition_to(WorkerState.RECORDING)
             self._start_new_segment()
@@ -514,14 +546,12 @@ class WorkerController:
 
             start_mono = time.monotonic()
             last_heartbeat = 0.0
-            last_stream_check = 0.0
-            video_frozen_start: Optional[float] = None
-            file_stall_start: Optional[float] = None
-            last_known_size_mb: float = 0.0
 
             # 12. 非阻塞主控制循环 (Single-Writer 唯一执行主体)
-            while not self.stop_requested and self.state_machine.state == WorkerState.RECORDING:
+            while not self.stop_requested and self.state_machine.state in {WorkerState.RECORDING, WorkerState.RECOVERING}:
                 time.sleep(0.5)
+                if self.stop_requested or self.state_machine.state in {WorkerState.STOPPING, WorkerState.STOPPED}:
+                    break
                 now_mono = time.monotonic()
                 total_elapsed = now_mono - start_mono
                 seg_elapsed = now_mono - self.segment_start_mono
@@ -543,7 +573,8 @@ class WorkerController:
                     if action.action_type == ActionType.FATAL_STOP:
                         logger.error(f"执行代际有效动作: 致命停止 (reason: {action.reason})")
                         self._fatal_error = True
-                        if self._watchdog and getattr(self._watchdog, "_visual_stall_count", 0) >= 2:
+                        self._failure_reason = action.reason
+                        if action.reason == "login_blocked":
                             self._login_blocked = True
                             self.emitter.emit(LoginBlockedEvent(
                                 reason="runtime_visual_login_blocked",
@@ -552,46 +583,33 @@ class WorkerController:
                         self.request_stop()
                         break
                     elif action.action_type == ActionType.IN_PLACE_HEAL:
-                        logger.info(f"主线程执行代际有效动作: 原地 Intent 重新唤起与穿透 (reason: {action.reason})")
-                        if self._navigator:
-                            self._navigator.dismiss_login_prompt()
-                            self._navigator.dismiss_center_dialog()
-                            self._navigator.refresh_current_room(self.target_room_id)
+                        # 定位会打开短暂资料页，必须先封口，不能把取证操作录进直播。
+                        self._correct_target_room(action.reason)
+                        break
                     elif action.action_type == ActionType.RESTART_SEGMENT:
-                        logger.info(f"主线程执行代际有效动作: 重启当前切片 (reason: {action.reason})")
                         self._recycle_current_segment(reason=action.reason)
                         break
-
                 if self.stop_requested:
                     break
-
-                # C. 四维解耦健康监测真实评估
+                self._poll_identity(now_mono)
+                if self.stop_requested:
+                    break
                 current_size_mb = self._pipeline.get_current_file_size_mb() if self._pipeline else 0.0
-                file_delta = current_size_mb - last_known_size_mb
-                last_known_size_mb = current_size_mb
-
-                if file_delta <= 0.0:
-                    if file_stall_start is None:
-                        file_stall_start = now_mono
-                else:
-                    file_stall_start = None
-
-                f_stall_dur = (now_mono - file_stall_start) if file_stall_start is not None else 0.0
-                v_frozen_dur = (now_mono - video_frozen_start) if video_frozen_start is not None else 0.0
-
-                signals = self.health_monitor.evaluate_signals(
-                    video_motion=0.5,  # 动态由看门狗视觉探针更新
-                    audio_active=None, # 未知/无专用音频分贝计
-                    process_alive=self._pipeline.is_recording() if self._pipeline else False,
-                    file_delta_mb=file_delta,
-                    video_frozen_duration_sec=v_frozen_dur,
-                    file_stall_duration_sec=f_stall_dur,
-                )
-
-                if not signals.is_healthy and signals.alert_reason == "file_write_stalled":
-                    logger.warning("四维健康监测判定文件写入严重停滞，触发自愈切片重拉...")
-                    self._recycle_current_segment(reason="health_monitor_file_stalled")
-                    continue
+                snapshot = self._watchdog.snapshot() if self._watchdog else None
+                video_motion = snapshot.video_motion if snapshot and snapshot.generation_id == self.current_generation_id else None
+                if self._heal_ready_at is not None:
+                    healthy = (snapshot is not None and snapshot.generation_id == self.current_generation_id
+                               and snapshot.sampled_at >= self._heal_ready_at and snapshot.video_motion is not None
+                               and snapshot.video_frozen_sec == 0 and snapshot.file_stall_sec == 0
+                               and snapshot.probe_failure_sec == 0 and not snapshot.login_blocked)
+                    if healthy:
+                        self._heal_ready_at = None
+                        self.state_machine.transition_to(WorkerState.RECORDING)
+                        self.emitter.emit(StallHealedEvent(action="intent_refresh"))
+                    elif time.monotonic() - self._heal_ready_at >= 15:
+                        self._heal_ready_at = None
+                        self._recycle_current_segment("refresh_verification_failed")
+                seg_elapsed = time.monotonic() - self.segment_start_mono
 
                 # D. 周期心跳发射 (未测得真实 FPS 时显式输出 null，真实反映生命周期)
                 if now_mono - last_heartbeat >= self.config.heartbeat_interval_sec:
@@ -600,7 +618,9 @@ class WorkerController:
                         segment_elapsed_sec=int(seg_elapsed),
                         file_size_mb=round(current_size_mb, 2),
                         fps=None,  # 避免硬编码伪造 30.0
-                        status=self.state_machine.state.value.lower()
+                        status=self.state_machine.state.value.lower(),
+                        room_identity_status=self.identity_status.value.lower(),
+                        video_motion=video_motion,
                     ))
                     last_heartbeat = now_mono
 
@@ -609,6 +629,8 @@ class WorkerController:
                     logger.info(f"达到预设总录制时长 {self.config.total_duration_sec}s，平稳结束。")
                     break
 
+                if self.state_machine.state != WorkerState.RECORDING:
+                    continue
                 # G. 检查计划周期切片 (ADR 0009 双管线交叠无缝切片)
                 if self.config.overlap_duration_sec > 0:
                     self._trigger_overlap_start_if_needed(seg_elapsed)
@@ -625,87 +647,22 @@ class WorkerController:
                         ok = self._finalize_current_segment(allow_short_tail=False)
                         if not ok:
                             logger.warning(f"周期切片 #{self.current_segment_index} 完整性校验失败，但按规格继续录制后续切片")
-                        # 启动下一段
+                        # 边界复核不占恢复预算；运行中只读探针不会打开资料页。
+                        if time.monotonic() - self._last_verified_mono >= self.config.identity_interval_sec:
+                            landing = self._locate_target_room()
+                            if not landing.success:
+                                if not self.stop_requested:
+                                    self._fatal_error = True
+                                self.request_stop()
+                                break
+                        if self.stop_requested:
+                            break
                         self._start_new_segment()
                         if self._watchdog:
                             self._watchdog.start()
 
         finally:
-            # 停止看门狗
-            if self._watchdog:
-                try:
-                    self._watchdog.stop()
-                except Exception:
-                    pass
-
-            # 状态机迁往 STOPPING
-            if self.state_machine.state in {WorkerState.RECORDING, WorkerState.RECOVERING}:
-                try:
-                    self.state_machine.transition_to(WorkerState.STOPPING)
-                except Exception:
-                    pass
-
-            # 统一收尾最后一个切片 (允许正常短尾片成功归档)
-            if self.current_segment_started and not self.current_segment_finalized:
-                is_aborted = self._fatal_error or self._login_blocked or self._room_mismatch
-                self._finalize_current_segment(
-                    is_aborted=is_aborted,
-                    reason="worker_stopped",
-                    allow_short_tail=True,
-                    is_final=True,
-                )
-
-            # 若退出时次切片已在交叠捕获中，一并安全封口并收尾归档
-            if self._overlapping_started and (isinstance(self._pipeline, DualPipelineManager) or hasattr(self._pipeline, "get_secondary_pipeline")):
-                try:
-                    secondary = self._pipeline.get_secondary_pipeline()
-                    if secondary and hasattr(secondary, "is_recording") and secondary.is_recording():
-                        secondary.stop_segment()
-                    raw_overlap = self._overlapping_file_path or (secondary.current_file_path if secondary else None)
-                    target_final_name = build_segment_filename(
-                        room_id=self.target_room_id or "live",
-                        start_epoch=int(time.time()),
-                        segment_index=self._overlapping_seg_index,
-                        generation_id=self.current_generation_id + 1,
-                    )
-                    target_final = self.task_output_dir / target_final_name
-                    if raw_overlap and Path(raw_overlap).exists():
-                        ok, final_p, _ = finalize_segment(
-                            raw_path=Path(raw_overlap),
-                            target_path=target_final,
-                            allow_short_tail=True,
-                        )
-                        if ok:
-                            self.emitter.emit(SegmentFinishedEvent(
-                                segment_index=self._overlapping_seg_index,
-                                file_path=str(final_p),
-                                duration_sec=int(time.monotonic() - self._overlapping_start_mono),
-                                file_size_mb=round(secondary.get_current_file_size_mb(), 2) if hasattr(secondary, "get_current_file_size_mb") else 0.0,
-                                is_final=True,
-                            ))
-                        else:
-                            self.emitter.emit(SegmentAbortedEvent(
-                                segment_index=self._overlapping_seg_index,
-                                file_path=str(final_p),
-                                reason="exit_short_tail_failed"
-                            ))
-                except Exception as e:
-                    logger.warning(f"交叠次切片退出收尾异常: {e}")
-                self._overlapping_started = False
-
-            # 状态机迁往终态 STOPPED
-            if self.state_machine.state == WorkerState.STOPPING:
-                try:
-                    self.state_machine.transition_to(WorkerState.STOPPED)
-                except Exception:
-                    pass
-
-            # 实例锁严格持有至管线彻底停止并完成所有收尾后再释放
-            if instance_lock:
-                try:
-                    instance_lock.release()
-                except Exception as e:
-                    logger.warning(f"释放实例锁异常: {e}")
+            self._cleanup(instance_lock)
 
         # 确定最终退出码
         if self._room_mismatch:
@@ -761,17 +718,9 @@ class WorkerController:
             reason=f"process_crash_code_{exit_code}"
         )
 
-        # 3. 校验重试上限（正常轮转不递增计数，只统计故障次数）
-        if self._total_crash_count >= self.MAX_RECOVERY_RETRIES:
-            logger.error(
-                f"已达最大连续崩溃恢复上限 ({self.MAX_RECOVERY_RETRIES} 次)，果断终止录制，防止死循环！"
-            )
-            self._fatal_error = True
-            self.request_stop()
+        self._finish_overlapping_segment(is_aborted=True, reason="primary_crashed_during_overlap")
+        if not self._consume_recovery_budget():
             return False
-
-        self._total_crash_count += 1
-        logger.info(f"正在触发第 {self._total_crash_count}/{self.MAX_RECOVERY_RETRIES} 次就地自愈拉起...")
 
         # 4. 尝试启动新切片，单调推进序号与代际
         try:
@@ -797,13 +746,216 @@ class WorkerController:
             self.current_segment_started = True
             self.current_segment_finalized = False
 
+        if not self._consume_recovery_budget():
+            return
+        self.state_machine.transition_to(WorkerState.RECOVERING)
+        self._finish_overlapping_segment(is_aborted=True, reason=reason)
         logger.warning(f"看门狗正在快速重拉切片 #{self.current_segment_index} (reason: {reason})...")
         # 为旧切片发射终态 aborted 事件
         self._finalize_current_segment(is_aborted=True, reason=reason)
         # 开启新切片
         try:
             self._start_new_segment()
+            self.state_machine.transition_to(WorkerState.RECORDING)
         except Exception as e:
             logger.error(f"重拉切片启动新段失败: {e}")
             self._fatal_error = True
             self.request_stop()
+
+
+    def _consume_recovery_budget(self) -> bool:
+        now = time.monotonic()
+        while self._recovery_times and now - self._recovery_times[0] > 300:
+            self._recovery_times.popleft()
+        if self._total_crash_count >= self.MAX_RECOVERY_RETRIES or len(self._recovery_times) >= 2:
+            self._failure_reason = "recovery_budget_exhausted"
+            self._fatal_error = True
+            self.request_stop()
+            return False
+        self._total_crash_count += 1
+        self._recovery_times.append(now)
+        return True
+
+    def _pipeline_wait_tick(self) -> bool:
+        """管线短轮询期间仍响应停止、输出真实状态，不运行新的切片动作。"""
+        now = time.monotonic()
+        if now - self._last_wait_heartbeat >= self.config.heartbeat_interval_sec:
+            self.emitter.emit(HeartbeatEvent(elapsed_sec=int(now - self._task_start_mono),
+                status=self.state_machine.state.value.lower(), fps=None,
+                room_identity_status=self.identity_status.value.lower()))
+            self._last_wait_heartbeat = now
+        return not self.stop_requested
+
+    def _locate_target_room(self):
+        def report(**step):
+            evidence = step.get('evidence')
+            self.emitter.emit(RoomNavigationEvent(attempt=step.get('attempt', 0),
+                action=step.get('action', ''), route=step.get('route', ''), reason=step.get('reason', ''),
+                observed_room_id=evidence.room_id if evidence else None,
+                observed_anchor_uid=evidence.anchor_uid if evidence else None,
+                evidence_source=evidence.source if evidence else 'unavailable',
+                evidence_observed_at=evidence.observed_at if evidence else 0.0))
+        result = locate_target(self._navigator, self.target_room_id,
+            target_kind=self.config.target_kind, web_rid=self.config.web_rid,
+            anchor_uid=self.target_uid, timeout_sec=100, max_attempts=3,
+            stop_requested=lambda: self.stop_requested, on_step=report,
+            allow_unconfirmed=self.config.allow_unconfirmed_identity)
+        self.identity_status = result.status
+        self.emitter.set_context(room_identity_status=result.status.value.lower())
+        if result.success:
+            self._failure_reason = ''
+            self._identity_deadline = None
+            self._bad_page_count = 0
+            self.target_nickname = result.evidence.nickname if result.evidence else None
+            if result.status == IdentityStatus.VERIFIED:
+                self._last_verified_mono = time.monotonic()
+                self._last_verified_time = time.time()
+                self._last_verified_index = max(1, self.current_segment_index)
+            else:
+                self.has_identity_risk = True
+            evidence = result.evidence
+            self.emitter.set_context(room_evidence_source=evidence.source if evidence else 'unavailable',
+                                     room_evidence_at=evidence.observed_at if evidence else 0.0)
+            report(attempt=result.attempts, action='target_ready', reason=result.reason, evidence=evidence)
+        else:
+            self._failure_reason = result.reason
+            report(attempt=result.attempts, action='navigation_exhausted', reason=result.reason,
+                   evidence=result.evidence)
+        return result
+
+    def _landing_exit_code(self, reason):
+        if reason == 'login_blocked':
+            self._login_blocked = True
+            self.emitter.emit(LoginBlockedEvent(reason='auth_required', vmindex=self.config.vmindex))
+            return EXIT_LOGIN_BLOCKED
+        if reason == 'device_unavailable':
+            return EXIT_DEVICE_UNAVAILABLE
+        if reason in ('id_mismatch', 'room_evidence_unavailable'):
+            return EXIT_ROOM_MISMATCH
+        if reason == 'render_timeout':
+            return EXIT_PREFLIGHT_STALL
+        return EXIT_NAVIGATION_FAILED
+
+    def _correct_target_room(self, reason):
+        """先保存已有录像，再自动返回目标；尝试失败才报告无法恢复。"""
+        if self.stop_requested:
+            return False
+        if not self._consume_recovery_budget():
+            return False
+        self.state_machine.transition_to(WorkerState.RECOVERING)
+        self.emitter.emit(StallDetectedEvent(action='relocate_target'))
+        if self._watchdog:
+            self._watchdog.stop()
+        self._finish_overlapping_segment(is_aborted=True, reason='relocating_target')
+        self._finalize_current_segment(is_aborted=True, reason=reason)
+        result = self._locate_target_room()
+        if self.stop_requested:
+            return False
+        if not result.success:
+            self._login_blocked = result.reason == 'login_blocked'
+            self._room_mismatch = result.reason in ('id_mismatch', 'room_evidence_unavailable')
+            self._fatal_error = True
+            self.request_stop()
+            return False
+        self._start_new_segment()
+        self.state_machine.transition_to(WorkerState.RECORDING)
+        if self._watchdog:
+            self._watchdog.start()
+        self.emitter.emit(StallHealedEvent(action='relocate_target'))
+        return True
+
+    def _poll_identity(self, now: float):
+        """运行期只读检查是否仍在直播页；强取证在开录/纠偏/自然切片边界执行。
+
+        本地 UID 不显示不否定已获取的独立房间证据；证据来源和时间一直显式保留。
+        仍处于 LivePlayActivity 的切房，可能需要等下一次强复核才能发现。
+        """
+        if not self._probe_executor or not self._navigator:
+            return
+        if self._identity_future is not None and self._identity_future.done():
+            try:
+                activity = self._identity_future.result() or ''
+            except Exception:
+                activity = ''
+            self._identity_future = None
+            if self._identity_future_generation != self.current_generation_id:
+                return
+            if 'LivePlayActivity' in activity:
+                self._bad_page_count = 0
+                self._identity_deadline = None
+            else:
+                self._bad_page_count += 1
+                if self._identity_deadline is None:
+                    self._identity_deadline = now + self.config.identity_recheck_timeout_sec
+                # 页面明确离开时先导航恢复，不把异常画面继续录作目标内容。
+                if activity and self._bad_page_count >= 2:
+                    for idx in range(self._last_verified_index, self.current_segment_index + 1):
+                        self.emitter.emit(SegmentQualityWarningEvent(segment_index=idx,
+                            flag='possible_navigation_drift', suspected_start_time=self._last_verified_time))
+                    self._correct_target_room('runtime_left_live_page')
+                    return
+        if self._identity_deadline is not None and now >= self._identity_deadline:
+            self._correct_target_room('runtime_page_probe_unavailable')
+            return
+        if not self.stop_requested and self._identity_future is None and now - self._last_identity_check >= 5:
+            self._last_identity_check = now
+            self._identity_future_generation = self.current_generation_id
+            self._identity_future = self._probe_executor.submit(self._navigator.get_current_focus_activity)
+
+    def _finish_overlapping_segment(self, is_aborted=False, reason="", is_final=False):
+        if not self._overlapping_started:
+            return
+        idx, raw = self._overlapping_seg_index, self._overlapping_file_path
+        secondary = self._pipeline.get_secondary_pipeline()
+        try:
+            secondary.stop_segment()
+            if is_aborted or not secondary.get_exit_code() == 0:
+                raise RuntimeError(reason or "secondary_exited")
+            target = self.task_output_dir / build_segment_filename(self.target_room_id or "live", int(time.time()), idx, self.current_generation_id + 1)
+            ok, final, result = finalize_segment(Path(raw), target, allow_short_tail=True)
+            if not ok:
+                raise RuntimeError(result.reject_reason)
+            self.emitter.emit(SegmentFinishedEvent(segment_index=idx, file_path=str(final),
+                duration_sec=result.duration, file_size_mb=result.size_mb, is_final=is_final))
+        except Exception as exc:
+            self._had_segment_errors = True
+            self._last_segment_failed = True
+            self.emitter.emit(SegmentAbortedEvent(segment_index=idx, file_path=str(raw or ""),
+                                                  reason=reason or f"overlap_finalize_failed: {exc}"))
+        finally:
+            self._overlapping_started = False
+
+    def _cleanup(self, instance_lock):
+        """完整停止两条管线后才归还锁；不会把两个切片都标为最终片。"""
+        if self._resources_stopped:
+            return
+        if self._watchdog:
+            self._watchdog.stop()
+        if self.state_machine.state != WorkerState.STOPPED:
+            self.state_machine.transition_to(WorkerState.STOPPING)
+        overlap = self._overlapping_started
+        try:
+            self._finalize_current_segment(
+                is_aborted=self._fatal_error or self._login_blocked or self._room_mismatch,
+                reason=self._failure_reason or "worker_stopped", allow_short_tail=True,
+                is_final=not overlap)
+        except Exception as exc:
+            self._fatal_error = True
+            self._failure_reason = f"finalize_exception: {exc}"
+            if self.current_segment_started and not self.current_segment_finalized:
+                self.emitter.emit(SegmentAbortedEvent(segment_index=self.current_segment_index,
+                    file_path=str(self.current_file_path or ""), reason=self._failure_reason))
+                self.current_segment_finalized = True
+        finally:
+            self._finish_overlapping_segment(is_aborted=self._fatal_error or self._room_mismatch,
+                                             reason=self._failure_reason, is_final=True)
+            # 即使启动期间抛错、尚未发 started，也不能遗留自己创建的录制进程。
+            if self._pipeline:
+                self._pipeline.teardown()
+            if self._probe_executor:
+                self._probe_executor.shutdown(wait=False, cancel_futures=True)
+            self._resources_stopped = True
+            if instance_lock:
+                instance_lock.release()
+            if self.state_machine.state == WorkerState.STOPPING:
+                self.state_machine.transition_to(WorkerState.STOPPED)

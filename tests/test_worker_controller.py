@@ -1,131 +1,135 @@
-"""Worker 顶层控制器集成测试（最高层测试 Seam）。"""
-import io
-import json
-from pathlib import Path
-import unittest
-from unittest.mock import MagicMock, patch
-
-from src.worker.controller import WorkerController, WorkerConfig
-from src.worker.events import WorkerEventEmitter
-from src.worker.resolver import RoomStatus, ResolvedRoom
+"""通过真实 WorkerController.run 验证录制边界，所有产物只在 tmp_path 内。"""
+import pytest
+from worker_harness import build_worker, assert_paired
 
 
-class TestWorkerController(unittest.TestCase):
-    @patch("src.worker.controller.finalize_segment")
-    @patch("src.worker.controller.MuMuClient")
-    @patch("src.worker.controller.WorkerNavigator")
-    @patch("src.worker.controller.WorkerPipeline")
-    def test_worker_run_normal_cycle(
-        self,
-        mock_pipeline_cls,
-        mock_navigator_cls,
-        mock_mumu_cls,
-        mock_finalize,
-    ):
-        mock_finalize.return_value = (True, Path("target.mp4"), MagicMock(is_valid=True))
-        # 准备 mock
-        stream = io.StringIO()
-        emitter = WorkerEventEmitter(stream=stream)
-
-        mock_mumu = mock_mumu_cls.return_value
-        mock_mumu.launch_player.return_value = True
-        mock_mumu.connect_adb.return_value = "127.0.0.1:16448"
-
-        mock_nav = mock_navigator_cls.return_value
-        mock_nav.launch_room.return_value = True
-        mock_nav.verify_preflight_content_gate.return_value = True
-        mock_nav.detect_current_room_identity.return_value = ("737141", "测试PK")
-
-        out_dir = Path("D:/test_output")
-        mock_file = MagicMock()
-        mock_file.name = "test_seg_001.mp4"
-        mock_file.exists.return_value = True
-
-        mock_pipeline = mock_pipeline_cls.return_value
-        mock_pipeline.start_segment.return_value = mock_file
-        mock_pipeline.is_recording.return_value = True
-        mock_pipeline.stop_segment.return_value = True
-        mock_pipeline.get_current_file_size_mb.return_value = 5.0
-        mock_pipeline.get_current_segment_elapsed.return_value = 0.5
-
-        cfg = WorkerConfig(
-            vmindex=2,
-            target="737141",
-            output_dir=Path("D:/test_output"),
-            segment_duration_sec=1,  # 1秒快速切片
-            total_duration_sec=2,    # 2秒后退出
-            heartbeat_interval_sec=0.5,
-        )
-
-        controller = WorkerController(config=cfg, emitter=emitter)
-        exit_code = controller.run()
-
-        self.assertEqual(exit_code, 0)
-        lines = [json.loads(line) for line in stream.getvalue().strip().splitlines()]
-        event_names = [item["event"] for item in lines]
-
-        self.assertIn("worker_started", event_names)
-        self.assertIn("segment_started", event_names)
-        self.assertIn("heartbeat", event_names)
-        self.assertIn("segment_finished", event_names)
-
-        # 检查最后一个 segment_finished 的 is_final 字段是否为 True
-        finished_events = [item for item in lines if item["event"] == "segment_finished"]
-        self.assertTrue(len(finished_events) >= 1)
-        self.assertTrue(finished_events[-1]["is_final"], "最终停机封口的切片必须标记 is_final=True")
-
-        mock_mumu.optimize_performance_for_recording.assert_called_with(
-            2,
-            mute=True,
-            disable_dynamic_fps=True,
-            window_mode="foreground",
-            pos_x=None,
-            pos_y=None,
-        )
-
-    @patch("src.worker.controller.MuMuClient")
-    @patch("src.worker.controller.WorkerNavigator")
-    @patch("src.worker.controller.WorkerPipeline")
-    def test_worker_preflight_gate_blocked_refuses_recording(
-        self,
-        mock_pipeline_cls,
-        mock_navigator_cls,
-        mock_mumu_cls,
-    ):
-        stream = io.StringIO()
-        emitter = WorkerEventEmitter(stream=stream)
-
-        mock_mumu = mock_mumu_cls.return_value
-        mock_mumu.launch_player.return_value = True
-        mock_mumu.connect_adb.return_value = "127.0.0.1:16448"
-
-        mock_nav = mock_navigator_cls.return_value
-        mock_nav.launch_room.return_value = True
-        mock_nav.detect_current_room_identity.return_value = ("737141", "测试PK")
-        # 模拟门禁检测失败（如处于登录页且无法绕过）
-        mock_nav.verify_preflight_content_gate.return_value = False
-
-        mock_pipeline = mock_pipeline_cls.return_value
-
-        cfg = WorkerConfig(
-            vmindex=2,
-            target="737141",
-            output_dir=Path("D:/test_output"),
-        )
-
-        controller = WorkerController(config=cfg, emitter=emitter)
-        exit_code = controller.run()
-
-        # 断言：严格返回退出码 15 (EXIT_LOGIN_BLOCKED)
-        self.assertEqual(exit_code, 15)
-        # 断言：坚决不启动 scrcpy 录制
-        self.assertFalse(mock_pipeline.start_segment.called)
-
-        lines = [json.loads(line) for line in stream.getvalue().strip().splitlines()]
-        event_names = [item["event"] for item in lines]
-        self.assertIn("login_blocked", event_names)
-        self.assertNotIn("segment_started", event_names)
+def test_normal_rotations_and_verified_small_media(monkeypatch, tmp_path, valid_media):
+    h = build_worker(monkeypatch, tmp_path, valid_media)
+    assert h.controller.run() == 0
+    terminals = assert_paired(h.events())
+    assert h.launched == [1, 2]
+    assert [e['is_final'] for e in terminals] == [False, True]
+    assert all(e['event'] == 'segment_finished' for e in terminals)
+    assert all(e['duration_sec'] > 0 for e in terminals)
+    assert h.events()[-1]['event'] == 'worker_stopped'
+    assert all(not pipe.alive for pipe in h.pipelines)
 
 
-if __name__ == "__main__":
-    unittest.main()
+@pytest.mark.parametrize('reason,code', [('login_blocked', 15), ('navigation_failed', 17),
+                                        ('render_timeout', 16), ('device_unavailable', 20)])
+def test_preflight_classification(monkeypatch, tmp_path, valid_media, reason, code):
+    h = build_worker(monkeypatch, tmp_path, valid_media, gate=False, gate_reason=reason)
+    assert h.controller.run() == code
+    assert not h.launched
+    assert any(e['event'] == 'login_blocked' for e in h.events()) == (code == 15)
+    assert h.events()[-1]['exit_code'] == code
+
+
+def test_two_crashes_in_run_preserve_indices_and_events(monkeypatch, tmp_path, valid_media):
+    h = build_worker(monkeypatch, tmp_path, valid_media, total=4, segment=30, crashes=(1, 2))
+    assert h.controller.run() == 0
+    terminals = assert_paired(h.events())
+    assert h.launched == [1, 2, 3]
+    assert [e['event'] for e in terminals] == ['segment_aborted', 'segment_aborted', 'segment_finished']
+    assert h.events()[-1]['had_segment_errors']
+
+
+def test_final_validation_failure_never_claims_success(monkeypatch, tmp_path, valid_media):
+    h = build_worker(monkeypatch, tmp_path, valid_media, total=1, segment=30, broken_segments=(1,))
+    assert h.controller.run() == 30
+    terminals = assert_paired(h.events())
+    assert terminals[0]['event'] == 'segment_aborted'
+    assert not any(e['event'] == 'segment_finished' for e in h.events())
+    assert h.events()[-1]['exit_code'] == 30
+
+
+def test_stop_during_overlap_has_one_final_and_both_closed(monkeypatch, tmp_path, valid_media):
+    h = build_worker(monkeypatch, tmp_path, valid_media, total=0, segment=10, overlap=3)
+    h.clock.on_sleep = lambda now: h.controller.request_stop() if now >= 1008 else None
+    assert h.controller.run() == 0
+    terminals = assert_paired(h.events())
+    assert h.launched == [1, 2]
+    assert sum(e.get('is_final', False) for e in terminals) == 1
+    assert terminals[-1]['segment_index'] == 2
+    assert all(not p.alive for p in h.pipelines)
+
+
+def test_expected_identity_is_not_filled_from_room_id(monkeypatch, tmp_path, valid_media):
+    h = build_worker(monkeypatch, tmp_path, valid_media, uid='999999', expected_uid='900001', allow_unconfirmed=True)
+    assert h.controller.run() == 18
+    assert not h.launched
+
+
+def test_strict_identity_without_evidence_is_blocked(monkeypatch, tmp_path, valid_media):
+    h = build_worker(monkeypatch, tmp_path, valid_media, uid=None, expected_uid=None)
+    assert h.controller.run() == 18
+    assert not h.launched
+
+
+def test_unconfirmed_requires_explicit_allow_and_reports_risk(monkeypatch, tmp_path, valid_media):
+    h = build_worker(monkeypatch, tmp_path, valid_media, uid=None, expected_uid=None, allow_unconfirmed=True)
+    assert h.controller.run() == 0
+    assert_paired(h.events())
+    assert all(e['room_identity_status'] == 'unconfirmed' for e in h.events() if e['event'] == 'segment_finished')
+
+
+def test_primary_crashes_during_overlap_preserves_all_terminals(monkeypatch, tmp_path, valid_media):
+    h = build_worker(monkeypatch, tmp_path, valid_media, total=12, segment=10, overlap=3)
+    injected = [False]
+    def crash(now):
+        if now >= 1007.5 and h.controller._overlapping_started and not injected[0]:
+            injected[0] = True
+            h.pipelines[0].alive = False
+            h.pipelines[0].exit_code = 9
+    h.clock.on_sleep = crash
+    assert h.controller.run() == 0
+    terminals = assert_paired(h.events())
+    assert h.launched == [1, 2, 3]
+    assert [e['event'] for e in terminals] == ['segment_aborted', 'segment_aborted', 'segment_finished']
+    assert not any(p.alive for p in h.pipelines)
+
+
+def test_secondary_failure_falls_back_without_reusing_index(monkeypatch, tmp_path, valid_media):
+    h = build_worker(monkeypatch, tmp_path, valid_media, total=12, segment=10, overlap=3)
+    injected = [False]
+    def crash(now):
+        if now >= 1007.5 and h.controller._overlapping_started and not injected[0]:
+            injected[0] = True
+            h.pipelines[1].alive = False
+            h.pipelines[1].exit_code = 9
+    h.clock.on_sleep = crash
+    assert h.controller.run() == 0
+    terminals = assert_paired(h.events())
+    assert h.launched == [1, 2, 3]
+    assert len([e for e in terminals if e['event'] == 'segment_aborted']) == 1
+    assert h.controller._overlap_disabled
+    assert not any(p.alive for p in h.pipelines)
+
+
+def test_real_watchdog_freeze_actions_reach_controller_and_budget(monkeypatch, tmp_path, valid_media):
+    import numpy as np
+    import src.worker.controller as cm
+    from src.worker.watchdog import StallWatchdog
+    h = build_worker(monkeypatch, tmp_path, valid_media, total=110, segment=1800)
+    monkeypatch.setattr(cm.WorkerNavigator, 'get_current_focus_activity',
+                        lambda self: 'com.ss.android.ugc.aweme.LivePlayActivity', raising=False)
+    monkeypatch.setattr(cm.WorkerNavigator, '_capture_frame_array',
+                        lambda self: np.full((100, 100, 3), 80, dtype=np.uint8), raising=False)
+    class TickWatchdog(StallWatchdog):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            # 录制进程边界模拟字节持续增长；视觉信号来自实际 ndarray 差分。
+            self.pipeline.get_current_file_size_mb = lambda: h.clock.monotonic() / 10
+        def start(self):
+            self._stop.clear()
+            h.clock.on_sleep = lambda now: self.check_once(now)
+        def stop(self):
+            self._stop.set()
+            h.clock.on_sleep = None
+    monkeypatch.setattr(cm, 'StallWatchdog', TickWatchdog)
+    assert h.controller.run() == 30
+    terminals = assert_paired(h.events())
+    assert len(h.launched) <= 3
+    assert h.controller._failure_reason == 'recovery_budget_exhausted'
+    assert any(e['event'] == 'segment_aborted' for e in terminals)
+    assert all(not p.alive for p in h.pipelines)

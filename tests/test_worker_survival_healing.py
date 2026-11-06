@@ -1,77 +1,52 @@
-"""测试 scrcpy 进程存活秒级监控与有界就地自愈 (Ticket 06)。"""
-from unittest.mock import MagicMock, patch
-import pytest
-
-from src.worker.controller import WorkerController, WorkerConfig, EXIT_RECORDING_FAILED
-from src.worker.events import (
-    WorkerEventEmitter,
-    SegmentStartedEvent,
-    SegmentAbortedEvent,
-)
+"""恢复次数同时受滚动窗口和任务全局预算约束。"""
+from unittest.mock import Mock
+from src.worker.controller import WorkerController, WorkerConfig
+from src.worker.events import WorkerEventEmitter
+from src.worker.state_machine import WorkerState
+import io
 
 
-def test_watchdog_detects_process_crash_within_one_second():
-    """主循环在 <= 1.0 秒内检测到 scrcpy 进程终止，并正确发射 segment_aborted。"""
-    config = WorkerConfig(
-        vmindex=0,
-        target="room_test",
-        output_dir=MagicMock(),
-        segment_duration_sec=100,
-    )
-    mock_stream = MagicMock()
-    emitter = WorkerEventEmitter(stream=mock_stream)
-    controller = WorkerController(config=config, emitter=emitter)
-
-    # 模拟管线进程突然退出 (is_recording 返回 False, returncode=1)
-    mock_pipe = MagicMock()
-    mock_pipe.is_recording.return_value = False
-    mock_pipe.get_exit_code.return_value = 1
-    mock_pipe.current_file_path = "seg_001.mp4"
-    mock_pipe.get_current_segment_elapsed.return_value = 2.0
-    mock_pipe.get_current_file_size_mb.return_value = 1.0
-
-    controller._pipeline = mock_pipe
-    controller.current_generation_id = 1
-    controller.state_machine.transition_to(controller.state_machine.ALLOWED_TRANSITIONS[controller.state_machine.state].copy().pop())
-
-    # 触发单次检查或调用存活探针
-    with patch.object(controller, "_handle_pipeline_crash") as mock_heal:
-        controller._check_pipeline_survival(segment_idx=1)
-        mock_heal.assert_called_once_with(segment_idx=1, exit_code=1)
+def make_controller(tmp_path):
+    ctrl = WorkerController(WorkerConfig(0, '123', tmp_path), WorkerEventEmitter(io.StringIO()))
+    pipe = Mock()
+    pipe.is_recording.return_value = False
+    pipe.get_exit_code.return_value = 9
+    pipe.current_file_path = tmp_path / 'missing.mp4'
+    pipe.get_current_file_size_mb.return_value = 0.0
+    pipe.start_segment.side_effect = lambda idx: tmp_path / f'seg_{idx}.mp4'
+    ctrl._pipeline = pipe
+    ctrl.state_machine.transition_to(WorkerState.RECORDING)
+    return ctrl
 
 
-def test_bounded_healing_stops_after_max_retries():
-    """连续故障达到上限 3 次后必须果断停止自愈，禁止陷入无限死循环重启。"""
-    config = WorkerConfig(
-        vmindex=0,
-        target="room_test",
-        output_dir=MagicMock(),
-        segment_duration_sec=100,
-    )
-    mock_stream = MagicMock()
-    emitter = WorkerEventEmitter(stream=mock_stream)
-    controller = WorkerController(config=config, emitter=emitter)
+def test_survival_probe_dispatches_actual_exit(tmp_path):
+    ctrl = make_controller(tmp_path)
+    heal = Mock(return_value=True)
+    ctrl._handle_pipeline_crash = heal
+    assert ctrl._check_pipeline_survival(segment_idx=1)
+    heal.assert_called_once_with(segment_idx=1, exit_code=9)
 
-    mock_pipe = MagicMock()
-    mock_pipe.current_file_path = "seg_001.mp4"
-    mock_pipe.start_segment.return_value = "new_seg.mp4"
-    controller._pipeline = mock_pipe
 
-    # 模拟连续触发 3 次崩溃自愈
-    assert controller._total_crash_count == 0
-    ok1 = controller._handle_pipeline_crash(segment_idx=1, exit_code=1)
-    assert ok1 is True
-    assert controller._total_crash_count == 1
+def test_rolling_window_blocks_third_immediate_restart(tmp_path):
+    ctrl = make_controller(tmp_path)
+    assert ctrl._handle_pipeline_crash(segment_idx=1, exit_code=9)
+    assert ctrl._handle_pipeline_crash(exit_code=9)
+    assert not ctrl._handle_pipeline_crash(exit_code=9)
+    assert ctrl._total_crash_count == 2
+    assert ctrl._failure_reason == 'recovery_budget_exhausted'
+    assert ctrl.stop_requested
 
-    ok2 = controller._handle_pipeline_crash(segment_idx=2, exit_code=1)
-    assert ok2 is True
-    assert controller._total_crash_count == 2
 
-    ok3 = controller._handle_pipeline_crash(segment_idx=3, exit_code=1)
-    assert ok3 is True
-    assert controller._total_crash_count == 3
-
-    # 第 4 次崩溃已超过上限 (max 3 次)，必须停止自愈并标记 fatal
-    ok4 = controller._handle_pipeline_crash(segment_idx=4, exit_code=1)
-    assert ok4 is False
-    assert controller._fatal_error is True
+def test_global_budget_persists_across_windows(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    ctrl = make_controller(tmp_path)
+    value = [1000.0]
+    monkeypatch.setattr('src.worker.controller.time', SimpleNamespace(
+        monotonic=lambda: value[0], time=lambda: 1800000000 + value[0]))
+    for index in range(3):
+        value[0] += 301
+        assert ctrl._handle_pipeline_crash(segment_idx=1 if index == 0 else None, exit_code=9)
+    value[0] += 301
+    assert not ctrl._handle_pipeline_crash(exit_code=9)
+    assert ctrl._total_crash_count == 3
+    assert ctrl._fatal_error

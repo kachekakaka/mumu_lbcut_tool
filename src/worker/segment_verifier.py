@@ -1,20 +1,19 @@
-"""切片完整性三级核验与音视频双轨检测器 (Ticket 07)。"""
+"""切片双轨/容器校验与不覆盖归档；短尾片大小不是完整性判据。"""
 from dataclasses import dataclass
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import shutil
-from typing import Optional
 
 from src.worker.executor import run_command
 
-logger = logging.getLogger("SegmentVerifier")
+logger = logging.getLogger(__name__)
 
 
 @dataclass
 class SegmentValidationResult:
-    """切片校验结果。"""
     is_valid: bool
     has_video: bool
     has_audio: bool
@@ -24,166 +23,71 @@ class SegmentValidationResult:
     reject_reason: str = ""
 
 
-def verify_segment_file(
-    file_path: Path,
-    min_size_bytes: int = 100 * 1024,
-    ffprobe_exe: Path | None = None,
-    timeout: float = 8.0,
-    allow_short_tail: bool = False,
-) -> SegmentValidationResult:
-    """对生成的切片 MP4 执行三级完整性核验。
-
-    1. 文件存在性与最小大小阈值核验（短尾切片放宽大小阈值）；
-    2. ffprobe 探测音视频双轨有效性与编码流；
-    3. 时长有效性核验。
-    """
-    if not file_path.exists():
-        return SegmentValidationResult(
-            is_valid=False,
-            has_video=False,
-            has_audio=False,
-            reject_reason="文件不存在",
-        )
-
+def verify_segment_file(file_path: Path, min_size_bytes: int = 0,
+                        ffprobe_exe: Path | None = None, timeout: float = 8.0,
+                        allow_short_tail: bool = False) -> SegmentValidationResult:
+    """元数据完整性不是逐帧解码保证；min_size_bytes 不再作为拒绝有效媒体的门槛。"""
+    result = SegmentValidationResult(False, False, False, is_short_tail=allow_short_tail)
     try:
-        stat_obj = file_path.stat()
-        raw_size = getattr(stat_obj, "st_size", 0)
-        file_size = int(raw_size)
-    except (TypeError, ValueError, AttributeError):
-        file_size = min_size_bytes
-
-    size_mb = file_size / (1024 * 1024)
-
-    effective_min_size = 1024 if allow_short_tail else min_size_bytes
-    if file_size < effective_min_size:
-        return SegmentValidationResult(
-            is_valid=False,
-            has_video=False,
-            has_audio=False,
-            size_mb=round(size_mb, 3),
-            is_short_tail=allow_short_tail,
-            reject_reason=f"文件过小 ({file_size} 字节 < {effective_min_size} 字节阈值)，可能写入截断",
-        )
-
-    # 尝试探测 ffprobe
-    probe_bin = ffprobe_exe or shutil.which("ffprobe")
-    if not probe_bin:
-        return SegmentValidationResult(
-            is_valid=False,
-            has_video=False,
-            has_audio=False,
-            size_mb=round(size_mb, 2),
-            reject_reason="未检测到 ffprobe 工具，无法核验音视频双轨有效性",
-        )
-
-    cmd = [
-        str(probe_bin),
-        "-v", "error",
-        "-show_entries", "stream=codec_type,codec_name:format=duration,size",
-        "-of", "json",
-        str(file_path),
-    ]
-
+        size = file_path.stat().st_size
+    except OSError as exc:
+        result.reject_reason = f"文件不存在或不可读取: {exc}"
+        return result
+    result.size_mb = size / (1024 * 1024)
+    if size == 0:
+        result.reject_reason = "零字节空文件，写入截断"
+        return result
+    probe = ffprobe_exe or shutil.which("ffprobe")
+    if not probe:
+        result.reject_reason = "未检测到 ffprobe，无法验证双轨媒体"
+        return result
+    cmd = [str(probe), "-v", "error", "-show_entries",
+           "stream=codec_type,codec_name,duration,nb_frames:format=duration,size",
+           "-of", "json", str(file_path)]
     try:
-        res = run_command(cmd, timeout=timeout)
-        if res.exit_code != 0:
-            return SegmentValidationResult(
-                is_valid=False,
-                has_video=False,
-                has_audio=False,
-                size_mb=round(size_mb, 2),
-                reject_reason=f"ffprobe 解析损坏: {res.stderr[:100]}",
-            )
-
-        probe_data = json.loads(res.stdout)
-        streams = probe_data.get("streams", [])
-        has_video = any(s.get("codec_type") == "video" for s in streams)
-        has_audio = any(s.get("codec_type") == "audio" for s in streams)
-
-        format_info = probe_data.get("format", {})
-        duration_val = float(format_info.get("duration", 0.0))
-
-        if not has_video:
-            return SegmentValidationResult(
-                is_valid=False,
-                has_video=False,
-                has_audio=has_audio,
-                duration=duration_val,
-                size_mb=round(size_mb, 2),
-                reject_reason="视频轨缺失",
-            )
-
-        if not has_audio:
-            return SegmentValidationResult(
-                is_valid=False,
-                has_video=True,
-                has_audio=False,
-                duration=duration_val,
-                size_mb=round(size_mb, 2),
-                reject_reason="音频轨缺失 (违反双轨录制规格，严禁静默产出无声视频)",
-            )
-
-        return SegmentValidationResult(
-            is_valid=True,
-            has_video=True,
-            has_audio=True,
-            duration=duration_val,
-            size_mb=round(size_mb, 2),
-        )
-
-    except Exception as e:
-        logger.warning(f"执行 ffprobe 探测异常: {e}")
-        return SegmentValidationResult(
-            is_valid=False,
-            has_video=False,
-            has_audio=False,
-            size_mb=round(size_mb, 2),
-            reject_reason=f"ffprobe 检测异常: {e}",
-        )
+        output = run_command(cmd, timeout=timeout)
+        if output.exit_code != 0:
+            raise ValueError(f"ffprobe 解析损坏: {output.stderr[:160]}")
+        data = json.loads(output.stdout)
+        streams = data.get("streams", [])
+        result.has_video = any(s.get("codec_type") == "video" for s in streams)
+        result.has_audio = any(s.get("codec_type") == "audio" for s in streams)
+        result.duration = float(data.get("format", {}).get("duration", 0))
+        if not result.has_video:
+            result.reject_reason = "视频轨缺失"
+        elif not result.has_audio:
+            result.reject_reason = "音频轨缺失"
+        elif not math.isfinite(result.duration) or result.duration <= 0:
+            result.reject_reason = "媒体时长无效"
+        elif any(s.get("nb_frames") == "0" for s in streams if s.get("codec_type") in ("video", "audio")):
+            result.reject_reason = "必需轨道没有有效媒体帧"
+        else:
+            result.is_valid = True
+    except Exception as exc:
+        result.reject_reason = f"ffprobe 检测异常: {exc}"
+    return result
 
 
-def finalize_segment(
-    raw_path: Path,
-    target_path: Path,
-    ffprobe_exe: Path | None = None,
-    allow_short_tail: bool = False,
-    timeout: float = 8.0,
-) -> tuple[bool, Path, SegmentValidationResult]:
-    """收尾并归档切片文件。
-
-    若校验通过：更名为 target_path；
-    若目标已存在：绝不覆盖，拒绝成功，保留原文件并明确报错；
-    若校验失败：更名为 <raw_path>.corrupted，阻止损坏文件流入下游。
-    """
-    res = verify_segment_file(raw_path, ffprobe_exe=ffprobe_exe, allow_short_tail=allow_short_tail, timeout=timeout)
+def finalize_segment(raw_path: Path, target_path: Path, ffprobe_exe: Path | None = None,
+                     allow_short_tail: bool = False, timeout: float = 8.0):
+    """成功时无覆盖归档；失败保留原始路径和证据，绝不删除已有产物。"""
+    result = verify_segment_file(raw_path, ffprobe_exe=ffprobe_exe,
+                                 allow_short_tail=allow_short_tail, timeout=timeout)
+    if not result.is_valid:
+        return False, raw_path, result
     target_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if res.is_valid:
-        # 1. 目标文件存在性检查：绝不 unlink 或覆盖已有录像！
-        if hasattr(target_path, "exists") and target_path.exists():
-            err_msg = f"归档目标文件已存在 ({target_path})，拒绝覆盖已有产物"
-            logger.error(err_msg)
-            res.is_valid = False
-            res.reject_reason = err_msg
-            return False, raw_path, res
-
-        # 2. 执行更名并严格核查
+    if raw_path.resolve() == target_path.resolve():
+        return True, raw_path, result
+    try:
+        # 同目录硬链接创建是原子的：已存在目标必然失败，不存在检查/替换窗口。
+        os.link(raw_path, target_path)
         try:
-            if hasattr(raw_path, "replace"):
-                raw_path.replace(target_path)
-            if hasattr(target_path, "exists") and not target_path.exists():
-                raise OSError(f"更名后目标文件不存在: {target_path}")
-            return True, target_path, res
-        except Exception as e:
-            logger.error(f"更名正式切片文件失败: {e}")
-            res.is_valid = False
-            res.reject_reason = f"更名归档失败: {e}"
-            return False, raw_path, res
-    else:
-        corrupted_path = raw_path.with_name(raw_path.stem + ".corrupted")
-        try:
-            if hasattr(raw_path, "replace") and not (hasattr(corrupted_path, "exists") and corrupted_path.exists()):
-                raw_path.replace(corrupted_path)
-        except Exception:
-            corrupted_path = raw_path
-        return False, corrupted_path, res
+            raw_path.unlink()
+        except OSError:
+            # 两个名字指向同一有效产物，保留原始名字比误删数据更安全。
+            logger.warning("归档成功但原始名字未移除: %s", raw_path)
+        return True, target_path, result
+    except OSError as exc:
+        result.is_valid = False
+        result.reject_reason = f"归档失败（目标已存在或不支持无覆盖链接），原文件保留: {exc}"
+        return False, raw_path, result

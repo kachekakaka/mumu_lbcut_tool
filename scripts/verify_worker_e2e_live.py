@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,9 +28,7 @@ if str(REPO_ROOT) not in sys.path:
 TMP_OUTPUT_DIR = (
     REPO_ROOT.parent / "mumu_lbcut_tool_dev" / "mumu_lbcut_tool_tmp" / "e2e_live_verify"
 )
-ARTIFACT_PREVIEW_DIR = Path(
-    r"C:\Users\73839\.gemini\antigravity\brain\bd946f40-a1fa-4dce-a8b1-c9f8b8739927\preview_frames"
-)
+
 
 FFPROBE_CANDIDATES = [
     Path(r"C:\Users\73839\.agent-reach-venv\Scripts\ffprobe.EXE"),
@@ -116,20 +115,20 @@ def run_e2e_test(
     ffmpeg_exe = find_binary(FFMPEG_CANDIDATES, "ffmpeg")
     logger.info(f"依赖二进制检查通过: ffprobe={ffprobe_exe}, ffmpeg={ffmpeg_exe}")
 
-    TMP_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    # 清理旧输出目录中的运行产物
-    for item in TMP_OUTPUT_DIR.glob("run_*"):
-        if item.is_dir():
-            shutil.rmtree(item, ignore_errors=True)
+    # 每次验证独立目录，绝不删除以前的 run_* 录像或证据。
+    run_dir = TMP_OUTPUT_DIR / (time.strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex)
+    run_dir.mkdir(parents=True, exist_ok=False)
+    preview_dir = run_dir / "preview"
 
     cmd = [
         sys.executable,
         "-m", "src.worker.cli",
         "--vmindex", str(vmindex),
         "--target", target,
-        "--output-dir", str(TMP_OUTPUT_DIR),
+        "--output-dir", str(run_dir),
         "--segment-duration", str(segment_duration),
-        "--overlap-duration", "3.0",
+        "--recording-mode", "continuous",
+        "--overlap-duration", "0.0",
         "--window-mode", window_mode,
         "--allow-unconfirmed-identity",
     ]
@@ -187,8 +186,8 @@ def run_e2e_test(
                         first_segment_started.set()
                     elif ev_type == "heartbeat":
                         fps = data.get("fps", 0)
-                        bytes_rec = data.get("bytes_recorded", 0) / (1024 * 1024)
-                        logger.info(f"[NDJSON Event] ❤️ heartbeat: fps={fps:.1f}, size={bytes_rec:.2f}MB")
+                        bytes_rec = data.get("file_size_mb", 0)
+                        logger.info(f"[NDJSON Event] ❤️ heartbeat: fps={fps if fps is not None else 'unknown'}, size={bytes_rec:.2f}MB")
                     elif ev_type in ("worker_started", "worker_stopped", "worker_aborted"):
                         logger.info(f"[NDJSON Event] ℹ️ {ev_type}: {data}")
                 except Exception:
@@ -273,10 +272,10 @@ def run_e2e_test(
         assert info["duration"] > 0, f"切片 #{idx} 时长无效！"
 
         # 截取预览帧存到 artifacts
-        out_jpg = ARTIFACT_PREVIEW_DIR / f"e2e_live_verify_seg{idx:02d}.jpg"
+        out_jpg = preview_dir / f"e2e_live_verify_seg{idx:02d}.jpg"
         extract_preview_frame(ffmpeg_exe, mp4_path, out_jpg, time_sec=min(5, int(info["duration"] / 2)))
         # 同步复制到根目录方便直接渲染
-        root_jpg = ARTIFACT_PREVIEW_DIR.parent / f"seg{idx:02d}_05s.jpg"
+        root_jpg = run_dir / f"seg{idx:02d}_05s.jpg"
         extract_preview_frame(ffmpeg_exe, mp4_path, root_jpg, time_sec=min(5, int(info["duration"] / 2)))
 
     logger.info("=======================================================")

@@ -32,6 +32,7 @@ from src.worker.events import (
     SegmentAbortedEvent,
     HeartbeatEvent,
 )
+from src.worker.state_machine import WorkerState
 from src.worker.health_monitor import HealthMonitor
 from src.worker.identity_verifier import IdentityStatus
 from src.worker.naming_lock import WorkerInstanceLock, LockAcquisitionError
@@ -100,7 +101,8 @@ class TestReviewDefectsReproduction(unittest.TestCase):
             # 模拟先启动了切片 1
             emitter.emit(SegmentStartedEvent(segment_index=1, file_path=str(mock_pipe.current_file_path)))
 
-            # 触发看门狗切片重拉
+            # 已开始的切片处于 RECORDING，恢复不允许从 PREFLIGHT 凭空发生。
+            ctrl.state_machine.transition_to(WorkerState.RECORDING)
             ctrl._recycle_current_segment()
 
             # 断言：切片 1 必须有且仅有一个终态事件（finished 或 aborted），然后再是切片 2 的 started

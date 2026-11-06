@@ -1,3 +1,4 @@
+from src.worker.state_machine import WorkerState
 """Worker 主控制流程与 14 项核心规格全量回归测试套件。
 
 覆盖用户明确要求的 14 大核心场景：
@@ -135,6 +136,7 @@ class TestWorkerE2ERegression(unittest.TestCase):
             self.assertEqual(ctrl.current_generation_id, 1)
 
             # 看门狗触发重启
+            ctrl.state_machine.transition_to(WorkerState.RECORDING)
             ctrl._recycle_current_segment(reason="watchdog_stall")
             self.assertEqual(ctrl.current_segment_index, 2)
             self.assertEqual(ctrl.current_generation_id, 2)
@@ -240,31 +242,28 @@ class TestWorkerE2ERegression(unittest.TestCase):
             self.assertTrue(raw.exists(), "归档失败时原文件必须妥善保留")
 
     def test_07_identity_mismatch_detected_from_page_blocks_recording(self):
-        """场景 7: 目标主播为 A，模拟器实际页面证据探测为 B：主流程严防错房并以退出码 18 退出。"""
+        """真实控制流程三次纠偏后仍为其他房间：不把错误画面交付为目标录像。"""
+        from src.worker.room_locator import RoomEvidence
         stream = io.StringIO()
-        emitter = WorkerEventEmitter(stream=stream)
-
-        with patch("src.worker.controller.MuMuClient") as mock_mumu, \
-             patch("src.worker.controller.WorkerNavigator") as mock_nav_cls:
-
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+             patch("src.worker.controller.MuMuClient") as mock_mumu, \
+             patch("src.worker.controller.WorkerNavigator") as mock_nav_cls, \
+             patch("src.worker.controller.WorkerPipeline") as mock_pipeline:
             mock_mumu.return_value.launch_player.return_value = True
-            mock_mumu.return_value.connect_adb.return_value = "127.0.0.1:16448"
-
-            # 模拟器实际页面证据探测到了完全不同的 UID_B
-            mock_nav = mock_nav_cls.return_value
-            mock_nav.launch_room.return_value = True
-            mock_nav.detect_current_room_identity.return_value = ("UID_B_ACTUAL", "其他主播B")
-
-            cfg = WorkerConfig(
-                vmindex=2,
-                target="88888",
-                output_dir=Path("./output"),
-            )
-            ctrl = WorkerController(config=cfg, emitter=emitter)
-            code = ctrl.run()
-
-            # 必须坚决以 EXIT_ROOM_MISMATCH (18) 退出！
-            self.assertEqual(code, EXIT_ROOM_MISMATCH)
+            mock_mumu.return_value.connect_adb.return_value = "synthetic-device"
+            nav = mock_nav_cls.return_value
+            nav.navigate_route.return_value = True
+            nav.wait_live_page.return_value = True
+            nav.observe_live_room.return_value = RoomEvidence('99999', '22222', source='synthetic-device')
+            cfg = WorkerConfig(vmindex=321,target='88888',target_kind='room_id',
+                expected_anchor_uid='11111',output_dir=Path(tmp_dir)/'out',lock_dir=Path(tmp_dir)/'locks')
+            ctrl = WorkerController(cfg, WorkerEventEmitter(stream))
+            self.assertEqual(ctrl.run(), EXIT_ROOM_MISMATCH)
+            self.assertEqual(nav.observe_live_room.call_count, 3)
+            self.assertFalse(mock_pipeline.called)
+            events = [json.loads(line) for line in stream.getvalue().splitlines()]
+            self.assertEqual(sum(e.get('action')=='correct_wrong_room' for e in events),3)
+            self.assertFalse(any(e['event']=='segment_started' for e in events))
 
     def test_08_cli_escape_switch_allows_unconfirmed_but_blocks_mismatch(self):
         """场景 8: CLI 逃逸开关：只放行 UNCONFIRMED，绝不放行明确 MISMATCH。"""
