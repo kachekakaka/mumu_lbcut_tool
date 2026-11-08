@@ -69,6 +69,46 @@ def fresh_profile_evidence(before: str, after: str, live_task: str,
     return candidates[0] if len(candidates) == 1 else None
 
 
+def current_live_fragment_evidence(activity_top: str, current_activity: str | None) -> RoomEvidence | None:
+    """从当前 LivePlayActivity 的 LivePlayFragment 参数读取当前场次与主播 UID。
+
+    只采信 live_backend_roomid + USER_ID；FROM_ROOM_ID 是跳转来源，不能作为当前房间。
+    ROOM_ID / EXTRA_ROOM_UNIQUE_KEY 若存在，必须与当前 room_id 一致。多个 Fragment
+    副本必须全部一致；冲突、缺 UID 或非直播 Activity 均回退到完整资料页取证。
+    """
+    if not current_activity or 'LivePlayActivity' not in current_activity:
+        return None
+    text = str(activity_top or '')
+    # dumpsys embeds empty Bundle[{}] values inside mArguments; normalize them so
+    # the outer Bundle terminator is not mistaken for the nested empty bundle.
+    text = re.sub(r'Bundle\[\{\}\]', 'Bundle[empty]', text)
+    bundles = re.findall(r'mArguments=Bundle\[\{(.*?)\}\]', text, re.DOTALL)
+    candidates = []
+    for body in bundles:
+        if 'live_backend_roomid=' not in body or 'is_LiveRoomFragment=true' not in body:
+            continue
+        rooms = re.findall(r'live_backend_roomid=(\d+)', body)
+        uids = re.findall(r'live\.intent\.extra\.USER_ID=(\d+)', body)
+        room_args = re.findall(r'live\.intent\.extra\.ROOM_ID=(\d+)', body)
+        unique = re.findall(r'live\.intent\.extra\.EXTRA_ROOM_UNIQUE_KEY=(\d+)_\d+', body)
+        if len(set(rooms)) != 1 or len(set(uids)) != 1:
+            return None
+        room_id, uid = rooms[0], uids[0]
+        if uid == '0' or not room_id.isdigit() or not uid.isdigit():
+            return None
+        if room_args and (len(set(room_args)) != 1 or room_args[0] != room_id):
+            return None
+        if unique and (len(set(unique)) != 1 or unique[0] != room_id):
+            return None
+        candidates.append((room_id, uid, unique[0] if unique else None))
+    if not candidates or len({(r, u) for r, u, _ in candidates}) != 1:
+        return None
+    room_id, uid, _ = candidates[0]
+    tokens = {token for _, _, token in candidates if token}
+    token = next(iter(tokens)) if len(tokens) == 1 else None
+    return RoomEvidence(room_id, uid, None, 'live_fragment_arguments', token, time.time())
+
+
 def compare_evidence(evidence: RoomEvidence, room_id: str | None,
                      anchor_uid: str | None) -> IdentityStatus:
     """比较同类稳定标识；昵称只展示，不用同名文本替代身份匹配。"""

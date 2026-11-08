@@ -3,12 +3,14 @@ from pathlib import Path
 import logging
 import subprocess
 import time
+import threading
 import re
 import xml.etree.ElementTree as ET
 
 from src.mvp.config import get_adb_exe
 from src.worker.adb_client import AdbDeviceClient
-from src.worker.room_locator import RoomEvidence, activity_records, fresh_profile_evidence
+from src.worker.room_locator import (RoomEvidence, activity_records, fresh_profile_evidence,
+                                      current_live_fragment_evidence)
 
 logger = logging.getLogger(__name__)
 
@@ -29,9 +31,20 @@ class WorkerNavigator:
         self.last_gate_reason = "render_timeout"
         self._operation_deadline = None
         self._last_adb_failed = False
+        self._last_overlay_observation = None
+        self._navigation_generation = 0
+        self._profile_entry_clicked_generation = None
+        self._probe_metrics = {}
+        self._probe_metrics_lock = threading.Lock()
+        self._focus_snapshot_cache = None
+
+    def _invalidate_focus_cache(self) -> None:
+        self._focus_snapshot_cache = None
 
     def _adb(self, *args: str, timeout: float = 5.0) -> str:
         """执行 ADB 命令，遇到断连自动有界重试。"""
+        if args[:2] == ("shell", "input") or (args[:2] == ("shell", "am") and "start" in args):
+            self._invalidate_focus_cache()
         try:
             self._last_adb_failed = False
             if self._operation_deadline is not None:
@@ -58,29 +71,38 @@ class WorkerNavigator:
             logger.warning(f"执行 ADB 指令失败: {args}, 错误: {e}")
             return ""
 
+    def get_current_focus_snapshot(self) -> tuple[str | None, str | None]:
+        """一次读取同时提供 package/activity；短时复用，UI 操作会主动失效。"""
+        now = time.monotonic()
+        cached = getattr(self, "_focus_snapshot_cache", None)
+        if cached is not None and now - cached[0] <= 0.25:
+            return cached[1], cached[2]
+
+        package = activity = None
+        out = self._adb("shell", "dumpsys", "window", "windows")
+        match = re.search(r"mCurrentFocus=.*?([a-zA-Z0-9._]+/[a-zA-Z0-9._]+)", out)
+        if match:
+            component = match.group(1)
+        else:
+            out = self._adb("shell", "dumpsys", "activity", "activities")
+            match = re.search(
+                r"(?:topResumedActivity|mResumedActivity|ResumedActivity).*?ActivityRecord\{.*?\s+([a-zA-Z0-9._]+/[a-zA-Z0-9._]+)",
+                out,
+            )
+            component = match.group(1) if match else None
+        if component:
+            package, activity_name = component.split("/", 1)
+            activity = package + activity_name if activity_name.startswith(".") else activity_name
+        self._focus_snapshot_cache = (time.monotonic(), package, activity)
+        return package, activity
+
     def get_current_focus_package(self) -> str | None:
         """获取当前前台聚焦的应用包名。"""
-        out = self._adb("shell", "dumpsys", "window", "windows")
-        m = re.search(r"mCurrentFocus=.*?([a-zA-Z0-9._]+)/", out)
-        if m:
-            return m.group(1)
-        out2 = self._adb("shell", "dumpsys", "activity", "activities")
-        m2 = re.search(r"ResumedActivity: ActivityRecord\{.*?\s+([a-zA-Z0-9._]+)/", out2)
-        if m2:
-            return m2.group(1)
-        return None
+        return self.get_current_focus_snapshot()[0]
 
     def get_current_focus_activity(self) -> str | None:
         """获取当前前台聚焦的完整 Activity 类名。"""
-        out = self._adb("shell", "dumpsys", "window", "windows")
-        m = re.search(r"mCurrentFocus=.*?([a-zA-Z0-9._]+/[a-zA-Z0-9._]+)", out)
-        if m:
-            return m.group(1).replace("/", ".")
-        out2 = self._adb("shell", "dumpsys", "activity", "activities")
-        m2 = re.search(r"ResumedActivity: ActivityRecord\{.*?\s+([a-zA-Z0-9._]+/[a-zA-Z0-9._]+)", out2)
-        if m2:
-            return m2.group(1).replace("/", ".")
-        return None
+        return self.get_current_focus_snapshot()[1]
 
     def configure_target(self, kind: str = "auto", web_rid: str | None = None):
         """保留目标种类；同一任务首次进入和自愈使用完全相同的路由。"""
@@ -167,8 +189,48 @@ class WorkerNavigator:
         self._adb("shell", "rm", "-f", remote_path)
         return save_path.exists()
 
+    def _record_probe_timing(self, name: str, elapsed_ms: float, status: str) -> None:
+        lock = getattr(self, "_probe_metrics_lock", None)
+        if lock is None:
+            self._probe_metrics_lock = threading.Lock()
+            lock = self._probe_metrics_lock
+        with lock:
+            if not hasattr(self, "_probe_metrics"):
+                self._probe_metrics = {}
+            row = self._probe_metrics.setdefault(name, {
+                "count": 0, "total_ms": 0.0, "max_ms": 0.0, "failures": 0,
+            })
+            row["count"] += 1
+            row["total_ms"] += elapsed_ms
+            row["max_ms"] = max(row["max_ms"], elapsed_ms)
+            row["failures"] += int(status != "ok")
+
+    def reset_metrics(self) -> None:
+        lock = getattr(self, "_probe_metrics_lock", None)
+        if lock is None:
+            self._probe_metrics_lock = threading.Lock()
+            lock = self._probe_metrics_lock
+        with lock:
+            self._probe_metrics = {}
+        self.adb_client.reset_metrics()
+
+    def metrics_snapshot(self) -> dict:
+        lock = getattr(self, "_probe_metrics_lock", None)
+        if lock is None:
+            self._probe_metrics_lock = threading.Lock()
+            lock = self._probe_metrics_lock
+        with lock:
+            probes = {
+                name: {**row, "total_ms": round(row["total_ms"], 1),
+                       "max_ms": round(row["max_ms"], 1)}
+                for name, row in self._probe_metrics.items()
+            }
+        return {"adb": self.adb_client.metrics_snapshot(), "probes": probes}
+
     def _capture_frame_array(self):
-        """通过 ADB 直接从内存截帧解码为 RGB 图像矩阵。"""
+        """通过 ADB 直接从内存截帧解码为 RGB 图像矩阵，并记录耗时。"""
+        started = time.monotonic()
+        status = "error"
         try:
             import io
             import numpy as np
@@ -182,9 +244,12 @@ class WorkerNavigator:
             res = subprocess.run(cmd, capture_output=True, timeout=budget)
             if res.returncode == 0 and len(res.stdout) > 0:
                 img = Image.open(io.BytesIO(res.stdout)).convert("RGB")
+                status = "ok"
                 return np.array(img)
         except Exception as e:
             logger.warning(f"内存截帧解码异常: {e}")
+        finally:
+            self._record_probe_timing("screenshot", (time.monotonic()-started)*1000.0, status)
         return None
 
     def verify_preflight_content_gate(self, timeout_sec: float = 8.0) -> bool:
@@ -313,6 +378,10 @@ class WorkerNavigator:
 
     def navigate_route(self, target, web_rid, route, deadline, stop_requested):
         """根据页面反馈选择入口，不把系统已受理当作定位完成。"""
+        self._navigation_generation = getattr(self, "_navigation_generation", 0) + 1
+        self._profile_entry_clicked_generation = None
+        self._last_overlay_observation = None
+        self._invalidate_focus_cache()
         old = self._operation_deadline
         self._operation_deadline = deadline
         try:
@@ -369,7 +438,8 @@ class WorkerNavigator:
                 else:
                     bypasser = PopupBypasser(self.adb_client)
                     bypasser.deadline = min(deadline, time.monotonic()+4)
-                    bypasser.detect_and_dismiss_popups()
+                    if bypasser.detect_and_dismiss_popups():
+                        self._invalidate_focus_cache()
                 self._navigation_sleep(.5, deadline, stop_requested)
             return False
         finally:
@@ -377,112 +447,183 @@ class WorkerNavigator:
 
     @staticmethod
     def _anchor_entry_point(tree, width, height):
-        """仅选择直播顶部主播名字，不点击聊天用户名或关注按钮。"""
+        """优先定位直播顶部真实头像容器，不点昵称文字或关注按钮。"""
+        parent = {child: node for node in tree.iter() for child in node}
         choices = []
         for node in tree.iter('node'):
             key = node.get('resource-id','').rsplit('/',1)[-1]
-            if node.get('package') != DOUYIN_PACKAGE or key not in {'user_name','author_name'}:
+            if node.get('package') != DOUYIN_PACKAGE or key not in {'avatar_container','user_avatar','author_avatar'}:
                 continue
             match = re.fullmatch(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]',node.get('bounds',''))
             if not match:
                 continue
             x1,y1,x2,y2 = map(int,match.groups())
-            if 0 <= x1 < x2 < width*.65 and height*.03 <= y1 < y2 < height*.18:
+            if 0 <= x1 < x2 < width*.25 and height*.03 <= y1 < y2 < height*.18:
                 choices.append(((x1+x2)//2,(y1+y2)//2))
-        return choices[0] if len(choices)==1 else None
+        unique = list(dict.fromkeys(choices))
+        if len(unique)==1:
+            return unique[0]
+
+        # 某些版本只把头像节点作为不可点击子项暴露；只有唯一头像且父容器可点击才接受。
+        fallback=[]
+        for node in tree.iter('node'):
+            key=node.get('resource-id','').rsplit('/',1)[-1]
+            if node.get('package') != DOUYIN_PACKAGE or key not in {'user_name','author_name'}:
+                continue
+            ancestor=parent.get(node)
+            while ancestor is not None:
+                if ancestor.tag=='node' and ancestor.get('package')==DOUYIN_PACKAGE and ancestor.get('clickable')=='true':
+                    match=re.fullmatch(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]',ancestor.get('bounds',''))
+                    if match:
+                        x1,y1,x2,y2=map(int,match.groups())
+                        if 0 <= x1 < x2 < width*.65 and height*.03 <= y1 < y2 < height*.18:
+                            fallback.append(((x1+x2)//2,(y1+y2)//2))
+                    break
+                ancestor=parent.get(ancestor)
+        fallback=list(dict.fromkeys(fallback))
+        return fallback[0] if len(fallback)==1 else None
+
+    @staticmethod
+    def _profile_sheet_avatar_point(frame):
+        """在已打开的主播资料半屏卡片中定位头像；仅支持已验证的竖屏浅色卡片。
+
+        Android 15 的直播动效可能令 UIAutomator 第二次 dump 报
+        'could not get idle state'。此时用截图确认底部浅色资料卡存在，
+        再点击已实测的头像相对位置；未检测到卡片时绝不盲点。
+        """
+        if frame is None:
+            return None
+        import numpy as np
+        h, w = frame.shape[:2]
+        if not 1.6 < h / w < 2.3:
+            return None
+
+        def patch_luma(rx, ry, radius=10):
+            x, y = int(w * rx), int(h * ry)
+            patch = frame[max(0, y-radius):min(h, y+radius),
+                          max(0, x-radius):min(w, x+radius), :3]
+            return float(np.mean(patch)) if patch.size else 0.0
+
+        # 资料卡以底部白色/浅色 sheet 覆盖直播画面；两处独立采样降低误判。
+        live_bg = patch_luma(.95, .20)
+        sheet_right_top = patch_luma(.95, .50)
+        sheet_right_mid = patch_luma(.95, .70)
+        avatar_area = patch_luma(.14, .335)
+        if live_bg > 150 or sheet_right_top < 225 or sheet_right_mid < 220:
+            return None
+        if avatar_area > 248 or avatar_area < 25:
+            return None
+        return int(w * .14), int(h * .335)
 
     def observe_live_room(self, deadline, stop_requested):
-        """由当前主播资料卡主动取得独立 UID/场次证据，再返回直播画面。
+        """优先从当前 LivePlayFragment 直接读取场次 UID/room_id，失败才走资料页回退。
 
-        不查询公网，不读取账号凭证，不点击关注、登录或发送分享。
-        优先按新 UI 树中的直播顶部名字和资料头像 bounds 定位入口；
-        只有已实测竖屏布局允许左上头像坐标兜底，不点击中部活动区域。
-        资料卡点击必须匹配实际头像节点，不猜测关注/发送等按钮。
+        快速路径只读取当前 LivePlayActivity 的 Fragment mArguments，不查询公网，
+        不读取账号凭证，不点击任何 UI。证据缺失或冲突时才使用原有资料卡取证。
         """
         from src.worker.popup_bypasser import PopupBypasser
         old = self._operation_deadline
         self._operation_deadline = deadline
-        cleanup_deadline = deadline
         operation_deadline = deadline - min(10.0, max(2.0, (deadline-time.monotonic())*.2))
         self._operation_deadline = operation_deadline
         card_open = False
         profile_open = False
+        entry_clicked = False
+        fast_identity = False
         frame = None
         try:
-            if stop_requested() or 'LivePlayActivity' not in (self.get_current_focus_activity() or ''):
+            if stop_requested():
+                return RoomEvidence(source='cancelled')
+            current_activity = self.get_current_focus_activity() or ''
+            if 'LivePlayActivity' not in current_activity:
                 return RoomEvidence()
+            # 先读取当前 Activity 顶部 Fragment 参数；成功时完全跳过 UIAutomator 和头像点击。
+            activity_top = self._adb('shell', 'dumpsys', 'activity', 'top',
+                                     timeout=min(8.0, max(1.0, operation_deadline-time.monotonic())))
+            fast_evidence = current_live_fragment_evidence(activity_top, current_activity)
+            if fast_evidence is not None:
+                fast_identity = True
+                logger.info('从当前 LivePlayFragment 取得身份：room_id=%s uid=%s',
+                            fast_evidence.room_id, fast_evidence.anchor_uid)
+                return fast_evidence
             frame = self._capture_frame_array()
             if frame is None:
-                return RoomEvidence()
-            h,w = frame.shape[:2]
+                return RoomEvidence(source='screenshot_unavailable')
+            h, w = frame.shape[:2]
             if not 1.6 < h/w < 2.3:
                 return RoomEvidence(source='unsupported_live_layout')
+
             bypasser = PopupBypasser(self.adb_client)
-            # 先找实际显示的主播入口；刚进直播时顶栏可能还未加载或被清屏隐藏。
-            # 已有资料卡则直接读取，不能再次点击背景把它关掉。
-            avatars = []
-            bypasser.dump_timeout_sec = 8.0
-            entry_clicked = False
-            # 三次点击后仍须读取一次结果，不能把刚打开的资料卡误当失败。
-            for entry_attempt in range(4):
-                if stop_requested() or operation_deadline-time.monotonic() < 3:
-                    return RoomEvidence(source='cancelled_or_deadline')
-                bypasser.deadline = min(operation_deadline, time.monotonic()+11)
-                xml = bypasser.get_ui_dump()
-                tree = ET.fromstring(xml) if xml else None
-                if tree is not None:
-                    avatars = [n for n in tree.iter('node') if n.get('package') == DOUYIN_PACKAGE
-                               and n.get('content-desc', '').endswith('的头像')]
-                    if len(avatars) == 1:
-                        break
-                    point = self._anchor_entry_point(tree, w, h)
-                else:
-                    point = None
-                if not xml and entry_clicked:
-                    # 点击后读取超时：只等结果，不再次盲点把刚打开的卡片关掉。
-                    self._navigation_sleep(1.0, operation_deadline, stop_requested)
-                    continue
-                if entry_attempt == 3:
-                    break  # 最后一轮只确认第三次点击的结果，不产生第四次点击。
-                if point:
+            bypasser.dump_timeout_sec = 4.0  # live 动画无法 idle 时快速切换截图证据，不等待长超时
+            bypasser.deadline = min(operation_deadline, time.monotonic()+15)
+            xml = bypasser.get_ui_dump()  # 一次取证只请求一次 UIAutomator，避免 live UI idle 超时
+            tree = ET.fromstring(xml) if xml else None
+            avatars = ([n for n in tree.iter('node')
+                        if n.get('package') == DOUYIN_PACKAGE
+                        and n.get('content-desc', '').endswith('的头像')]
+                       if tree is not None else [])
+
+            if len(avatars) == 1:
+                # 已经处于资料卡状态：直接按实际节点坐标进入完整资料页。
+                avatar = avatars[0]
+                nickname = avatar.get('content-desc', '')[:-3]
+                points = re.fullmatch(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', avatar.get('bounds',''))
+                if not points:
+                    return RoomEvidence(nickname=nickname)
+                x1,y1,x2,y2 = map(int,points.groups())
+                if not (0 <= x1 < x2 <= w and 0 <= y1 < y2 <= h):
+                    return RoomEvidence(nickname=nickname)
+                avatar_point = ((x1+x2)//2,(y1+y2)//2)
+                card_open = True
+            else:
+                # 当前直播布局的主播入口是顶部 user_name；没有 XML 时仅用已验证竖屏头像坐标。
+                generation = getattr(self, '_navigation_generation', 0)
+                already_clicked = getattr(self, '_profile_entry_clicked_generation', None) == generation
+                entry_clicked = already_clicked
+                if not already_clicked:
+                    point = self._anchor_entry_point(tree, w, h) if tree is not None else None
+                    if point is None:
+                        # 已实测 MuMu 竖屏顶部主播头像中心；不点击昵称或关注按钮。
+                        point = (int(w*.0833), int(h*.079))
                     self._adb('shell','input','tap',str(point[0]),str(point[1]))
-                else:
-                    # 只在已适配竖屏直播页尝试左上主播头像；绝不点击中部活动/礼物区。
-                    self._adb('shell','input','tap',str(int(w*.0833)),str(int(h*.0755)))
-                entry_clicked = True
-                self._navigation_sleep(.8, operation_deadline, stop_requested)
-            if len(avatars) != 1:
-                logger.info('直播页已到达，但主播资料入口尚未就绪，将同页复检')
-                return RoomEvidence(source='anchor_card_not_ready')
-            card_open = True
-            avatar = avatars[0]
-            nickname = avatar.get('content-desc', '')[:-3]
-            points = re.fullmatch(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', avatar.get('bounds',''))
-            if not points:
-                return RoomEvidence(nickname=nickname)
-            x1,y1,x2,y2 = map(int,points.groups())
-            if not (0 <= x1 < x2 <= w and 0 <= y1 < y2 <= h):
-                return RoomEvidence(nickname=nickname)
+                    self._profile_entry_clicked_generation = generation
+                    entry_clicked = True
+                    # 网络慢或直播页刚完成冷启动时，资料卡动画可能晚于入口点击；
+                    # 多等一小段再截图确认，不重复点击入口。
+                    if not self._navigation_sleep(2.5, operation_deadline, stop_requested):
+                        return RoomEvidence(source='cancelled')
+                # 不再二次 UI dump。直播动画会令 UiAutomation waitForIdle 报错；
+                # 截图只在确认底部资料卡出现后，才点击其头像。
+                sheet_frame = self._capture_frame_array()
+                avatar_point = self._profile_sheet_avatar_point(sheet_frame)
+                if avatar_point is None:
+                    logger.info('主播入口已点击，但截图未确认资料卡；不执行盲点')
+                    # 未确认前不能把它标记为已打开；也不能发送 Back，避免误退直播页。
+                    return RoomEvidence(source='anchor_card_not_ready')
+                card_open = True
+
             before = self._adb('shell', 'dumpsys', 'activity', 'activities')
-            active = re.search(r'(?:topResumedActivity|mResumedActivity|ResumedActivity).*?ActivityRecord\{\S+\s+u\d+\s+[^ ]*LivePlayActivity\s+t(\d+)', before)
+            active = re.search(
+                r'(?:topResumedActivity|mResumedActivity|ResumedActivity).*?ActivityRecord\{.*?\s+u\d+\s+[^ ]*LivePlayActivity\s+t(\d+)',
+                before,
+            )
             if not active:
-                return RoomEvidence(nickname=nickname)
-            self._adb('shell', 'input', 'tap', str((x1+x2)//2), str((y1+y2)//2))
+                return RoomEvidence()
+            self._adb('shell', 'input', 'tap', str(avatar_point[0]), str(avatar_point[1]))
             profile_open = True
             until = min(operation_deadline, time.monotonic()+12)
             while time.monotonic() < until and not stop_requested():
                 after = self._adb('shell','dumpsys','activity','activities')
-                evidence = fresh_profile_evidence(before, after, active.group(1), nickname)
+                evidence = fresh_profile_evidence(before, after, active.group(1))
                 if evidence is not None:
                     return evidence
-                self._navigation_sleep(.3, until, stop_requested)
-            return RoomEvidence(nickname=nickname)
+                self._navigation_sleep(.5, until, stop_requested)
+            return RoomEvidence()
         except Exception as exc:
             logger.warning('当前房间取证未完成，将尝试纠偏: %s', exc)
             return RoomEvidence()
         finally:
-            # 清理最多10秒，取消时也不能把整个剩余取证时限都用于清理。
-            cleanup_deadline = min(cleanup_deadline, time.monotonic()+10.0)
+            cleanup_deadline = min(deadline, time.monotonic()+10.0)
             self._operation_deadline = cleanup_deadline
             if profile_open:
                 for _ in range(3):
@@ -494,10 +635,12 @@ class WorkerNavigator:
                         break
             elif card_open:
                 self._adb('shell','input','keyevent','4')
-            if 'LivePlayActivity' in (self.get_current_focus_activity() or ''):
-                # 返回直播后先识别，只有确定仍有资料卡/礼物展馆才按返回关闭。
-                # 禁止“预计空白位置”点击：该位置可能正是展馆/活动入口。
-                self.dismiss_live_overlay(cleanup_deadline, lambda: False)
+            if not fast_identity and 'LivePlayActivity' in (self.get_current_focus_activity() or ''):
+                preserve_pending_profile = entry_clicked and not profile_open
+                # 入口已点击但尚未确认资料卡时，保留当前直播页给下一轮只读复检；
+                # 不发送 Back，也不在收尾阶段再触发一次 UIAutomator dump。
+                if not preserve_pending_profile and not profile_open:
+                    self.dismiss_live_overlay(cleanup_deadline, lambda: False)
             self._operation_deadline = old
 
     def wait_live_picture(self, deadline, stop_requested, *, check_overlay=True,
@@ -537,10 +680,15 @@ class WorkerNavigator:
                     if overlay_deadline-time.monotonic() < 2:
                         last_problem = 'page_probe_unavailable'
                         break
-                    if not self.dismiss_live_overlay(overlay_deadline, stop_requested):
+                    cached = self._last_overlay_observation
+                    if cached is not None and time.time() - cached.get('observed_at', 0) > 5:
+                        cached = None
+                    if not self.dismiss_live_overlay(overlay_deadline, stop_requested,
+                                                     initial_observation=cached):
                         self.last_gate_reason = 'overlay_not_recovered'
                         return False
                     overlay_checked = True
+                    self._last_overlay_observation = None
                     # 返回操作后重新读取Activity再采样，不使用点击前的页面状态。
                     continue
                 frame = self._capture_frame_array()
@@ -598,6 +746,7 @@ class WorkerNavigator:
             current = observation or self.inspect_live_surface(
                 timeout_sec=max(.1, min(5, deadline-time.monotonic())))
             observation = None
+            self._last_overlay_observation = current
             if 'LivePlayActivity' not in current['activity']:
                 return False
             if not current.get('overlay'):

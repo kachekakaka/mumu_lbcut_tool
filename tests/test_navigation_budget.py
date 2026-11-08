@@ -100,10 +100,14 @@ def test_ui_dump_can_take_seven_seconds_with_explicit_probe_budget():
     from src.worker.popup_bypasser import PopupBypasser
     observed=[]
     class Adb:
-        def run_adb(self,*args,timeout):
+        def run_adb(self,*args,timeout,**kwargs):
             observed.append((args,timeout))
-            if args[1]=='uiautomator' and timeout<7:raise TimeoutError('slow fresh UI')
-            return SimpleNamespace(exit_code=0,stdout='<hierarchy><node text="fresh"/></hierarchy>')
+            if args[:3] == ("shell","uiautomator","dump"):
+                if timeout<7:raise TimeoutError('slow fresh UI')
+                return SimpleNamespace(exit_code=139,stdout='',stderr='Segmentation fault')
+            if args[:2] == ("shell","cat"):
+                return SimpleNamespace(exit_code=0,stdout='<hierarchy><node text="fresh"/></hierarchy>',stderr='')
+            return SimpleNamespace(exit_code=0,stdout='',stderr='')
     reader=PopupBypasser(Adb());reader.dump_timeout_sec=8
     reader.deadline=time.monotonic()+12
     assert 'fresh' in reader.get_ui_dump()

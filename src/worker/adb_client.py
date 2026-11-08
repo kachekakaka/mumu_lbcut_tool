@@ -2,6 +2,8 @@
 import logging
 from pathlib import Path
 import time
+import math
+import threading
 from typing import Optional
 
 from src.mvp.config import get_adb_exe
@@ -33,15 +35,98 @@ class AdbDeviceClient:
         self.adb_exe = adb_exe or get_adb_exe()
         if not self.adb_exe or not self.adb_exe.exists():
             raise FileNotFoundError(f"未找到 adb.exe: {self.adb_exe}")
+        self._metrics_lock = threading.Lock()
+        self._command_metrics = {}
+        self._slow_commands = []
 
     @property
     def current_serial(self) -> str:
         return self.serial
 
+    @staticmethod
+    def _command_kind(args: tuple[str, ...]) -> str:
+        joined = " ".join(args).lower()
+        if "uiautomator dump" in joined:
+            return "ui_dump"
+        if args[:2] == ("shell", "cat"):
+            return "ui_xml_read"
+        if "screencap" in joined:
+            return "screenshot"
+        if args[:3] == ("shell", "dumpsys", "activity"):
+            return "activity_probe"
+        if args[:3] == ("shell", "dumpsys", "window"):
+            return "window_probe"
+        if args[:3] == ("shell", "input", "tap"):
+            return "tap"
+        if args[:3] == ("shell", "input", "keyevent"):
+            return "keyevent"
+        if args[:2] == ("shell", "am") and "start" in args:
+            return "intent"
+        return "other"
+
+    def reset_metrics(self) -> None:
+        with self._metrics_lock:
+            self._command_metrics.clear()
+            self._slow_commands.clear()
+
+    def metrics_snapshot(self) -> dict:
+        with self._metrics_lock:
+            result = {}
+            for kind, row in self._command_metrics.items():
+                samples = sorted(row["samples_ms"])
+                def percentile(p):
+                    if not samples:
+                        return 0.0
+                    index = min(len(samples)-1, math.ceil((len(samples)-1)*p))
+                    return round(samples[index], 1)
+                result[kind] = {
+                    "count": row["count"],
+                    "total_ms": round(row["total_ms"], 1),
+                    "max_ms": round(row["max_ms"], 1),
+                    "p50_ms": percentile(.50),
+                    "p95_ms": percentile(.95),
+                    "failures": row["failures"],
+                    "timeouts": row["timeouts"],
+                }
+            return {"commands": result, "slow_commands": list(self._slow_commands)}
+
+    def _record_command(self, kind: str, elapsed_ms: float, status: str) -> None:
+        with self._metrics_lock:
+            row = self._command_metrics.setdefault(kind, {
+                "count": 0, "total_ms": 0.0, "max_ms": 0.0,
+                "failures": 0, "timeouts": 0, "samples_ms": [],
+            })
+            row["count"] += 1
+            row["total_ms"] += elapsed_ms
+            row["max_ms"] = max(row["max_ms"], elapsed_ms)
+            row["failures"] += int(status != "ok")
+            row["timeouts"] += int(status == "timeout")
+            row["samples_ms"].append(elapsed_ms)
+            if len(row["samples_ms"]) > 256:
+                del row["samples_ms"][:-256]
+            if elapsed_ms >= 500:
+                self._slow_commands.append({
+                    "kind": kind, "elapsed_ms": round(elapsed_ms, 1), "status": status,
+                })
+                if len(self._slow_commands) > 32:
+                    del self._slow_commands[:-32]
+
     def run_adb(self, *args: str, timeout: float = 5.0, check: bool = False) -> CommandResult:
-        """执行 ADB 命令，强制携带 -s <exact_serial>。"""
+        """执行 ADB 命令，强制携带 -s <exact_serial>，并记录分类耗时。"""
         cmd = [str(self.adb_exe), "-s", self.serial, *args]
-        return run_command(cmd, timeout=timeout, check=check)
+        kind = self._command_kind(args)
+        started = time.monotonic()
+        status = "ok"
+        try:
+            result = run_command(cmd, timeout=timeout, check=check)
+            if result.exit_code != 0:
+                status = "error"
+            return result
+        except Exception as exc:
+            status = "timeout" if "timeout" in type(exc).__name__.lower() else "error"
+            raise
+        finally:
+            self._record_command(kind, (time.monotonic()-started)*1000.0, status)
 
     def is_device_ready(self, timeout: float = 3.0) -> bool:
         """检查目标设备状态是否为 'device'。"""

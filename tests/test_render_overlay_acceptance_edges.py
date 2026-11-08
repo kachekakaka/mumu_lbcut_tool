@@ -26,29 +26,31 @@ def test_fan_club_labels_without_overlay_structure_do_not_trigger_back():
 
 
 def test_final_anchor_click_gets_read_only_confirmation(monkeypatch):
-    import src.worker.navigator as nm
     from src.worker.popup_bypasser import PopupBypasser
     nav=WorkerNavigator.__new__(WorkerNavigator)
     nav._operation_deadline=None;nav.adb_client=object()
+    nav._navigation_generation=2;nav._profile_entry_clicked_generation=None
     nav.get_current_focus_activity=lambda:'com.ss.android.ugc.aweme.live.LivePlayActivity'
-    nav._capture_frame_array=lambda:np.zeros((1920,1080,3),dtype=np.uint8)
+    live=np.full((1920,1080,3),20,dtype=np.uint8)
+    sheet=live.copy();sheet[int(.27*1920):,:,:]=255
+    sheet[int(.29*1920):int(.38*1920),int(.07*1080):int(.22*1080),:]=[120,130,140]
+    frames=iter([live,sheet]);nav._capture_frame_array=lambda:next(frames)
     nav._navigation_sleep=lambda *args:True
     nav.dismiss_live_overlay=lambda *args:True
-    normal=f'<hierarchy><node package="{PACKAGE}" resource-id="{PACKAGE}:id/user_name" bounds="[150,109][348,161]" /></hierarchy>'
-    card=f'<hierarchy><node package="{PACKAGE}" resource-id="{PACKAGE}:id/spf" content-desc="测试主播的头像" bounds="[42,641][264,863]" /></hierarchy>'
-    sequence=iter([normal,normal,normal,card])
-    monkeypatch.setattr(PopupBypasser,'get_ui_dump',lambda self:next(sequence))
+    normal=f'<hierarchy><node package="{PACKAGE}" resource-id="{PACKAGE}:id/apz" clickable="true" bounds="[36,98][495,206]"><node package="{PACKAGE}" resource-id="{PACKAGE}:id/avatar_container" bounds="[36,98][144,206]" /><node package="{PACKAGE}" resource-id="{PACKAGE}:id/user_name" bounds="[150,109][348,161]" /></node></hierarchy>'
+    monkeypatch.setattr(PopupBypasser,'get_ui_dump',lambda self:normal)
     before='topResumedActivity=ActivityRecord{live u0 com.ss.android.ugc.aweme/.live.LivePlayActivity t42}\n* Hist #0: ActivityRecord{live u0 com.ss.android.ugc.aweme/.live.LivePlayActivity t42}\n'
     after='* Hist #1: ActivityRecord{profile u0 com.ss.android.ugc.aweme/.profile.ui.UserProfileActivity t42}\n Intent { dat=aweme://user/profile?uid=100&room_id=200&anchor_id=100&previous_page=live }\n'+before
     dumps=iter([before,after]);taps=[]
     def adb(*args,**kwargs):
-        if args[:3]==('shell','dumpsys','activity'):return next(dumps)
+        if args[:4]==('shell','dumpsys','activity','top'):return ''
+        if args[:4]==('shell','dumpsys','activity','activities'):return next(dumps)
         if args[:3]==('shell','input','tap'):taps.append(args[3:])
         return ''
     nav._adb=adb
     result=nav.observe_live_room(time.monotonic()+30,lambda:False)
     assert result.anchor_uid=='100' and result.room_id=='200'
-    assert len(taps)==4  # 三次主播入口点击 + 一次真实资料头像点击。
+    assert len(taps)==2  # one header tap + screenshot-confirmed profile avatar tap
 
 
 def test_real_gallery_without_accessible_text_is_detected_as_native_sheet():
@@ -114,3 +116,23 @@ def test_picture_confirmation_can_avoid_duplicate_ui_dump():
     a=np.zeros((100,100,3),dtype=np.uint8);b=a.copy();b[20:40,20:40]=200
     frames=iter([a,b]);nav._capture_frame_array=lambda:next(frames)
     assert nav.wait_live_picture(time.monotonic()+2,lambda:False,check_overlay=False)
+
+
+
+def test_final_picture_reuses_fresh_overlay_observation(monkeypatch):
+    nav=WorkerNavigator.__new__(WorkerNavigator)
+    nav._operation_deadline=None
+    cached={"activity":"LivePlayActivity","overlay":None,"ui_available":True,"observed_at":time.time()}
+    nav._last_overlay_observation=cached
+    nav.get_current_focus_activity=lambda:"LivePlayActivity"
+    calls=[]
+    def dismiss(deadline,stop,**kwargs):
+        calls.append(kwargs.get("initial_observation"))
+        return kwargs.get("initial_observation") is cached
+    nav.dismiss_live_overlay=dismiss
+    nav._navigation_sleep=lambda *args:True
+    a=np.zeros((100,100,3),dtype=np.uint8);b=a.copy();b[20:40,20:40]=200
+    frames=iter([a,b]);nav._capture_frame_array=lambda:next(frames)
+    assert nav.wait_live_picture(time.monotonic()+20,lambda:False)
+    assert calls==[cached]
+    assert nav._last_overlay_observation is None

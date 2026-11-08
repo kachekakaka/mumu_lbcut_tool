@@ -40,3 +40,18 @@ def test_adb_commands_always_include_serial():
         assert "-s" in call_args
         s_index = call_args.index("-s")
         assert call_args[s_index + 1] == "127.0.0.1:16384"
+
+
+
+def test_adb_client_reports_command_timing_by_category_and_can_reset():
+    client = AdbDeviceClient(serial="127.0.0.1:16448")
+    with patch("src.worker.adb_client.run_command") as mock_run:
+        mock_run.return_value = MagicMock(exit_code=0, stdout="ok", stderr="")
+        client.run_adb("shell", "dumpsys", "activity", "activities")
+        client.run_adb("shell", "input", "tap", "10", "20")
+    snapshot = client.metrics_snapshot()
+    assert snapshot["commands"]["activity_probe"]["count"] == 1
+    assert snapshot["commands"]["tap"]["count"] == 1
+    assert snapshot["commands"]["activity_probe"]["total_ms"] >= 0
+    client.reset_metrics()
+    assert client.metrics_snapshot() == {"commands": {}, "slow_commands": []}

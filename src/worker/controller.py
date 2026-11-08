@@ -2,6 +2,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 import logging
+import json
 import os
 import signal
 import sys
@@ -791,6 +792,8 @@ class WorkerController:
     def _locate_target_room(self):
         navigation_started = time.monotonic()
         current_phase = ''
+        if self._navigator and callable(getattr(type(self._navigator), "reset_metrics", None)):
+            self._navigator.reset_metrics()
         def report(**step):
             nonlocal current_phase
             current_phase = step.get('phase', current_phase)
@@ -810,6 +813,9 @@ class WorkerController:
             anchor_uid=self.target_uid, timeout_sec=self.config.navigation_timeout_sec, max_attempts=3,
             stop_requested=lambda: not self._pipeline_wait_tick(), on_step=report,
             allow_unconfirmed=self.config.allow_unconfirmed_identity)
+        if self._navigator and callable(getattr(type(self._navigator), "metrics_snapshot", None)):
+            logger.info("NAVIGATION_PERF %s", json.dumps(
+                self._navigator.metrics_snapshot(), ensure_ascii=False, sort_keys=True))
         self.identity_status = result.status
         self.emitter.set_context(room_identity_status=result.status.value.lower())
         if result.success:

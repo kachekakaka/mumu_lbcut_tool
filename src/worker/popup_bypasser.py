@@ -37,23 +37,50 @@ class PopupBypasser:
         return min(maximum, remaining)
 
     def get_ui_dump(self) -> str:
-        """唯一临时路径保证新鲜度；兼容 MuMu 写出 XML 后 dumper 返回 139。"""
+        """直接执行 UIAutomator，再独立读取其输出文件。
+
+        MuMu Android 15 上 UIAutomator 可能在 XML 已落盘后以 139 退出；
+        不能把进程退出码直接当成 dump 失败。也不能把 uiautomator 放进
+        adb shell sh -c：该启动方式在部分 MuMu 镜像中无法正确初始化。
+        """
         remote = '/sdcard/wp_ui_' + uuid.uuid4().hex + '.xml'
         try:
-            self.adb.run_adb('shell', 'uiautomator', 'dump', remote, timeout=self._budget(self.dump_timeout_sec))
-            result = self.adb.run_adb('shell', 'cat', remote, timeout=self._budget(2.0))
+            # UUID 路径确保不会误读历史文件；直接调用 wrapper 保留 Android 环境。
+            result = self.adb.run_adb(
+                'shell', 'uiautomator', 'dump', remote,
+                timeout=self._budget(self.dump_timeout_sec + 2.0),
+                check=False,
+            )
             if result.exit_code != 0:
+                logger.debug(
+                    'UIAutomator returned %s; checking whether a complete XML was written',
+                    result.exit_code,
+                )
+
+            read_result = self.adb.run_adb(
+                'shell', 'cat', remote,
+                timeout=self._budget(3.0),
+                check=False,
+            )
+            if read_result.exit_code != 0:
                 return ''
-            root = ET.fromstring(result.stdout)
-            if root.tag != 'hierarchy' or not list(root.iter('node')):
+            output = read_result.stdout or ''
+            begin = output.find('<hierarchy')
+            end = output.rfind('</hierarchy>')
+            if begin < 0 or end < begin:
                 return ''
-            return result.stdout
+            xml = output[begin:end + len('</hierarchy>')]
+            root = ET.fromstring(xml)
+            if root.tag != 'hierarchy' or not any(node.tag == 'node' for node in root.iter()):
+                return ''
+            return xml
         except Exception as exc:
             logger.debug('本次页面结构不可读取: %s', exc)
             return ''
         finally:
+            # 每次使用唯一文件名，清理失败也不会污染下一轮读取。
             try:
-                self.adb.run_adb('shell', 'rm', '-f', remote, timeout=1.0)
+                self.adb.run_adb('shell', 'rm', '-f', remote, timeout=1.5)
             except Exception:
                 pass
 
