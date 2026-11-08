@@ -28,6 +28,7 @@ class StallWatchdog:
                  check_interval_sec: float = 2.0, stall_threshold_sec: float = 10.0,
                  segment_recycle_threshold_sec: float = 20.0, fatal_threshold_sec: float = 45.0,
                  visual_probe_interval_sec: float = 5.0,
+                 probe_failure_fatal_sec: float = 60.0,
                  generation_provider: Callable[[], int] | None = None,
                  on_post_action: Callable[[PipelineAction], None] | None = None,
                  on_stall_action=None, on_request_new_segment=None, on_fatal_stall=None):
@@ -37,6 +38,7 @@ class StallWatchdog:
         self.segment_recycle_threshold_sec = max(segment_recycle_threshold_sec, stall_threshold_sec * 2)
         self.fatal_threshold_sec = max(fatal_threshold_sec, self.segment_recycle_threshold_sec + 5)
         self.visual_probe_interval_sec = visual_probe_interval_sec
+        self.probe_failure_fatal_sec = max(60.0, float(probe_failure_fatal_sec))
         self.generation_provider = generation_provider or (lambda: 0)
         self.on_post_action = on_post_action
         self.on_stall_action = on_stall_action
@@ -165,7 +167,7 @@ class StallWatchdog:
         if self._visual_stall_count >= 2:
             self._post(ActionType.FATAL_STOP, gen, "login_blocked")
             return
-        if failed >= max(15.0, self.stall_threshold_sec * 2):
+        if failed >= self.probe_failure_fatal_sec:
             self._post(ActionType.FATAL_STOP, gen, "visual_probe_unavailable")
             return
         duration = max(stalled, frozen if self._low_motion_count >= 2 else 0.0)

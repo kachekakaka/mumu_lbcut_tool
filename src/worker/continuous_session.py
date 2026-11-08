@@ -232,7 +232,9 @@ class ContinuousSession:
                     self.last_clear_wall=observation.get('observed_at',time.time())
             self.probe_failures=0 if activity else self.probe_failures+1
             if self.probe_failures>=3:self.recover('surface_probe_unavailable',True)
-        if not c.stop_requested and self.surface_future is None and now-self.last_surface>=8:
+        # UIAutomator can be slow or exit after writing XML on animated live pages.
+        # Reduce overlap with the Watchdog screencap on the shared ADB/render path.
+        if not c.stop_requested and self.surface_future is None and now-self.last_surface>=30:
             self.last_surface=now;self.surface_gen=c.current_generation_id
             self.surface_future=self.probes.submit(c._navigator.inspect_live_surface)
 

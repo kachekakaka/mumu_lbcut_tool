@@ -76,4 +76,8 @@ def test_probe_unavailable_is_not_reported_healthy():
         pipe.get_current_file_size_mb.return_value = tick + 1
         dog.check_once(float(tick))
     assert dog.snapshot().video_motion is None
+    assert not any(a.reason == 'visual_probe_unavailable' for a in actions)
+    for tick in range(17, 61):
+        pipe.get_current_file_size_mb.return_value = tick + 1
+        dog.check_once(float(tick))
     assert any(a.reason == 'visual_probe_unavailable' for a in actions)

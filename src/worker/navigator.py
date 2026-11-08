@@ -236,7 +236,9 @@ class WorkerNavigator:
             import numpy as np
             from PIL import Image
             cmd = [str(self.adb_exe), "-s", self.serial, "exec-out", "screencap", "-p"]
-            budget = 5.0
+            # Allow for slower emulator frame readback under host GPU throttling.
+            # A short visual-probe delay must not become a capture failure.
+            budget = 8.0
             if self._operation_deadline is not None:
                 budget = min(budget, self._operation_deadline - time.monotonic())
                 if budget < 1.0:
