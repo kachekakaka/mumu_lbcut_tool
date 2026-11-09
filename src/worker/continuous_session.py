@@ -29,6 +29,15 @@ class CaptureSessionEvent(BaseWorkerEvent):
 
 
 @dataclass
+class StreamMonitorEvent(BaseWorkerEvent):
+    event: str='stream_monitor'
+    action: str=''
+    reason: str=''
+    analyzer_pid: int=0
+    generation_id: int=0
+
+
+@dataclass
 class OverlayRecoveryEvent(BaseWorkerEvent):
     event: str='overlay_recovery'
     action: str=''
@@ -62,12 +71,18 @@ class ContinuousSession:
         self.last_error=''
         self.closed=False
         self.epoch_ended=False
+        self.quality_marks={}
+        self.low_frame_rate=False
+        self.frame_rate_ok_since=None
 
     def start_epoch(self):
         c=self.c
         if c.stop_requested:raise InterruptedError('停止后禁止启动采集')
         self.epoch+=1
         self.epoch_ended=False
+        self.quality_marks={}
+        self.low_frame_rate=False
+        self.frame_rate_ok_since=None
         c.current_generation_id+=1
         c.action_dispatcher.current_generation_id=c.current_generation_id
         start_index=max(self.ledger,default=0)+1
@@ -177,6 +192,44 @@ class ContinuousSession:
         c.emitter.emit(StallHealedEvent(action='relocate_target' if relocate else 'restart_capture'))
         return True
 
+    def check_stream_quality(self):
+        """录像流分析的事件与切片质量标记；同一次持续异常对每个切片只标一次。"""
+        monitor=getattr(self.pipe,'monitor',None)
+        if monitor is None:return
+        c=self.c
+        for item in monitor.drain_events():
+            c.emitter.emit(StreamMonitorEvent(generation_id=c.current_generation_id,**item))
+        fps=monitor.fps(60)
+        if fps is not None:
+            now=monitor.clock()
+            if fps<12:
+                self.low_frame_rate=True
+                self.frame_rate_ok_since=None
+            elif self.low_frame_rate:
+                # 帧率常在 12 上下波动；恢复须持续满一个统计窗口，否则每次越线都会重新标记。
+                if self.frame_rate_ok_since is None:self.frame_rate_ok_since=now
+                elif now-self.frame_rate_ok_since>=60:
+                    self.low_frame_rate=False
+                    self.frame_rate_ok_since=None
+        current=[idx for idx,row in self.ledger.items() if row['epoch']==self.epoch]
+        if not current:return
+        latest=max(current)
+        for flag,active,lookback in (('visual_check_unavailable',monitor.unavailable,0),
+                                     ('low_frame_rate',self.low_frame_rate,60)):
+            if not active:
+                self.quality_marks.pop(flag,None)
+                continue
+            episode=self.quality_marks.setdefault(flag,{'since':time.time()-lookback,'marked':set()})
+            if latest not in episode['marked']:
+                episode['marked'].add(latest)
+                c.emitter.emit(SegmentQualityWarningEvent(segment_index=latest,flag=flag,
+                    suspected_start_time=episode['since']))
+
+    def heartbeat_fps(self):
+        monitor=getattr(self.pipe,'monitor',None)
+        fps=monitor.fps(10) if monitor else None
+        return round(fps,1) if fps is not None else None
+
     def poll_surface(self):
         c=self.c
         now=self.clock()
@@ -206,9 +259,9 @@ class ContinuousSession:
                     # 遮挡关闭不停止采集；持续保留原始媒体，风险区间通过事件说明。
                     recovery_deadline=time.monotonic()+30
                     ok=c._navigator.dismiss_live_overlay(min(recovery_deadline,time.monotonic()+18),
-                        lambda:c.stop_requested,initial_observation=observation,require_observed_clear=True)
+                        lambda:c.stop_requested,require_observed_clear=True)
                     if ok and not c.stop_requested:
-                        # 上一步已确认面板消失，画面检查不重复再做一次慢UI dump。
+                        # 上一步已确认面板消失，画面检查不再重复遮挡检查。
                         ok=c._navigator.wait_live_picture(recovery_deadline,lambda:c.stop_requested,
                                                          check_overlay=False)
                     self.sync()
@@ -232,9 +285,8 @@ class ContinuousSession:
                     self.last_clear_wall=observation.get('observed_at',time.time())
             self.probe_failures=0 if activity else self.probe_failures+1
             if self.probe_failures>=3:self.recover('surface_probe_unavailable',True)
-        # UIAutomator can be slow or exit after writing XML on animated live pages.
-        # Reduce overlap with the Watchdog screencap on the shared ADB/render path.
-        if not c.stop_requested and self.surface_future is None and now-self.last_surface>=30:
+        # 窗口状态探针约 0.4 秒且不经渲染链路；连续 3 次读不到前台才重新定位，即约 30 秒。
+        if not c.stop_requested and self.surface_future is None and now-self.last_surface>=10:
             self.last_surface=now;self.surface_gen=c.current_generation_id
             self.surface_future=self.probes.submit(c._navigator.inspect_live_surface)
 
@@ -259,6 +311,7 @@ class ContinuousSession:
                     else:self.recover(action.reason,True)
                     break
                 if c.stop_requested:break
+                self.check_stream_quality()
                 self.poll_surface()
                 if c.stop_requested:break
                 now=self.clock()
@@ -266,7 +319,7 @@ class ContinuousSession:
                     snap=c._watchdog.snapshot() if c._watchdog else None
                     c.emitter.emit(HeartbeatEvent(elapsed_sec=int(now-self.started),
                         file_size_mb=round(self.pipe.get_current_file_size_mb(),2),status=c.state_machine.state.value.lower(),
-                        room_identity_status=c.identity_status.value.lower(),fps=None,
+                        room_identity_status=c.identity_status.value.lower(),fps=self.heartbeat_fps(),
                         video_motion=snap.video_motion if snap else None))
                     self.last_heartbeat=now
                 if c.config.total_duration_sec and now-self.started>=c.config.total_duration_sec:break
@@ -297,6 +350,4 @@ class ContinuousSession:
         finally:
             self.probes.shutdown(wait=True,cancel_futures=True)
             self.pool.shutdown(wait=True,cancel_futures=True)
-            # 连续路径已收尾，旧串行清理器不能再对当前片发第二个终态。
-            c.current_segment_started=False;c.current_segment_finalized=True
             self.closed=True

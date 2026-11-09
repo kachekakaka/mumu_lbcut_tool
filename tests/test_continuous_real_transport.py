@@ -1,13 +1,24 @@
 """真实 Windows 命名管道 + ffmpeg 无重编码分段；不是 MuMu 实机测试。"""
-import hashlib,json,os,shutil,subprocess,time
+import hashlib,json,os,shutil,subprocess,sys,time
 from pathlib import Path
 import pytest
+import src.worker.stream_monitor as stream_monitor
 from src.worker.continuous_pipeline import ContinuousPipeline,NamedPipeBridge
 
 
 @pytest.mark.skipif(os.name!='nt',reason='当前产品传输为 Windows 命名管道')
-def test_realtime_segments_preserve_every_encoded_packet(monkeypatch,tmp_path,valid_media):
+@pytest.mark.parametrize('analyzer',['real','stuck'])
+def test_realtime_segments_preserve_every_encoded_packet(monkeypatch,tmp_path,valid_media,analyzer):
     ff=shutil.which('ffmpeg');probe=shutil.which('ffprobe')
+    spawned=[]
+    original_init=stream_monitor.Analyzer.__init__
+    def track(self,*args,**kwargs):
+        original_init(self,*args,**kwargs);spawned.append(self)
+    monkeypatch.setattr(stream_monitor.Analyzer,'__init__',track)
+    if analyzer=='stuck':
+        # 分析一路存活但从不读输入：录像写入不得受反压。
+        monkeypatch.setattr(stream_monitor,'build_command',
+            lambda exe:[sys.executable,'-c','import time;time.sleep(120)'])
     reference=tmp_path/'transport-reference.mkv'
     original=NamedPipeBridge.start
     class Tee:
@@ -18,7 +29,7 @@ def test_realtime_segments_preserve_every_encoded_packet(monkeypatch,tmp_path,va
             return written
         def flush(self):self.sink.flush();self.file.flush()
         def close(self):self.file.close();self.sink.close()
-    monkeypatch.setattr(NamedPipeBridge,'start',lambda self,sink:original(self,Tee(sink)))
+    monkeypatch.setattr(NamedPipeBridge,'start',lambda self,sink,tap=None:original(self,Tee(sink),tap))
     def producer(pipe,directory):
         return subprocess.Popen([ff,'-hide_banner','-loglevel','error','-y','-re','-stream_loop','10',
             '-i',str(valid_media),'-t','11','-map','0','-c','copy','-f','matroska',pipe],
@@ -46,6 +57,9 @@ def test_realtime_segments_preserve_every_encoded_packet(monkeypatch,tmp_path,va
             actual=[h for f in fragments for h in hashes(f.path,stream)]
             assert expected and actual==expected
         for a,b in zip(fragments,fragments[1:]):assert abs(a.end_pts-b.start_pts)<.0001
+        assert p.bridge.bytes_forwarded==reference.stat().st_size
+        assert (p.monitor.frame_seq>0)==(analyzer=='real')
+        assert spawned and all(a.proc.poll() is not None for a in spawned)
     finally:
         p.stop()
 

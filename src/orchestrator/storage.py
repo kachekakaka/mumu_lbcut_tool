@@ -248,7 +248,11 @@ class Store:
                     # Popen 成功不等于开始录制；首片开始后才将任务标为 running。
                     db.execute("UPDATE jobs SET status='running' WHERE id=? AND status='starting'", (job_id,))
                 elif kind == "segment_quality_warning":
-                    db.execute("UPDATE segments SET risk_json=? WHERE job_id=? AND segment_index=?", (payload, job_id, idx))
+                    # 同一切片可先后出现遮挡、低帧率、画面检查不可用，全部保留为列表。
+                    risks = json.loads(old["risk_json"]) if old["risk_json"] else []
+                    risks.append(event)
+                    db.execute("UPDATE segments SET risk_json=? WHERE job_id=? AND segment_index=?",
+                               (json.dumps(risks, sort_keys=True, ensure_ascii=False), job_id, idx))
                 else:
                     status = "finished" if kind == "segment_finished" else "aborted"
                     if old["status"] in ("finished", "aborted"):

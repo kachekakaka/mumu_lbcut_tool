@@ -21,6 +21,7 @@ import time
 import uuid
 
 from src.worker.scrcpy_probe import PipelineLogDrainer
+from src.worker.stream_monitor import StreamMonitor
 
 log = logging.getLogger(__name__)
 
@@ -50,7 +51,8 @@ class NamedPipeBridge:
         if self.handle == W.HANDLE(-1).value:
             raise ctypes.WinError(ctypes.get_last_error())
 
-    def start(self, sink):
+    def start(self, sink, tap=None):
+        """tap 收到同一份字节；它必须非阻塞且不抛异常，不能拖住封装输入。"""
         if self._thread:
             raise RuntimeError('字节桥不允许重复启动')
         def pump():
@@ -63,6 +65,8 @@ class NamedPipeBridge:
                             self.cancel.wait(.01)
                             continue
                         data = memoryview(buf.raw)[:count.value]
+                        if tap:
+                            tap(data)
                         while data:
                             wrote = sink.write(data)
                             if wrote is None or wrote <= 0:
@@ -150,6 +154,7 @@ class ContinuousPipeline:
         self.directory = self.output_dir / ('capture_' + uuid.uuid4().hex)
         self._proc = self._mux = None
         self.bridge = None
+        self.monitor = None
         self.wait_hook = None
         self.started_at = 0.0
         self._stopped = False
@@ -181,7 +186,9 @@ class ContinuousPipeline:
         try:
             self._mux = subprocess.Popen(mux_cmd,stdin=subprocess.PIPE,stdout=subprocess.PIPE,
                 stderr=self._mux_log,bufsize=0,creationflags=flags)
-            self.bridge.start(self._mux.stdin)
+            self.monitor = StreamMonitor(self.ffmpeg_exe, stderr_path=self.directory/'analysis.stderr.log')
+            self.monitor.start()
+            self.bridge.start(self._mux.stdin, tap=self.monitor.feed)
             def progress():
                 try:
                     for raw in iter(self._mux.stdout.readline,b''):
@@ -264,6 +271,7 @@ class ContinuousPipeline:
 
     def stop(self, timeout_sec=15):
         if self._stopped:return self.get_exit_code()==0
+        if self.monitor:self.monitor.stop()
         deadline=time.monotonic()+timeout_sec
         # 先停止唯一采集进程，等 MKV 字节桥自然 EOF，再让封装器写完最后一片。
         if self._proc and self._proc.poll() is None:

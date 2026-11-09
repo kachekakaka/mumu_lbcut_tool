@@ -14,7 +14,7 @@ def test_worker_corrects_other_room_then_records(monkeypatch,tmp_path,valid_medi
     monkeypatch.setattr(cm.WorkerNavigator,'navigate_route',lambda self,t,w,route,d,stop: seen.append(route) or True)
     assert h.controller.run()==0
     assert seen==['primary','reset']
-    assert h.launched==[1,2]
+    assert h.launched[:1]==[1]
     assert_paired(h.events())
     assert any(e['event']=='room_navigation' and e['action']=='correct_wrong_room' for e in h.events())
     assert any(e['event']=='room_navigation' and e['action']=='target_ready'

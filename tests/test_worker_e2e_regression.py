@@ -1,10 +1,7 @@
 from src.worker.state_machine import WorkerState
 """Worker 主控制流程与 14 项核心规格全量回归测试套件。
 
-覆盖用户明确要求的 14 大核心场景：
-1. 同一计划切片周期内连续两次进程崩溃：启动序号 1、2、3，每个开始事件恰好一个终态；
-2. 看门狗重启：旧片有准确终态，新片正确开始，大小基线重置，不被旧动作再次重启；
-3. 周期轮转及最终停止时校验失败：不发送成功完成事件，不无条件返回成功；
+覆盖核心场景（采集会话恢复与校验失败见 test_worker_controller.py）：
 4. ffprobe 不可用：超过原大小门槛的非视频文件不能被判为有效双轨录像；
 5. 正常短尾片：小体积但有效双轨的正常尾片不会误判为损坏；
 6. 归档冲突或移动失败：已有目标文件字节内容不变，不丢失原始文件；
@@ -14,7 +11,6 @@ from src.worker.state_machine import WorkerState
 10. 运行期下播与查询失败：已确认下播正常退出 (码 2)，网络失败和 UNKNOWN 不误退出；
 11. 同一 VM、不同房间、不同输出目录：第二个 Worker 无法获取控制权，不同 VM 可并行；
 12. 同一输出根目录并发运行：run_id 任务目录排他隔离，无覆盖；
-13. 慢探针、启动或恢复过程中收到停止请求：响应受控，进入 STOPPING 后不再启动新切片；
 14. 高频 stdout/stderr 输出：防背压日志持续消费与资源回收。
 """
 import io
@@ -47,7 +43,7 @@ from src.worker.events import (
 from src.worker.health_monitor import HealthMonitor
 from src.worker.identity_verifier import IdentityStatus, verify_room_identity
 from src.worker.naming_lock import WorkerInstanceLock, LockAcquisitionError
-from src.worker.pipeline import PipelineLogDrainer, WorkerPipeline
+from src.worker.scrcpy_probe import PipelineLogDrainer
 from src.worker.segment_verifier import (
     verify_segment_file,
     finalize_segment,
@@ -69,124 +65,6 @@ class TestWorkerE2ERegression(unittest.TestCase):
         self.events = []
         self.emitter = WorkerEventEmitter()
         self.emitter.emit = lambda ev: self.events.append(ev)
-
-    def test_01_double_crash_sequence_and_single_terminal(self):
-        """场景 1: 同一切片周期内连续两次崩溃，启动序号单调递增为 1、2、3，每个开始事件恰好一个终态。"""
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            cfg = WorkerConfig(
-                vmindex=2,
-                target="test_target",
-                output_dir=Path(tmp_dir),
-                segment_duration_sec=30,
-            )
-            ctrl = WorkerController(config=cfg, emitter=self.emitter)
-
-            mock_pipe = MagicMock()
-            mock_pipe.is_recording.return_value = False
-            mock_pipe.get_exit_code.return_value = 2
-            mock_pipe.start_segment.side_effect = lambda idx: Path(tmp_dir) / f"seg_{idx}.mp4"
-            mock_pipe.current_file_path = Path(tmp_dir) / "seg_1.mp4"
-            ctrl._pipeline = mock_pipe
-
-            # 初始启动切片 1
-            ctrl._start_new_segment()
-            self.assertEqual(ctrl.current_segment_index, 1)
-
-            # 第一次崩溃自愈
-            r1 = ctrl._handle_pipeline_crash(exit_code=2)
-            self.assertTrue(r1)
-            self.assertEqual(ctrl.current_segment_index, 2)
-
-            # 第二次崩溃自愈
-            r2 = ctrl._handle_pipeline_crash(exit_code=2)
-            self.assertTrue(r2)
-            self.assertEqual(ctrl.current_segment_index, 3)
-
-            started = [e for e in self.events if isinstance(e, SegmentStartedEvent)]
-            aborted = [e for e in self.events if isinstance(e, SegmentAbortedEvent)]
-            finished = [e for e in self.events if isinstance(e, SegmentFinishedEvent)]
-
-            started_indices = [e.segment_index for e in started]
-            # 严格断言：切片启动序号必须依次为 [1, 2, 3]
-            self.assertEqual(started_indices, [1, 2, 3])
-
-            # 切片 1 和切片 2 必须分别有且仅有一个 aborted 终态
-            aborted_indices = [e.segment_index for e in aborted]
-            self.assertIn(1, aborted_indices)
-            self.assertIn(2, aborted_indices)
-            self.assertEqual(aborted_indices.count(1), 1)
-            self.assertEqual(aborted_indices.count(2), 1)
-
-    def test_02_watchdog_restart_terminal_and_dedup(self):
-        """场景 2: 看门狗重启：旧片有准确终态，新片正确开始，旧代际动作丢弃不重复重启。"""
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            cfg = WorkerConfig(
-                vmindex=2,
-                target="test_target",
-                output_dir=Path(tmp_dir),
-                segment_duration_sec=30,
-            )
-            ctrl = WorkerController(config=cfg, emitter=self.emitter)
-            mock_pipe = MagicMock()
-            mock_pipe.start_segment.side_effect = lambda idx: Path(tmp_dir) / f"seg_{idx}.mp4"
-            ctrl._pipeline = mock_pipe
-
-            # 启动切片 1 (代际 1)
-            ctrl._start_new_segment()
-            self.assertEqual(ctrl.current_generation_id, 1)
-
-            # 看门狗触发重启
-            ctrl.state_machine.transition_to(WorkerState.RECORDING)
-            ctrl._recycle_current_segment(reason="watchdog_stall")
-            self.assertEqual(ctrl.current_segment_index, 2)
-            self.assertEqual(ctrl.current_generation_id, 2)
-
-            # 验证旧切片 1 已有且仅有一个 aborted 终态事件
-            aborted_1 = [e for e in self.events if isinstance(e, SegmentAbortedEvent) and e.segment_index == 1]
-            self.assertEqual(len(aborted_1), 1)
-            self.assertEqual(aborted_1[0].reason, "watchdog_stall")
-
-            # 模拟看门狗队列中残留了一个携带旧代际 1 的过期动作
-            ctrl.action_dispatcher.post_action(PipelineAction(
-                action_type=ActionType.RESTART_SEGMENT,
-                generation_id=1,  # 旧代际
-                reason="expired_stall",
-            ))
-            # 排空动作时，旧动作必须被安全丢弃，不返回有效动作
-            valid_actions = ctrl.action_dispatcher.drain_actions()
-            self.assertEqual(len(valid_actions), 0, "旧代际动作必须被丢弃！")
-
-    def test_03_verification_failure_rejects_success_event(self):
-        """场景 3: 周期轮转及最终停止时校验失败：不发送 finished 事件，最终返回错误码。"""
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            raw_bad = Path(tmp_dir) / "corrupt_raw.mp4"
-            raw_bad.write_bytes(b"garbage_not_mp4")
-
-            cfg = WorkerConfig(
-                vmindex=2,
-                target="test_target",
-                output_dir=Path(tmp_dir),
-                segment_duration_sec=30,
-            )
-            ctrl = WorkerController(config=cfg, emitter=self.emitter)
-            ctrl._pipeline = MagicMock()
-            ctrl._pipeline.current_file_path = raw_bad
-            ctrl.current_segment_index = 1
-            ctrl.current_file_path = raw_bad
-            ctrl.current_segment_started = True
-            ctrl.current_segment_finalized = False
-
-            # mock 校验器返回失败
-            with patch("src.worker.controller.finalize_segment") as mock_fin:
-                mock_fin.return_value = (False, raw_bad.with_name("corrupt_raw.corrupted"), MagicMock(reject_reason="bad_header"))
-                ok = ctrl._finalize_current_segment(allow_short_tail=False)
-
-            self.assertFalse(ok)
-            finished = [e for e in self.events if isinstance(e, SegmentFinishedEvent)]
-            aborted = [e for e in self.events if isinstance(e, SegmentAbortedEvent)]
-            self.assertEqual(len(finished), 0, "校验失败严禁发射 SegmentFinishedEvent！")
-            self.assertEqual(len(aborted), 1, "校验失败必须发射 SegmentAbortedEvent！")
-            self.assertTrue(ctrl._last_segment_failed)
 
     def test_04_missing_ffprobe_rejects_non_video_file(self):
         """场景 4: ffprobe 不可用时，普通大文件不能被判定为有效双轨录像。"""
@@ -248,7 +126,7 @@ class TestWorkerE2ERegression(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir, \
              patch("src.worker.controller.MuMuClient") as mock_mumu, \
              patch("src.worker.controller.WorkerNavigator") as mock_nav_cls, \
-             patch("src.worker.controller.WorkerPipeline") as mock_pipeline:
+             patch("src.worker.continuous_session.ContinuousSession") as mock_session:
             mock_mumu.return_value.launch_player.return_value = True
             mock_mumu.return_value.connect_adb.return_value = "synthetic-device"
             nav = mock_nav_cls.return_value
@@ -260,7 +138,7 @@ class TestWorkerE2ERegression(unittest.TestCase):
             ctrl = WorkerController(cfg, WorkerEventEmitter(stream))
             self.assertEqual(ctrl.run(), EXIT_ROOM_MISMATCH)
             self.assertEqual(nav.observe_live_room.call_count, 3)
-            self.assertFalse(mock_pipeline.called)
+            self.assertFalse(mock_session.called)
             events = [json.loads(line) for line in stream.getvalue().splitlines()]
             self.assertEqual(sum(e.get('action')=='correct_wrong_room' for e in events),3)
             self.assertFalse(any(e['event']=='segment_started' for e in events))
@@ -382,34 +260,6 @@ class TestWorkerE2ERegression(unittest.TestCase):
             self.assertTrue(ctrl1.task_output_dir.exists())
             self.assertTrue(ctrl2.task_output_dir.exists())
             self.assertNotEqual(str(ctrl1.task_output_dir), str(ctrl2.task_output_dir))
-
-    def test_13_stop_request_during_recovery_prevents_new_segment(self):
-        """场景 13: 收到停止请求后，进入 STOPPING，不再启动新切片，收尾不重复。"""
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            cfg = WorkerConfig(
-                vmindex=2,
-                target="test_target",
-                output_dir=Path(tmp_dir),
-                segment_duration_sec=30,
-            )
-            ctrl = WorkerController(config=cfg, emitter=self.emitter)
-            mock_pipe = MagicMock()
-            mock_pipe.is_recording.return_value = False
-            mock_pipe.start_segment.return_value = Path(tmp_dir) / "new.mp4"
-            ctrl._pipeline = mock_pipe
-
-            ctrl._start_new_segment()
-            # 外部发送停止信号
-            ctrl.request_stop()
-            ctrl.state_machine.transition_to(WorkerState.STOPPING)
-
-            # 此时尝试恢复或重拉切片，必须被受控阻断，不再启动新切片
-            start_count_before = mock_pipe.start_segment.call_count
-            ctrl._handle_pipeline_crash(exit_code=1)
-            self.assertEqual(
-                mock_pipe.start_segment.call_count, start_count_before,
-                "进入 STOPPING 状态后坚决禁止启动新切片！"
-            )
 
     def test_14_high_frequency_log_drainer_no_backpressure(self):
         """场景 14: 高频 stdout/stderr 输出：防背压日志排空器平稳消费并妥善回收。"""

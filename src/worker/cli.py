@@ -50,12 +50,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="逃逸开关：当主播身份处于无法确认状态时允许临时录制（确诊错房仍强制阻断）"
     )
     parser.add_argument(
-        "--overlap-duration",
-        type=float,
-        default=0.0,
-        help="双管线安全交叠窗口时长(秒)，默认 0（串行）；大于 0 显式开启交叠 (ADR 0009)"
-    )
-    parser.add_argument(
         "--background",
         action="store_true",
         default=False,
@@ -79,8 +73,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="窗口 Y 坐标（用于 offscreen 边缘模式或自定义摆放位置）"
     )
-    parser.add_argument("--recording-mode", choices=["continuous", "restart"], default="continuous",
-                        help="默认持续采集无重编码分段；restart 仅用于对照诊断")
     parser.add_argument("--target-kind", choices=["auto", "room_id", "web_rid"], default="auto")
     parser.add_argument("--web-rid", default=None, help="内部场次 ID 的网页入口备用值")
     parser.add_argument("--expected-anchor-uid", default=None, help="独立解析的主播 UID，不是 room_id")
@@ -122,17 +114,6 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.heartbeat_interval <= 0:
         errors.append(f"--heartbeat-interval 必须为正数，当前为 {args.heartbeat_interval}")
 
-    if args.recording_mode == 'continuous' and args.overlap_duration > 0:
-        errors.append('continuous 不使用交叠；必须显式选择 restart 才能诊断旧双管线')
-
-    if args.overlap_duration < 0:
-        errors.append(f"--overlap-duration 不能为负数，当前为 {args.overlap_duration}")
-
-    if args.overlap_duration >= args.segment_duration:
-        errors.append(
-            f"交叠时长 --overlap-duration ({args.overlap_duration}s) 必须小于切片时长 --segment-duration ({args.segment_duration}s)"
-        )
-
     if errors:
         for err in errors:
             sys.stderr.write(f"[参数错误] {err}\n")
@@ -150,7 +131,6 @@ def main(argv: list[str] | None = None) -> int:
 
     config = WorkerConfig(
         vmindex=args.vmindex,
-        recording_mode=args.recording_mode,
         target=args.target,
         navigation_timeout_sec=args.navigation_timeout,
         target_kind=args.target_kind,
@@ -163,7 +143,6 @@ def main(argv: list[str] | None = None) -> int:
         stall_timeout_sec=args.stall_timeout,
         heartbeat_interval_sec=args.heartbeat_interval,
         allow_unconfirmed_identity=args.allow_unconfirmed_identity,
-        overlap_duration_sec=args.overlap_duration,
         background_mode=(eff_window_mode == "hidden"),
         window_mode=eff_window_mode,
         window_pos_x=args.window_pos_x,

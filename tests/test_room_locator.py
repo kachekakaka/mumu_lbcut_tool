@@ -206,3 +206,11 @@ def test_actual_header_entry_excludes_chat_user_and_follow_control():
       <node package="com.ss.android.ugc.aweme" resource-id="com.ss.android.ugc.aweme:id/follow" bounds="[360,110][483,194]" />
     </hierarchy>""")
     assert WorkerNavigator._anchor_entry_point(tree,1080,1920)==(90,152)
+
+def test_first_navigate_event_has_no_failure_reason_and_retry_carries_previous_one():
+    nav=NavigationFixture([RoomEvidence('900','123')],pages=[False,True])
+    steps=[]
+    locate_target(nav,'900',target_kind='room_id',web_rid='88',on_step=lambda **kw: steps.append(kw))
+    navigates=[s['reason'] for s in steps if s['action']=='navigate']
+    assert navigates[0]==''
+    assert navigates[1]=='navigation_failed'  # 来自 wait_live_page 失败时的 last_gate_reason

@@ -1,4 +1,5 @@
 """真实 SQLite + Scanner + InstancePool + Scheduler 集成；仅替换网络和 Worker 进程边界。"""
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import time
@@ -255,3 +256,17 @@ def test_storage_failure_still_stops_owned_children(system, monkeypatch):
         e.scheduler.close()
     assert not e.children[0].alive
     assert e.store.rows('SELECT * FROM jobs')[0]['status'] != 'finished'
+
+
+def test_quality_warnings_for_one_segment_are_all_kept(tmp_path):
+    store = Store(tmp_path / 'quality.db')
+    target = store.add_target('A', now=1.0)
+    with store.transaction() as db:
+        db.execute("INSERT INTO jobs(id,target_id,session_key,status,created_at) VALUES('job',?,'s','running',1)", (target,))
+    for n, flag in enumerate(('overlay_live_panel_window', 'low_frame_rate', 'visual_check_unavailable')):
+        store.record_event('job', {'event': 'segment_quality_warning', 'event_id': f'e{n}',
+                                   'segment_index': 3, 'flag': flag}, 2.0)
+    store.record_event('job', {'event': 'segment_quality_warning', 'event_id': 'e1',
+                               'segment_index': 3, 'flag': 'low_frame_rate'}, 2.0)
+    risks = json.loads(store.row("SELECT risk_json FROM segments WHERE job_id='job' AND segment_index=3")['risk_json'])
+    assert [r['flag'] for r in risks] == ['overlay_live_panel_window', 'low_frame_rate', 'visual_check_unavailable']

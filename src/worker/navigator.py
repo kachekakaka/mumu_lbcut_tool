@@ -31,7 +31,6 @@ class WorkerNavigator:
         self.last_gate_reason = "render_timeout"
         self._operation_deadline = None
         self._last_adb_failed = False
-        self._last_overlay_observation = None
         self._navigation_generation = 0
         self._profile_entry_clicked_generation = None
         self._probe_metrics = {}
@@ -129,51 +128,9 @@ class WorkerNavigator:
                         "-p", DOUYIN_PACKAGE)
         return bool(out) and "Error" not in out and not self._last_adb_failed
 
-    def launch_room(self, room_id: str, web_rid: str | None = None,
-                    wait_sec: int = 3, warmup_first: bool = False) -> bool:
-        """离线目标路由；只有 App 未在前台时预热，不查询公网状态。"""
-        if warmup_first and self.get_current_focus_package() != DOUYIN_PACKAGE:
-            self._adb("shell", "am", "start", "-n", f"{DOUYIN_PACKAGE}/.main.MainActivity")
-            time.sleep(3.5)
-        if not self._send_room_intent(room_id, web_rid):
-            return False
-        if wait_sec > 0:
-            time.sleep(wait_sec)
-        self.dismiss_login_prompt()
-        return self.get_current_focus_package() == DOUYIN_PACKAGE
-
     def refresh_current_room(self, room_id: str) -> bool:
         """复用首次唤起路由，短号不得被当作内部场次 ID。"""
         return self._send_room_intent(room_id)
-
-    def dismiss_system_dialogs(self):
-        """自动放行 Android 系统投屏/录音授权弹窗及抖音登录阻断遮罩。"""
-        try:
-            # 1. 尝试放行系统授权弹窗
-            self._adb("shell", "input", "keyevent", "66")  # KEYCODE_ENTER
-            # 2. 检测并关闭可能遮挡直播间的登录引导弹窗
-            self.dismiss_login_prompt()
-        except Exception as e:
-            logger.warning(f"放行弹窗异常: {e}")
-
-    def dismiss_login_prompt(self):
-        """若前台弹出抖音免登录阻断遮罩（DYLoginActivity），自动点击跳过/关闭放行。"""
-        out = self._adb("shell", "dumpsys", "window", "windows")
-        if "DYLoginActivity" in out or "login" in out.lower():
-            logger.info("检测到抖音登录遮罩弹窗，正在自动点击跳过/关闭放行...")
-            # 1. 尝试点击全屏登录页左上角的“跳过”按钮（bounds=[18,72][150,204] 中心点 84, 138）
-            self._adb("shell", "input", "tap", "84", "138")
-            time.sleep(0.3)
-            # 2. 尝试点击半屏弹窗右上角关闭按钮（bounds=[960,656][1032,728] 中心点 996, 692）
-            self._adb("shell", "input", "tap", "996", "692")
-            time.sleep(0.5)
-
-    def dismiss_center_dialog(self):
-        """尝试点击居中卡片弹窗（如“发现抖音朋友”）左侧的【拒绝】按钮，严禁点击右侧【继续】。"""
-        logger.info("检测到居中卡片弹窗，正在点击左侧【拒绝】按钮放行...")
-        # 居中弹窗拒绝按钮 bounds=[120,1321][539,1464]，中心点约 330, 1392
-        self._adb("shell", "input", "tap", "330", "1392")
-        time.sleep(0.4)
 
     def capture_screenshot(self, save_path: Path) -> bool:
         """截屏用于心跳差分或证据归档。"""
@@ -254,99 +211,6 @@ class WorkerNavigator:
             self._record_probe_timing("screenshot", (time.monotonic()-started)*1000.0, status)
         return None
 
-    def verify_preflight_content_gate(self, timeout_sec: float = 8.0) -> bool:
-        self._operation_deadline = time.monotonic() + timeout_sec
-        try:
-            return self._verify_preflight_content_gate(timeout_sec)
-        finally:
-            self._operation_deadline = None
-
-    def _verify_preflight_content_gate(self, timeout_sec: float) -> bool:
-        """开录前置双重门禁：验证前台已脱离登录页且直播流真正开始动态渲染。"""
-        import numpy as np
-        from src.worker.popup_bypasser import PopupBypasser
-        bypasser = PopupBypasser(adb_client=self.adb_client)
-        bypasser.deadline = self._operation_deadline
-        start_t = time.monotonic()
-        self.last_gate_reason = "render_timeout"
-        logger.info(f"正在执行开录前置内容门禁核验 (阈值 {timeout_sec}s)...")
-
-        while time.monotonic() - start_t < timeout_sec:
-            # 优先穿透白名单弹窗 (如未成年人模式/青少年模式/隐私协议)
-            if bypasser.detect_and_dismiss_popups():
-                time.sleep(0.5)
-                continue
-
-            act = self.get_current_focus_activity() or ""
-            if "DYLoginActivity" in act or "login" in act.lower():
-                self.last_gate_reason = "login_blocked"
-                self.dismiss_login_prompt()
-                time.sleep(0.3)
-                continue
-
-            # 硬卡口：若前台处于短视频推荐流 MainActivity，坚决拦截，拒绝截帧浪费
-            if "MainActivity" in act:
-                self.last_gate_reason = "navigation_failed"
-                logger.warning(f"门禁拦截：前台当前处于首页短视频推荐流 ({act})，坚决拦截出流！")
-                time.sleep(0.3)
-                continue
-
-            if not act:
-                self.last_gate_reason = "device_unavailable"
-            elif "login" not in act.lower():
-                self.last_gate_reason = "render_timeout"
-            frame1 = self._capture_frame_array()
-            if frame1 is None:
-                time.sleep(0.3)
-                continue
-
-            # 1. 白底占比检测
-            # a) 全屏白底检测 (全屏登录页 RGB > 235 占比 > 60%)
-            white_ratio = float(np.mean((frame1[:, :, 0] > 235) & (frame1[:, :, 1] > 235) & (frame1[:, :, 2] > 235)))
-            if white_ratio > 0.60:
-                logger.warning(f"门禁检测到全屏高白底异常 (白底占比 {white_ratio:.1%})，尝试穿透遮罩...")
-                self.dismiss_login_prompt()
-                time.sleep(0.3)
-                continue
-
-            # b) 居中卡片弹窗白底检测 (如“发现抖音朋友”居中 bounds=[120,528][960,1464])
-            h, w, _ = frame1.shape
-            center_crop = frame1[int(h * 0.27):int(h * 0.76), int(w * 0.11):int(w * 0.89)]
-            if center_crop.size > 0:
-                center_white = float(np.mean((center_crop[:, :, 0] > 235) & (center_crop[:, :, 1] > 235) & (center_crop[:, :, 2] > 235)))
-                if center_white > 0.65:
-                    logger.warning(f"门禁检测到居中白色卡片弹窗 (居中白底占比 {center_white:.1%})，尝试点击【拒绝】穿透...")
-                    self.dismiss_center_dialog()
-                    time.sleep(0.3)
-                    continue
-
-            # 2. 帧差分动态推流校验
-            time.sleep(0.3)
-            frame2 = self._capture_frame_array()
-            if frame2 is None or frame2.shape != frame1.shape:
-                continue
-
-            diff = np.abs(frame2.astype(np.int16) - frame1.astype(np.int16))
-            dynamic_ratio = float(np.mean(diff > 15))
-
-            if dynamic_ratio > 0.005:  # 大于 0.5% 像素有动态变化
-                # 终极硬门禁校验：严禁在 MainActivity (首页短视频信息流) 放行出流
-                is_live_act = ("LivePlayActivity" in act or "live" in act.lower()) and ("MainActivity" not in act)
-                if not is_live_act:
-                    self.last_gate_reason = "navigation_failed"
-                    logger.warning(f"门禁拦截：检测到画面动态变化 (差分率 {dynamic_ratio:.2%})，但前台并非直播间 ({act})，坚决拦截！")
-                    time.sleep(0.3)
-                    continue
-
-                self.last_gate_reason = ""
-                logger.info(f"开录前置门禁顺利通过！Activity={act}, 白底率={white_ratio:.1%}, 动态帧差率={dynamic_ratio:.2%}")
-                return True
-
-            time.sleep(0.3)
-
-        logger.error(f"开录前置门禁超时 ({timeout_sec}s)：画面仍为静止遮罩或未开始推流。")
-        return False
-
     def detect_current_room_identity(self) -> tuple[str | None, str | None]:
         """只读取主播 UID 证据；展示短号、场次 room_id 绝不冒充 UID。"""
         try:
@@ -382,7 +246,6 @@ class WorkerNavigator:
         """根据页面反馈选择入口，不把系统已受理当作定位完成。"""
         self._navigation_generation = getattr(self, "_navigation_generation", 0) + 1
         self._profile_entry_clicked_generation = None
-        self._last_overlay_observation = None
         self._invalidate_focus_cache()
         old = self._operation_deadline
         self._operation_deadline = deadline
@@ -639,8 +502,7 @@ class WorkerNavigator:
                 self._adb('shell','input','keyevent','4')
             if not fast_identity and 'LivePlayActivity' in (self.get_current_focus_activity() or ''):
                 preserve_pending_profile = entry_clicked and not profile_open
-                # 入口已点击但尚未确认资料卡时，保留当前直播页给下一轮只读复检；
-                # 不发送 Back，也不在收尾阶段再触发一次 UIAutomator dump。
+                # 入口已点击但尚未确认资料卡时，保留当前直播页给下一轮只读复检，不发送 Back。
                 if not preserve_pending_profile and not profile_open:
                     self.dismiss_live_overlay(cleanup_deadline, lambda: False)
             self._operation_deadline = old
@@ -682,15 +544,10 @@ class WorkerNavigator:
                     if overlay_deadline-time.monotonic() < 2:
                         last_problem = 'page_probe_unavailable'
                         break
-                    cached = self._last_overlay_observation
-                    if cached is not None and time.time() - cached.get('observed_at', 0) > 5:
-                        cached = None
-                    if not self.dismiss_live_overlay(overlay_deadline, stop_requested,
-                                                     initial_observation=cached):
+                    if not self.dismiss_live_overlay(overlay_deadline, stop_requested):
                         self.last_gate_reason = 'overlay_not_recovered'
                         return False
                     overlay_checked = True
-                    self._last_overlay_observation = None
                     # 返回操作后重新读取Activity再采样，不使用点击前的页面状态。
                     continue
                 frame = self._capture_frame_array()
@@ -712,55 +569,54 @@ class WorkerNavigator:
         finally:
             self._operation_deadline = old
 
-    def inspect_live_surface(self, timeout_sec=6.0):
-        """后台只读探针；不触发点击，不修改主导航的截止时间。"""
-        from src.worker.live_overlay import classify_live_overlay
-        from src.worker.popup_bypasser import PopupBypasser
-        activity = self.get_current_focus_activity() or ''
-        if 'LivePlayActivity' not in activity:
-            return {'activity': activity, 'overlay': None, 'ui_available': False, 'observed_at': time.time()}
-        reader = PopupBypasser(self.adb_client)
-        reader.deadline = time.monotonic() + timeout_sec
-        xml = reader.get_ui_dump()
-        found = classify_live_overlay(xml)
-        return {'activity': activity, 'overlay': found.kind if found else None,
-                'markers': list(found.markers) if found else [], 'ui_available': bool(xml),
+    def inspect_live_surface(self, timeout_sec=3.0):
+        """后台只读探针：读取窗口焦点，不等待页面空闲；不点击，不修改主导航的截止时间。"""
+        from src.worker.live_overlay import classify_live_surface
+        deadline = time.monotonic() + timeout_sec
+        texts = {}
+        for target in ('displays', 'windows'):
+            remaining = deadline - time.monotonic()
+            texts[target] = ''
+            if remaining < .2:
+                break
+            try:
+                result = self.adb_client.run_adb('shell', 'dumpsys', 'window', target,
+                                                 timeout=remaining, check=False)
+                if result.exit_code == 0:
+                    texts[target] = result.stdout or ''
+            except Exception as exc:
+                logger.debug('窗口状态不可读取: %s', exc)
+        surface = classify_live_surface(texts.get('windows', ''), texts.get('displays', ''))
+        return {'activity': surface.activity, 'overlay': surface.overlay,
+                'markers': list(surface.markers), 'ui_available': surface.available,
                 'observed_at': time.time()}
 
-    def dismiss_live_overlay(self, deadline, stop_requested, *, initial_observation=None,
-                             require_observed_clear=False):
-        """仅关闭确定的面板；复用新鲜识别结果，关闭后未知UI不伪报已消失。
+    def dismiss_live_overlay(self, deadline, stop_requested, *, require_observed_clear=False):
+        """只在新鲜窗口证据确认面板持有焦点时发送 BACK；关闭后必须再次观察。
 
-        最多两次BACK，所有复检共享截止时间；不重复耗费第一轮UI dump。
-        require_observed_clear用于运行期验收，必须看到面板消失的实际UI证据。
+        每次 BACK 前都重新读取焦点：面板若已自行关闭，BACK 会退出直播间。
+        最多两次 BACK，所有复检共享截止时间。
+        require_observed_clear 用于运行期验收，必须读到面板已消失的窗口证据。
         """
-        observation = initial_observation
-        if observation is not None:
-            age = time.time() - observation.get('observed_at', 0)
-            if not (0 <= age <= 5 and observation.get('ui_available')
-                    and 'LivePlayActivity' in observation.get('activity', '')
-                    and 'LivePlayActivity' in (self.get_current_focus_activity() or '')):
-                observation = None
         backs = 0
-        for _ in range(5):
+        for _ in range(6):
             if stop_requested() or time.monotonic() >= deadline:
                 return False
-            current = observation or self.inspect_live_surface(
-                timeout_sec=max(.1, min(5, deadline-time.monotonic())))
-            observation = None
-            self._last_overlay_observation = current
-            if 'LivePlayActivity' not in current['activity']:
+            current = self.inspect_live_surface(
+                timeout_sec=max(.5, min(3, deadline-time.monotonic())))
+            activity = current.get('activity', '')
+            if activity and 'LivePlayActivity' not in activity:
                 return False
             if not current.get('overlay'):
                 if current.get('ui_available'):
                     return True
                 if not require_observed_clear and backs == 0:
                     return True  # 初次准入未知不盲点；后续画面与周期探针仍继续。
-                self._navigation_sleep(.2, deadline, stop_requested)
+                self._navigation_sleep(.3, deadline, stop_requested)
                 continue
             if backs >= 2:
                 return False
-            logger.info('关闭已识别直播遮挡: %s，使用返回键', current['overlay'])
+            logger.info('关闭直播面板窗口: %s，使用返回键', ' '.join(current.get('markers', [])))
             self._adb('shell', 'input', 'keyevent', '4',
                       timeout=min(2, max(.1, deadline-time.monotonic())))
             backs += 1

@@ -60,10 +60,8 @@ class WorkerProcessHandle:
         cmd = [self.python_exe, "-u", "-m", "src.worker.cli",
                "--vmindex", str(self.spec.vmindex), "--target", self.spec.target,
                "--output-dir", str(self.spec.output_dir.resolve()),
-               "--recording-mode", self.spec.recording_mode,
                "--navigation-timeout", str(self.spec.navigation_timeout_sec),
                "--segment-duration", str(self.spec.segment_duration_sec),
-               "--overlap-duration", str(self.spec.overlap_duration_sec),
                "--stall-timeout", str(self.spec.stall_timeout_sec),
                "--heartbeat-interval", str(self.spec.heartbeat_interval_sec),
                "--window-mode", self.spec.window_mode]

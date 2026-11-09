@@ -187,7 +187,8 @@ def locate_target(navigator, target: str, *, target_kind: str = 'auto',
         last_status, last_evidence = IdentityStatus.UNCONFIRMED, None
         phase = 'navigation'
         until = min(preparation_deadline, time.monotonic()+30)
-        emit('navigate', last_reason, stage_deadline=until)
+        # 首次导航尚无失败原因；重试时带上一次的失败原因便于排查。
+        emit('navigate', last_reason if attempt > 1 else '', stage_deadline=until)
         if not navigator.navigate_route(target, web_rid, route, until, stop_requested):
             last_reason = 'intent_failed'
             continue

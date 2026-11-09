@@ -127,8 +127,6 @@ def run_e2e_test(
         "--target", target,
         "--output-dir", str(run_dir),
         "--segment-duration", str(segment_duration),
-        "--recording-mode", "continuous",
-        "--overlap-duration", "0.0",
         "--window-mode", window_mode,
         "--allow-unconfirmed-identity",
     ]

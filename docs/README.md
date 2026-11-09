@@ -9,9 +9,9 @@
 ```text
 docs/
 ├─ README.md
-├─ 需求说明.md                      按需
+├─ [需求说明.md](需求说明.md)
 ├─ 设计说明.md                      按需
-├─ 待办.md                          按需
+├─ [待办.md](待办.md)
 ├─ 术语.md                          按需
 ├─ 方案/
 │  ├─ [20261020-MVP技术可行性验证方案.md](方案/20261020-MVP技术可行性验证方案.md)
@@ -24,7 +24,10 @@ docs/
 ├─ 证据/验证/
 │  ├─ [20261020-MVP技术可行性验证.md](证据/验证/20261020-MVP技术可行性验证.md)
 │  ├─ [20261031-录播Worker技术验证.md](证据/验证/20261031-录播Worker技术验证.md)
-│  └─ [20261101-开录前置门禁与视觉看门狗技术验证.md](证据/验证/20261101-开录前置门禁与视觉看门狗技术验证.md)
+│  ├─ [20261101-开录前置门禁与视觉看门狗技术验证.md](证据/验证/20261101-开录前置门禁与视觉看门狗技术验证.md)
+│  ├─ [20261108-截图容错修复与15分钟实机验证.md](证据/验证/20261108-截图容错修复与15分钟实机验证.md)
+│  ├─ [20261108-运行期遮挡探针改用窗口状态验证.md](证据/验证/20261108-运行期遮挡探针改用窗口状态验证.md)
+│  └─ [20261109-冻结检测改用录像流实机验证.md](证据/验证/20261109-冻结检测改用录像流实机验证.md)
 └─ adr/
    ├─ [0001-scrcpy-pipeline-for-audio-video-isolation.md](adr/0001-scrcpy-pipeline-for-audio-video-isolation.md)
    ├─ [0002-time-segmented-mp4-recording.md](adr/0002-time-segmented-mp4-recording.md)
@@ -34,14 +37,18 @@ docs/
    ├─ [0006-stall-watchdog-and-av-sync.md](adr/0006-stall-watchdog-and-av-sync.md)
    ├─ [0007-preflight-content-gate-and-visual-watchdog.md](adr/0007-preflight-content-gate-and-visual-watchdog.md)
    ├─ [0008-single-writer-pipeline-action-queue.md](adr/0008-single-writer-pipeline-action-queue.md)
-   ├─ [0009-overlapping-dual-pipeline-seamless-slicing.md](adr/0009-overlapping-dual-pipeline-seamless-slicing.md)
    ├─ [0010-orchestrator-architecture-and-delivery-contract.md](adr/0010-orchestrator-architecture-and-delivery-contract.md)
-   └─ [0011-worker-responsibility-purification-and-offline-decoupling.md](adr/0011-worker-responsibility-purification-and-offline-decoupling.md)
+   ├─ [0011-worker-responsibility-purification-and-offline-decoupling.md](adr/0011-worker-responsibility-purification-and-offline-decoupling.md)
+   ├─ [0012-continuous-capture-segment-muxer.md](adr/0012-continuous-capture-segment-muxer.md)
+   ├─ [0013-freeze-detection-from-captured-stream.md](adr/0013-freeze-detection-from-captured-stream.md)
+   └─ [0014-remove-restart-mode-and-dual-pipeline.md](adr/0014-remove-restart-mode-and-dual-pipeline.md)
 
 archive/docs/                       仓库根目录下，按需
 ├─ 方案/
-│  └─ [20261101-未登录弹窗阻断治理与门禁加固方案.md](../archive/docs/方案/20261101-未登录弹窗阻断治理与门禁加固方案.md)
+│  ├─ [20261101-未登录弹窗阻断治理与门禁加固方案.md](../archive/docs/方案/20261101-未登录弹窗阻断治理与门禁加固方案.md)
+│  └─ [20261109-冻结检测改用录像流与旧录制路径清理方案.md](../archive/docs/方案/20261109-冻结检测改用录像流与旧录制路径清理方案.md)
 └─ adr/                             已失效或被替代的决定
+   └─ [0009-overlapping-dual-pipeline-seamless-slicing.md](../archive/docs/adr/0009-overlapping-dual-pipeline-seamless-slicing.md)
 ```
 
 当前专项验证：[持续采集与遮挡恢复](证据/验证/20261106-持续采集与遮挡恢复验证.md)；前期结果：[目标直播定位与实录验证](证据/验证/20261106-目标直播定位与实录验证.md)。
@@ -50,9 +57,9 @@ archive/docs/                       仓库根目录下，按需
 
 | 位置 | 唯一正文职责 | 创建时机 |
 | --- | --- | --- |
-| `docs/需求说明.md` | 已确认的目标、行为、边界和验收要求；明确标记尚未实现的部分 | 需求需要持久维护时 |
+| [docs/需求说明.md](需求说明.md) | 已确认的目标、行为、边界和验收要求；明确标记尚未实现的部分 | 需求需要持久维护时 |
 | `docs/设计说明.md` | 当前架构、模块职责、数据与接口约束，以及代码和测试入口 | 技术设计确定后 |
-| `docs/待办.md` | 未完工作、已知缺陷、未验证事项及对应依据 | 出现需跨任务跟踪的事项时 |
+| [docs/待办.md](待办.md) | 未完工作、已知缺陷、未验证事项及对应依据 | 出现需跨任务跟踪的事项时 |
 | `docs/术语.md` | 易混概念及业务术语，不重复实现参数 | 确有术语解释需要时 |
 | [docs/方案/](方案/) | 待审阅、待实施、实施中、待验证或暂停的专项方案 | 用户要求或同意编写方案时 |
 | `docs/证据/验证/YYYYMMDD-任务名称.md` | 需要长期保留的验证摘要、环境、结果、未测项与外部材料位置 | 形成有留存价值的验证结论时 |

@@ -103,7 +103,6 @@ def run_test(
     pos_y: int | None = None,
     segment_duration: int = 25,
     total_duration: int = 55,
-    overlap_duration: float = 3.0,
 ):
     ffprobe_exe = find_ffprobe()
     logger.info(f"使用 ffprobe: {ffprobe_exe}")
@@ -132,7 +131,6 @@ def run_test(
         "--target", target_entry,
         "--output-dir", str(out_base),
         "--segment-duration", str(segment_duration),
-        "--overlap-duration", str(overlap_duration),
         "--total-duration", str(total_duration),
         "--allow-unconfirmed-identity",
         "--window-mode", eff_mode,
@@ -226,7 +224,6 @@ if __name__ == "__main__":
     parser.add_argument("--window-pos-y", type=int, default=None)
     parser.add_argument("--segment-duration", type=int, default=25, help="单切片时长(秒)")
     parser.add_argument("--total-duration", type=int, default=55, help="总录制时长(秒)")
-    parser.add_argument("--overlap-duration", type=float, default=3.0, help="双管线交叠时长(秒)")
     parsed = parser.parse_args()
 
     mode = "hidden" if parsed.background else parsed.window_mode
@@ -238,5 +235,4 @@ if __name__ == "__main__":
         pos_y=parsed.window_pos_y,
         segment_duration=parsed.segment_duration,
         total_duration=parsed.total_duration,
-        overlap_duration=parsed.overlap_duration,
     )

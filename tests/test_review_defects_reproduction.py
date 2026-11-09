@@ -1,8 +1,6 @@
 """复现 3d0be8c 复审中发现的功能缺陷的针对性测试套件。
 
 本测试套件直接复现：
-1. 连续崩溃导致切片序号重复 [1, 2, 2] 与主循环状态不同步；
-2. 看门狗重启 (_recycle_current_segment) 遗漏旧切片终态事件；
 3. finalize_segment 覆盖已有文件 (unlink) 与吞异常；
 4. verify_segment_file 缺失 ffprobe 时根据大小伪造双轨有效性；
 5. 校验失败时控制器依然发射 segment_finished 并以退出码 0 掩盖；
@@ -41,80 +39,6 @@ from src.worker.segment_verifier import verify_segment_file, finalize_segment
 
 class TestReviewDefectsReproduction(unittest.TestCase):
     """缺陷复现测试集合。在修复前这些测试应准确揭示问题。"""
-
-    def test_reproduce_double_crash_segment_index_corruption(self):
-        """复现缺陷 1: 同一切片周期内连续两次崩溃，切片序号出现 [1, 2, 2] 且主循环状态不同步。"""
-        events = []
-        emitter = WorkerEventEmitter()
-        emitter.emit = lambda ev: events.append(ev)
-
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            cfg = WorkerConfig(
-                vmindex=2,
-                target="test_room",
-                output_dir=Path(tmp_dir),
-                segment_duration_sec=30,
-                total_duration_sec=5,
-            )
-            ctrl = WorkerController(config=cfg, emitter=emitter)
-
-            # 模拟 pipeline
-            mock_pipeline = MagicMock()
-            mock_pipeline.is_recording.return_value = False
-            mock_pipeline.get_exit_code.return_value = 2
-            mock_pipeline.start_segment.side_effect = lambda idx: Path(tmp_dir) / f"seg_{idx}.mp4"
-            mock_pipeline.current_file_path = Path(tmp_dir) / "seg_1.mp4"
-            ctrl._pipeline = mock_pipeline
-
-            # 模拟当前切片为 1
-            # 第一次崩溃恢复
-            res1 = ctrl._handle_pipeline_crash(segment_idx=1, exit_code=2)
-            self.assertTrue(res1)
-            # 第二次崩溃恢复（若主循环未同步切片状态，仍传入 segment_idx=1）
-            res2 = ctrl._handle_pipeline_crash(segment_idx=ctrl.current_segment_index if hasattr(ctrl, "current_segment_index") and ctrl.current_segment_index > 1 else 1, exit_code=2)
-
-            started_indices = [e.segment_index for e in events if isinstance(e, SegmentStartedEvent)]
-            # 严格断言：连续两次崩溃后，启动的切片序号必须单调递增，如 [2, 3]（如果初始为1），绝不能是 [2, 2]
-            self.assertEqual(len(started_indices), len(set(started_indices)), f"切片序号出现重复: {started_indices}")
-            self.assertEqual(started_indices, sorted(started_indices), f"切片序号未单调递增: {started_indices}")
-
-    def test_reproduce_recycle_current_segment_missing_terminal_event(self):
-        """复现缺陷 2: _recycle_current_segment 仅发射 started，旧切片丢失终态事件。"""
-        events = []
-        emitter = WorkerEventEmitter()
-        emitter.emit = lambda ev: events.append(ev)
-
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            cfg = WorkerConfig(
-                vmindex=2,
-                target="test_room",
-                output_dir=Path(tmp_dir),
-                segment_duration_sec=30,
-            )
-            ctrl = WorkerController(config=cfg, emitter=emitter)
-            mock_pipe = MagicMock()
-            mock_pipe.current_segment_index = 1
-            mock_pipe.current_file_path = Path(tmp_dir) / "seg_1.mp4"
-            mock_pipe.start_segment.return_value = Path(tmp_dir) / "seg_2.mp4"
-            ctrl._pipeline = mock_pipe
-
-            # 模拟先启动了切片 1
-            emitter.emit(SegmentStartedEvent(segment_index=1, file_path=str(mock_pipe.current_file_path)))
-
-            # 已开始的切片处于 RECORDING，恢复不允许从 PREFLIGHT 凭空发生。
-            ctrl.state_machine.transition_to(WorkerState.RECORDING)
-            ctrl._recycle_current_segment()
-
-            # 断言：切片 1 必须有且仅有一个终态事件（finished 或 aborted），然后再是切片 2 的 started
-            started_events = [e for e in events if isinstance(e, SegmentStartedEvent)]
-            terminal_events_seg1 = [
-                e for e in events
-                if (isinstance(e, SegmentFinishedEvent) or isinstance(e, SegmentAbortedEvent)) and e.segment_index == 1
-            ]
-            self.assertEqual(
-                len(terminal_events_seg1), 1,
-                f"旧切片 #1 必须发射且仅发射一个终态事件，当前捕获: {terminal_events_seg1}"
-            )
 
     def test_reproduce_finalize_segment_unlinks_existing_target(self):
         """复现缺陷 3: finalize_segment 在目标文件已存在时调用 unlink 覆盖已有产物。"""

@@ -37,8 +37,6 @@ def build_parser():
                      help="传给Worker的定位总时限（60～900秒），默认300秒")
     run.add_argument("--scan-interval", type=float, default=30.0)
     run.add_argument("--segment-duration", type=int, default=1800)
-    run.add_argument("--overlap-duration", type=float, default=0.0)
-    run.add_argument("--recording-mode", choices=["continuous", "restart"], default="continuous")
     run.add_argument("--max-attempts", type=int, default=3)
     run.add_argument("--max-runtime", type=float, default=0,
                      help="验证用主控运行时限（秒），0 为持续运行")
@@ -58,9 +56,7 @@ def main(argv=None) -> int:
                 raise ValueError()
             if args.scan_interval <= 0 or args.segment_duration <= 0 or args.max_attempts < 1:
                 raise ValueError()
-            if args.recording_mode == 'continuous' and args.overlap_duration:
-                raise ValueError()
-            if args.overlap_duration < 0 or args.overlap_duration >= args.segment_duration or args.max_runtime < 0:
+            if args.max_runtime < 0:
                 raise ValueError()
         except ValueError:
             parser.error("实例索引或时间/重试参数非法")
@@ -82,8 +78,7 @@ def main(argv=None) -> int:
             from src.orchestrator.scheduler import Scheduler
             scheduler = Scheduler(store, args.output_dir, indices,
                 scan_interval_sec=args.scan_interval, max_attempts=args.max_attempts,
-                segment_duration_sec=args.segment_duration, overlap_duration_sec=args.overlap_duration,
-                recording_mode=args.recording_mode, navigation_timeout_sec=args.navigation_timeout)
+                segment_duration_sec=args.segment_duration, navigation_timeout_sec=args.navigation_timeout)
             stop = threading.Event()
             def request_stop(signum, frame):
                 stop.set()

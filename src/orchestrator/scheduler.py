@@ -88,8 +88,7 @@ class Scheduler:
                  clock=time.time, process_probe=inspect_job_process,
                  scan_interval_sec: float = 30.0, max_attempts: int = 3,
                  ended_interval_sec: float = 10.0, auto_scan: bool = True,
-                 segment_duration_sec: int = 1800, overlap_duration_sec: float = 0.0,
-                 recording_mode: str = "continuous", navigation_timeout_sec: float = 300.0):
+                 segment_duration_sec: int = 1800, navigation_timeout_sec: float = 300.0):
         from src.worker.room_locator import validate_navigation_timeout
         validate_navigation_timeout(navigation_timeout_sec)
         self.navigation_timeout = navigation_timeout_sec
@@ -101,12 +100,6 @@ class Scheduler:
         self.scan_interval = max(.1, scan_interval_sec)
         self.max_attempts, self.ended_interval = max_attempts, ended_interval_sec
         self.auto_scan, self.segment_duration = auto_scan, segment_duration_sec
-        if recording_mode not in {'continuous', 'restart'}:
-            raise ValueError('未知录制模式')
-        if recording_mode == 'continuous' and overlap_duration_sec:
-            raise ValueError('连续采集不能配置交叠；诊断模式需显式选择 restart')
-        self.recording_mode = recording_mode
-        self.overlap_duration = overlap_duration_sec
         self.scanner = scanner or RoomScanner()
         self.pool = pool or InstancePool()
         self.handle_factory, self.process_probe = handle_factory, process_probe
@@ -315,7 +308,6 @@ class Scheduler:
             web_rid=room.web_rid, expected_anchor_uid=getattr(room, "anchor_uid", None),
             allow_unconfirmed_identity=bool(target["allow_unconfirmed"]), job_id=job_id,
             event_log_path=journal, segment_duration_sec=self.segment_duration,
-            overlap_duration_sec=self.overlap_duration, recording_mode=self.recording_mode,
             navigation_timeout_sec=self.navigation_timeout)
         # 先保存启动意图和产物关联，覆盖 Popen 后写 PID 前的异常窗口。
         with self.store.transaction() as db:

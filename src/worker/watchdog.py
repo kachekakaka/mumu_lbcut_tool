@@ -1,4 +1,8 @@
-"""只读看门狗：真实 ROI 帧差、独立文件进度和有界探针失败处理。"""
+"""只读看门狗：录像流画面 ROI 帧差、独立文件进度与登录页检测。
+
+录制期间不向模拟器索取截图；画面来自采集会话的录像流分析（StreamMonitor）。
+画面检查不可用时只靠文件增长检测，不因此停止录制。
+"""
 from dataclasses import dataclass
 import logging
 import threading
@@ -18,7 +22,6 @@ class WatchdogSnapshot:
     video_motion: float | None
     video_frozen_sec: float
     file_stall_sec: float
-    probe_failure_sec: float
     login_blocked: bool = False
 
 
@@ -28,7 +31,6 @@ class StallWatchdog:
                  check_interval_sec: float = 2.0, stall_threshold_sec: float = 10.0,
                  segment_recycle_threshold_sec: float = 20.0, fatal_threshold_sec: float = 45.0,
                  visual_probe_interval_sec: float = 5.0,
-                 probe_failure_fatal_sec: float = 60.0,
                  generation_provider: Callable[[], int] | None = None,
                  on_post_action: Callable[[PipelineAction], None] | None = None,
                  on_stall_action=None, on_request_new_segment=None, on_fatal_stall=None):
@@ -38,7 +40,6 @@ class StallWatchdog:
         self.segment_recycle_threshold_sec = max(segment_recycle_threshold_sec, stall_threshold_sec * 2)
         self.fatal_threshold_sec = max(fatal_threshold_sec, self.segment_recycle_threshold_sec + 5)
         self.visual_probe_interval_sec = visual_probe_interval_sec
-        self.probe_failure_fatal_sec = max(60.0, float(probe_failure_fatal_sec))
         self.generation_provider = generation_provider or (lambda: 0)
         self.on_post_action = on_post_action
         self.on_stall_action = on_stall_action
@@ -56,7 +57,8 @@ class StallWatchdog:
         self._last_size_mb = None
         self._stall_start_time = None
         self._frozen_since = None
-        self._probe_failed_since = None
+        self._reset_at = None
+        self._frame_seq = None
         self._last_visual_probe_time = float('-inf')
         self._low_motion_count = 0
         self._visual_stall_count = 0
@@ -86,15 +88,47 @@ class StallWatchdog:
 
     @staticmethod
     def _roi(frame):
-        if frame is None or not isinstance(frame, np.ndarray) or frame.ndim != 3:
+        """灰度小图的画面上中部，避开底部弹幕区。"""
+        if frame is None or not isinstance(frame, np.ndarray) or frame.ndim != 2:
             return None
-        h, w = frame.shape[:2]
+        h, w = frame.shape
         crop = frame[int(h * .15):int(h * .65), int(w * .05):int(w * .95)]
         if crop.size == 0:
             return None
-        # 降采样降低复制和差分开销，不处理底部弹幕区。
-        stride = max(1, crop.shape[1] // 240)
-        return crop[::stride, ::stride, :3].mean(axis=2).astype(np.float32)
+        return crop.astype(np.float32)
+
+    def _sample_view(self, view, now):
+        if view is None or not view.available:
+            self._previous_roi = self._frame_seq = self._motion = None
+            self._frozen_since = None
+            self._low_motion_count = 0
+            return
+        if view.frozen_since is not None:
+            # 流分析已核实录像本身没有新画面；新建看门狗只从自身创建时刻起算。
+            since = max(view.frozen_since, self._reset_at)
+            self._frozen_since = since if self._frozen_since is None else min(self._frozen_since, since)
+            self._low_motion_count = max(self._low_motion_count, 2)
+            self._motion = 0.0
+            return
+        if view.frame is None or view.frame_seq == self._frame_seq:
+            return  # 暂无新帧：是否冻结由流分析的无帧核实决定，这里不推断。
+        self._frame_seq = view.frame_seq
+        roi = self._roi(view.frame)
+        if roi is None:
+            return
+        if self._previous_roi is not None and roi.shape == self._previous_roi.shape:
+            self._motion = float(np.mean(np.abs(roi - self._previous_roi)) / 255.0)
+            if self._motion < .003:
+                self._low_motion_count += 1
+                if self._frozen_since is None:
+                    self._frozen_since = now
+            else:
+                self._frozen_since = None
+                self._low_motion_count = 0
+        else:
+            self._frozen_since = None
+            self._low_motion_count = 0
+        self._previous_roi = roi
 
     def _post(self, kind: ActionType, gen: int, reason: str):
         if self._stop.is_set() or gen != self.generation_provider():
@@ -115,6 +149,8 @@ class StallWatchdog:
             if self._sample_gen != gen:
                 self._reset()
                 self._sample_gen = gen
+        if self._reset_at is None:
+            self._reset_at = now
         if not self.pipeline.is_recording():
             return
         size = self.pipeline.get_current_file_size_mb()
@@ -128,47 +164,22 @@ class StallWatchdog:
         if now - self._last_visual_probe_time >= self.visual_probe_interval_sec:
             self._last_visual_probe_time = now
             act = self.navigator.get_current_focus_activity() or ""
-            frame = self.navigator._capture_frame_array()
+            monitor = getattr(self.pipeline, "monitor", None)
+            view = monitor.view() if monitor else None
             if gen != self.generation_provider() or self._stop.is_set():
                 return  # 旧采样不可污染新切片。
-            login = "login" in act.lower()
-            # 白色直播、展馆加载页和浅色面板不能仅凭颜色确诊为登录。
             # 登录强结论使用实际 Activity；原生面板交由只读表面探针识别后返回关闭。
-            # ROI冻结、文件停滞、探针不可用的检测仍独立执行。
-            self._visual_stall_count = self._visual_stall_count + 1 if login else 0
-            roi = self._roi(frame)
-            if roi is None or not act:
-                if self._probe_failed_since is None:
-                    self._probe_failed_since = now
-                self._motion = None
-            else:
-                self._probe_failed_since = None
-                if self._previous_roi is not None and roi.shape == self._previous_roi.shape:
-                    self._motion = float(np.mean(np.abs(roi - self._previous_roi)) / 255.0)
-                    if self._motion < .003:
-                        self._low_motion_count += 1
-                        if self._frozen_since is None:
-                            self._frozen_since = now
-                    else:
-                        self._frozen_since = None
-                        self._low_motion_count = 0
-                else:
-                    self._frozen_since = None
-                    self._low_motion_count = 0
-                self._previous_roi = roi
+            self._visual_stall_count = self._visual_stall_count + 1 if "login" in act.lower() else 0
+            self._sample_view(view, now)
 
         frozen = now - self._frozen_since if self._frozen_since is not None else 0.0
         stalled = now - self._stall_start_time if self._stall_start_time is not None else 0.0
-        failed = now - self._probe_failed_since if self._probe_failed_since is not None else 0.0
-        snapshot = WatchdogSnapshot(gen, now, self._motion, frozen, stalled, failed,
+        snapshot = WatchdogSnapshot(gen, now, self._motion, frozen, stalled,
                                     self._visual_stall_count > 0)
         with self._lock:
             self._snapshot = snapshot
         if self._visual_stall_count >= 2:
             self._post(ActionType.FATAL_STOP, gen, "login_blocked")
-            return
-        if failed >= self.probe_failure_fatal_sec:
-            self._post(ActionType.FATAL_STOP, gen, "visual_probe_unavailable")
             return
         duration = max(stalled, frozen if self._low_motion_count >= 2 else 0.0)
         reason = "file_progress_stalled" if stalled >= frozen else "video_frozen"
@@ -184,7 +195,7 @@ class StallWatchdog:
         elif duration >= self.stall_threshold_sec and self._action_taken_level < 1:
             self._action_taken_level = 1
             self._post(ActionType.IN_PLACE_HEAL, gen, reason)
-        elif duration == 0 and not failed and not self._visual_stall_count:
+        elif duration == 0 and not self._visual_stall_count:
             self._action_taken_level = 0
 
     def _run_loop(self):
