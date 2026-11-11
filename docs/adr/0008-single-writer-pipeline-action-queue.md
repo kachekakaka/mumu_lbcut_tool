@@ -7,7 +7,7 @@
   - [CONTEXT.md](../../CONTEXT.md)
   - [ADR 0005: 录播 Worker 采用 NDJSON 标准事件流作为外部控制契约](0005-ndjson-event-stream-contract.md)
   - [ADR 0006: 卡顿看门狗采用原地 Intent 刷新与周期切片保障音画同步](0006-stall-watchdog-and-av-sync.md)
-  - [20261102-Worker稳定性加固与异常治理综合方案.md](../方案/20261102-Worker稳定性加固与异常治理综合方案.md)
+  - [20261102-Worker稳定性加固与异常治理综合方案.md](../../archive/docs/方案/20261102-Worker稳定性加固与异常治理综合方案.md)
 
 ---
 
