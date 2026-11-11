@@ -33,16 +33,48 @@ def test_stalled_file_posts_refresh_without_background_navigation():
     pipe.stop_segment.assert_not_called()
 
 
-def test_freeze_detected_even_when_file_grows():
+def test_confirmed_freeze_detected_even_when_file_grows():
     dog, pipe, nav, actions = build_dog()
+    pipe.monitor.new_frames = False
+    pipe.monitor.frozen_since = 0.
     for tick in range(7):
         pipe.get_current_file_size_mb.return_value = 1 + tick
         dog.check_once(float(tick))
     assert dog.snapshot().video_motion == 0
     assert dog.snapshot().video_frozen_sec >= 2
     assert dog.snapshot().file_stall_sec == 0
+    assert dog.snapshot().picture_static_sec == 0
     assert any(a.action_type == ActionType.RESTART_SEGMENT and a.reason == 'video_frozen' for a in actions)
     nav._capture_frame_array.assert_not_called()
+
+
+def test_static_picture_with_new_frames_is_timed_without_actions():
+    dog, pipe, nav, actions = build_dog()
+    for tick in range(200):
+        pipe.get_current_file_size_mb.return_value = 1 + tick
+        dog.check_once(float(tick))
+    snap = dog.snapshot()
+    assert snap.video_motion == 0 and snap.video_frozen_sec == 0
+    assert snap.picture_static_sec >= 190
+    assert actions == []
+    pipe.monitor.set_value(200)
+    dog.check_once(200.)
+    assert dog.snapshot().picture_static_sec == 0 and dog.snapshot().video_motion > .003
+
+
+def test_freeze_after_static_counts_from_confirmed_missing_frames():
+    dog, pipe, nav, actions = build_dog()
+    for tick in range(30):
+        pipe.get_current_file_size_mb.return_value = 1 + tick
+        dog.check_once(float(tick))
+    assert dog.snapshot().picture_static_sec > 20 and actions == []
+    pipe.monitor.new_frames = False
+    pipe.monitor.frozen_since = 29.5
+    for tick in range(30, 35):
+        pipe.get_current_file_size_mb.return_value = 1 + tick
+        dog.check_once(float(tick))
+    assert dog.snapshot().picture_static_sec == 0
+    assert [a.reason for a in actions] == ['video_frozen', 'video_frozen']
 
 
 def test_login_page_posts_fatal_without_direct_clicks():

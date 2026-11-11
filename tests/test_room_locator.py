@@ -70,6 +70,8 @@ def test_shared_nickname_does_not_hide_mismatching_stable_identity():
 
 class NavigationFixture:
     last_gate_reason='navigation_failed'
+    online=True
+    def device_online(self): return self.online
     def __init__(self, observations, pages=None):
         self.observations = iter(observations); self.pages=iter(pages or [True]*10)
         self.routes=[]; self.reads=0; self.ready_checks=0
@@ -114,6 +116,45 @@ def test_stop_prevents_navigation_and_recording():
     nav=NavigationFixture([])
     result=locate_target(nav,'900',stop_requested=lambda: True)
     assert not result.success and result.reason=='cancelled' and not nav.routes
+
+
+def test_device_lost_during_picture_wait_stops_at_once_with_device_unavailable():
+    """模拟器在定位途中崩溃：画面探测失败且 adb 确认掉线时立即结束，并映射为实例离线退出码 20。"""
+    from types import SimpleNamespace
+    from src.worker.controller import WorkerController, EXIT_DEVICE_UNAVAILABLE
+
+    nav=NavigationFixture([RoomEvidence('900','123')])
+    nav.online=False
+    def no_picture(**kwargs):
+        nav.ready_checks+=1; nav.last_gate_reason='page_probe_unavailable'; return False
+    nav.wait_live_picture=no_picture
+    steps=[]
+    result=locate_target(nav,'900',target_kind='room_id',anchor_uid='123',on_step=lambda **kw: steps.append(kw))
+    assert not result.success and result.reason=='device_unavailable'
+    assert nav.routes==['primary'] and nav.ready_checks==1
+    assert steps[-1]['action']=='device_lost'
+    assert WorkerController._landing_exit_code(SimpleNamespace(),'device_unavailable')==EXIT_DEVICE_UNAVAILABLE
+
+
+def test_intent_failure_on_online_device_still_tries_other_routes():
+    nav=NavigationFixture([RoomEvidence('900','123')])
+    routes=[]
+    def navigate(target,web,route,deadline,stop_requested):
+        routes.append(route); return route!='primary'
+    nav.navigate_route=navigate
+    result=locate_target(nav,'900',target_kind='room_id',web_rid='88',anchor_uid='123')
+    assert result.success and routes==['primary','web']
+
+
+def test_intent_failure_on_lost_device_does_not_try_other_routes():
+    nav=NavigationFixture([])
+    nav.online=False
+    routes=[]
+    def navigate(target,web,route,deadline,stop_requested):
+        routes.append(route); return False
+    nav.navigate_route=navigate
+    result=locate_target(nav,'900',target_kind='room_id',web_rid='88')
+    assert result.reason=='device_unavailable' and routes==['primary']
 
 
 def test_real_navigator_exposes_active_observation_and_correction():

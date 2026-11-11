@@ -24,8 +24,7 @@ def build_parser():
     add.add_argument("--allow-unconfirmed-identity", action="store_true",
                      help="显式接受身份未确认风险，不能放行确诊错房")
     sub.add_parser("status", help="查看实例、任务、目标和切片")
-    for name, key in (("record", "target_id"), ("remove", "target_id"),
-                      ("stop", "job_id"), ("unblock", "vmindex")):
+    for name, key in (("record", "target_id"), ("remove", "target_id"), ("stop", "job_id")):
         p = sub.add_parser(name)
         p.add_argument(key)
     rec = sub.add_parser("reconcile", help="请求对账；不会接管未知进程")
@@ -37,7 +36,6 @@ def build_parser():
                      help="传给Worker的定位总时限（60～900秒），默认300秒")
     run.add_argument("--scan-interval", type=float, default=30.0)
     run.add_argument("--segment-duration", type=int, default=1800)
-    run.add_argument("--max-attempts", type=int, default=3)
     run.add_argument("--max-runtime", type=float, default=0,
                      help="验证用主控运行时限（秒），0 为持续运行")
     return parser
@@ -54,12 +52,12 @@ def main(argv=None) -> int:
             indices = [int(x) for x in args.instances.split(",")]
             if not indices or any(i < 0 for i in indices):
                 raise ValueError()
-            if args.scan_interval <= 0 or args.segment_duration <= 0 or args.max_attempts < 1:
+            if args.scan_interval <= 0 or args.segment_duration <= 0:
                 raise ValueError()
             if args.max_runtime < 0:
                 raise ValueError()
         except ValueError:
-            parser.error("实例索引或时间/重试参数非法")
+            parser.error("实例索引或时间参数非法")
     store = Store(args.data_dir.resolve() / "orchestrator.sqlite3")
     try:
         if args.command == "add":
@@ -71,13 +69,13 @@ def main(argv=None) -> int:
                       ("targets", "instances", "jobs", "segments", "commands")}
             print(json.dumps(result, ensure_ascii=False, indent=2))
         elif args.command != "run":
-            subject = getattr(args, "target_id", getattr(args, "job_id", getattr(args, "vmindex", "")))
+            subject = getattr(args, "target_id", getattr(args, "job_id", ""))
             key = store.enqueue_command(args.command, str(subject))
             print(json.dumps({"command_id": key, "status": "queued", "note": "由运行中的调度器执行"}, ensure_ascii=False))
         else:
             from src.orchestrator.scheduler import Scheduler
             scheduler = Scheduler(store, args.output_dir, indices,
-                scan_interval_sec=args.scan_interval, max_attempts=args.max_attempts,
+                scan_interval_sec=args.scan_interval,
                 segment_duration_sec=args.segment_duration, navigation_timeout_sec=args.navigation_timeout)
             stop = threading.Event()
             def request_stop(signum, frame):

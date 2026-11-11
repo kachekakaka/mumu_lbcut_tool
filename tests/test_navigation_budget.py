@@ -18,6 +18,7 @@ class SlowPage:
     last_gate_reason='render_timeout'
     def __init__(self, clock):
         self.clock=clock;self.routes=[];self.reads=0;self.pictures=[]
+    def device_online(self): return True
     def navigate_route(self,target,web,route,deadline,stop):
         self.routes.append(route);self.clock.sleep(5);return True
     def wait_live_page(self,deadline,stop_requested):

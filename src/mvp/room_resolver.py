@@ -1,11 +1,14 @@
 """抖音直播间解析与开播状态检测模块。"""
 from dataclasses import dataclass
 from enum import Enum
-from html.parser import HTMLParser
-import json
 import logging
 import re
+import threading
+from urllib.parse import quote, urlencode
+
 import requests
+
+from src.mvp.vendor.abogus import ABogus, BrowserFingerprintGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -14,8 +17,12 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0"
 )
-
-PACE_PUSH = re.compile(r"^\s*self\.__pace_f\.push\((\[.*\])\)\s*;?\s*$", re.DOTALL)
+LIVE_ORIGIN = "https://live.douyin.com"
+ROOM_ENTER_URL = LIVE_ORIGIN + "/webcast/room/web/enter/"
+TTWID_URL = "https://ttwid.bytedance.com/ttwid/union/register/"
+TTWID_BODY = ('{"region":"cn","aid":1768,"needFid":false,"service":"www.ixigua.com",'
+              '"migrate_info":{"ticket":"","source":"node"},"cbUrlProtocol":"https","union":true}')
+ROOM_ENDED_CODE = 30003
 
 
 class RoomStatus(Enum):
@@ -34,81 +41,27 @@ class ResolvedRoom:
     anchor_uid: str | None = None  # 主播稳定 UID，与场次 room_id 分开
 
 
-class _ScriptCollector(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=False)
-        self._parts: list[str] | None = None
-        self.scripts: list[str] = []
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag.lower() == "script":
-            self._parts = []
-
-    def handle_data(self, data: str) -> None:
-        if self._parts is not None:
-            self._parts.append(data)
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag.lower() == "script" and self._parts is not None:
-            self.scripts.append("".join(self._parts))
-            self._parts = None
-
-
-def _walk(value: object, path: tuple[str, ...] = ()):
-    yield path, value
-    if isinstance(value, dict):
-        for key, child in value.items():
-            yield from _walk(child, (*path, str(key)))
-    elif isinstance(value, list):
-        for index, child in enumerate(value):
-            yield from _walk(child, (*path, str(index)))
-
-
-def _pace_payloads(page_html: str):
-    collector = _ScriptCollector()
-    collector.feed(page_html)
-    fragments: list[str] = []
-    for script in collector.scripts:
-        match = PACE_PUSH.fullmatch(script)
-        if match is None:
-            continue
-        try:
-            outer = json.loads(match.group(1))
-        except Exception:
-            continue
-        if not isinstance(outer, list) or len(outer) < 2 or not isinstance(outer[1], str):
-            continue
-        serialized = outer[1]
-        fragments.append(serialized)
-        separator = serialized.find(":")
-        if separator < 0:
-            continue
-        try:
-            yield json.loads(serialized[separator + 1 :])
-        except Exception:
-            continue
-
-    for record in "".join(fragments).splitlines():
-        _, separator, payload = record.partition(":")
-        if not separator:
-            continue
-        try:
-            yield json.loads(payload)
-        except Exception:
-            continue
+def _room_params(web_rid: str) -> dict[str, object]:
+    return dict(aid="6383", app_name="douyin_web", live_id=1, device_platform="web",
+                language="zh-CN", cookie_enabled="true", screen_width=1920, screen_height=1080,
+                browser_language="zh-CN", browser_platform="Win32", browser_name="Edge",
+                browser_version="130.0.0.0", enter_source="", is_need_double_stream="false",
+                web_rid=web_rid, room_id_str="")
 
 
 class RoomResolver:
-    """负责从用户输入的 URL/短链/文本中提取 web_rid，并检查其当前开播状态。"""
+    """从用户输入的 URL/短链/文本中提取 web_rid，并通过签名接口查询开播状态。
+
+    只使用游客 ttwid，不携带登录态。网页 live.douyin.com/<web_rid> 被风控时会返回验证码页，
+    而签名接口在同一网络下仍可用，所以状态只从接口取。
+    """
 
     def __init__(self, timeout: int = 8):
         self.timeout = timeout
         self.session = requests.Session()
-        self.session.headers.update({
-            "User-Agent": USER_AGENT,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Cookie": "__ac_nonce=067140000000000000000;"
-        })
+        self.session.headers.update({"User-Agent": USER_AGENT, "Referer": LIVE_ORIGIN + "/"})
+        self._ttwid: str | None = None
+        self._ttwid_lock = threading.Lock()
 
     def extract_web_rid(self, text: str) -> str:
         """从输入的文本或 URL 中提取 web_rid。"""
@@ -136,48 +89,79 @@ class RoomResolver:
 
         return text
 
+    def _guest_ttwid(self, stale: str | None = None) -> str:
+        with self._ttwid_lock:
+            # 并发线程同时发现旧 ttwid 失效时只重新注册一次。
+            if self._ttwid and self._ttwid != stale:
+                return self._ttwid
+            resp = requests.post(TTWID_URL, data=TTWID_BODY, timeout=self.timeout,
+                                 headers={"User-Agent": USER_AGENT,
+                                          "Content-Type": "application/json; charset=utf-8"})
+            resp.raise_for_status()
+            ttwid = resp.cookies.get("ttwid")
+            if not ttwid:
+                raise RuntimeError(f"游客 ttwid 注册未返回 Cookie（HTTP {resp.status_code}）")
+            self._ttwid = ttwid
+            return ttwid
+
+    def _enter(self, web_rid: str, ttwid: str) -> requests.Response:
+        query = urlencode(list(_room_params(web_rid).items()), quote_via=quote, safe="")
+        fingerprint = BrowserFingerprintGenerator.generate_fingerprint("Edge")
+        signature = ABogus(fp=fingerprint, user_agent=USER_AGENT).generate_abogus(query)[1]
+        url = f"{ROOM_ENTER_URL}?{query}&a_bogus={quote(signature, safe='')}"
+        resp = self.session.get(url, timeout=self.timeout, headers={"Cookie": f"ttwid={ttwid}"})
+        resp.raise_for_status()
+        return resp
+
     def resolve(self, input_target: str) -> ResolvedRoom:
         """解析目标直播间并查询开播状态。"""
         web_rid = self.extract_web_rid(input_target)
-        url = f"https://live.douyin.com/{web_rid}"
-
+        unknown = ResolvedRoom(web_rid=web_rid, status=RoomStatus.UNKNOWN)
         try:
-            resp = self.session.get(url, timeout=self.timeout)
-            resp.raise_for_status()
-            html = resp.text
+            ttwid = self._guest_ttwid()
+            resp = self._enter(web_rid, ttwid)
+            if not resp.content:
+                # ttwid 失效时接口返回 200 空正文；换一个再试一次。
+                resp = self._enter(web_rid, self._guest_ttwid(stale=ttwid))
+            try:
+                payload = resp.json()
+            except ValueError:
+                payload = None
+            if not isinstance(payload, dict):
+                logger.warning("直播间 %s 状态接口未返回 JSON（HTTP %s，%s 字节），按未知处理",
+                               web_rid, resp.status_code, len(resp.content or b""))
+                return unknown
 
-            room_obj = None
-            # 优先从 pace_payloads 深度提取真正的 roomInfo.room
-            for payload in _pace_payloads(html):
-                for path, val in _walk(payload):
-                    if path and path[-1] == "roomInfo" and isinstance(val, dict):
-                        candidate_room = val.get("room")
-                        if isinstance(candidate_room, dict) and "status" in candidate_room:
-                            room_obj = candidate_room
-                            break
-                if room_obj:
-                    break
+            data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+            code = payload.get("status_code")
+            if code == ROOM_ENDED_CODE and data:
+                return ResolvedRoom(web_rid=web_rid, status=RoomStatus.ENDED)
+            rooms = data.get("data")
+            room = rooms[0] if isinstance(rooms, list) and rooms and isinstance(rooms[0], dict) else None
+            if code != 0 or room is None:
+                logger.warning("直播间 %s 状态接口业务异常（status_code=%r，%s），按未知处理",
+                               web_rid, code, payload.get("status_msg") or data.get("prompts") or "无房间数据")
+                return unknown
 
-            if room_obj:
-                raw_status = str(room_obj.get("status"))
-                status = RoomStatus.LIVE if raw_status == "2" else (RoomStatus.ENDED if raw_status in ("4", "0") else RoomStatus.UNKNOWN)
-                room_id = str(room_obj.get("id_str") or room_obj.get("id") or web_rid)
-                title = room_obj.get("title")
-                owner = room_obj.get("owner") if isinstance(room_obj.get("owner"), dict) else {}
-                nickname = owner.get("nickname")
-                return ResolvedRoom(
-                    web_rid=web_rid,
-                    status=status,
-                    room_id=room_id,
-                    title=title,
-                    nickname=nickname,
-                    anchor_uid=str(owner.get("id_str") or owner.get("id")) if (owner.get("id_str") or owner.get("id")) else None,
-                )
-
-            return ResolvedRoom(web_rid=web_rid, status=RoomStatus.UNKNOWN)
+            raw_status = str(room.get("status"))
+            status = (RoomStatus.LIVE if raw_status == "2"
+                      else RoomStatus.ENDED if raw_status in ("4", "0") else RoomStatus.UNKNOWN)
+            # 下播等场景接口可能省略 room.owner，同一房主改在 data.user 给出。
+            owner = room.get("owner") if isinstance(room.get("owner"), dict) else data.get("user")
+            owner = owner if isinstance(owner, dict) else {}
+            anchor_uid = owner.get("id_str") or owner.get("id")
+            room_id = room.get("id_str") or room.get("id")
+            return ResolvedRoom(
+                web_rid=web_rid,
+                status=status,
+                room_id=str(room_id) if room_id else None,
+                title=room.get("title"),
+                nickname=owner.get("nickname"),
+                anchor_uid=str(anchor_uid) if anchor_uid else None,
+            )
         except Exception as e:
             logger.error(f"查询直播间 {web_rid} 失败: {e}")
-            return ResolvedRoom(web_rid=web_rid, status=RoomStatus.UNKNOWN)
+            return unknown
 
     def batch_resolve(
         self,

@@ -21,6 +21,8 @@ def test_profile_entry_is_clicked_once_and_sheet_avatar_is_opened_without_second
     import time
     from src.worker.navigator import WorkerNavigator
 
+    # 本用例覆盖资料卡回退路径，只读一次 Fragment 参数，焦点序列不被重读消耗。
+    monkeypatch.setattr("src.worker.navigator.FAST_IDENTITY_TRIES", 1)
     nav = WorkerNavigator.__new__(WorkerNavigator)
     nav._operation_deadline = None
     nav._navigation_generation = 4
@@ -84,6 +86,43 @@ def test_live_fragment_fast_path_skips_uiautomator_and_all_ui_taps():
     assert result.room_id=='900' and result.anchor_uid=='123'
     assert result.source=='live_fragment_arguments'
     assert calls==[('shell','dumpsys','activity','top')]
+
+def test_live_fragment_not_ready_is_reread_before_profile_fallback(monkeypatch):
+    import time
+    from src.worker.navigator import WorkerNavigator
+    nav=WorkerNavigator.__new__(WorkerNavigator)
+    nav._operation_deadline=None
+    nav.get_current_focus_activity=lambda:'com.ss.android.ugc.aweme.live.LivePlayActivity'
+    sleeps=[]
+    nav._navigation_sleep=lambda seconds,*args: sleeps.append(seconds) or True
+    top=('mArguments=Bundle[{live_backend_roomid=900, live.intent.extra.USER_ID=123, '
+         'is_LiveRoomFragment=true}]')
+    reads=iter(['', '', top])
+    calls=[]
+    nav._adb=lambda *args,**kwargs: calls.append(args) or next(reads)
+    nav._capture_frame_array=lambda: (_ for _ in ()).throw(AssertionError('must not fall back while rereading'))
+    monkeypatch.setattr("src.worker.popup_bypasser.PopupBypasser",
+                        lambda adb: (_ for _ in ()).throw(AssertionError('must not dump UI')))
+    result=nav.observe_live_room(time.monotonic()+60,lambda:False)
+    assert (result.room_id,result.anchor_uid,result.source)==('900','123','live_fragment_arguments')
+    assert calls==[('shell','dumpsys','activity','top')]*3
+    assert sleeps==[1.0,1.0]
+
+
+def test_live_fragment_reread_stops_when_live_page_left():
+    import time
+    from src.worker.navigator import WorkerNavigator
+    nav=WorkerNavigator.__new__(WorkerNavigator)
+    nav._operation_deadline=None
+    focus=iter(['com.ss.android.ugc.aweme.live.LivePlayActivity','com.ss.android.ugc.aweme.main.MainActivity'])
+    nav.get_current_focus_activity=lambda:next(focus,'com.ss.android.ugc.aweme.main.MainActivity')
+    nav._navigation_sleep=lambda *args:True
+    calls=[]
+    nav._adb=lambda *args,**kwargs: calls.append(args) or ''
+    result=nav.observe_live_room(time.monotonic()+60,lambda:False)
+    assert result.room_id is None and result.anchor_uid is None
+    assert not any(c[:3]==('shell','input','tap') for c in calls)
+
 
 def test_second_observation_on_same_navigation_does_not_repeat_header_tap(monkeypatch):
     import numpy as np
@@ -189,3 +228,40 @@ def test_profile_sheet_fallback_rejects_landscape_and_nonwhite_overlays():
     frame=np.full((1920,1080,3),20,dtype=np.uint8)
     frame[int(.27*1920):,:,:]=[40,40,40]
     assert WorkerNavigator._profile_sheet_avatar_point(frame) is None
+
+
+def test_wait_live_page_dismisses_whitelisted_popup_over_home_then_reaches_live(monkeypatch):
+    """首页上叠着首次启动协议框时，先按白名单点“同意”，再等到直播页，而不是 10 秒后判定导航失败。"""
+    import time
+    from types import SimpleNamespace
+    from src.worker.navigator import WorkerNavigator
+
+    privacy = ('<hierarchy><node text="个人信息保护指引" bounds="[180,560][900,620]" />'
+               '<node text="《用户服务协议》" bounds="[180,640][900,700]" />'
+               '<node text="不同意" bounds="[440,1340][640,1400]" />'
+               '<node text="同意" bounds="[120,1420][960,1520]" /></hierarchy>')
+    state = {"popup": True, "home_checks": 0}
+    taps = []
+
+    def run_adb(*args, **kwargs):
+        if args[:3] == ("shell", "input", "tap"):
+            taps.append(args[3:]); state["popup"] = False
+        out = privacy if state["popup"] and args[:2] == ("shell", "cat") else '<hierarchy><node text="推荐" bounds="[0,0][10,10]" /></hierarchy>'
+        return SimpleNamespace(exit_code=0, stdout=out, stderr="")
+
+    nav = WorkerNavigator.__new__(WorkerNavigator)
+    nav._operation_deadline = None
+    nav.adb_client = SimpleNamespace(run_adb=run_adb)
+    nav._invalidate_focus_cache = lambda: None
+    nav._navigation_sleep = lambda *args: True
+    nav._adb = lambda *args, **kwargs: ""
+
+    def activity():
+        if state["popup"]:
+            return "com.ss.android.ugc.aweme.main.MainActivity"
+        state["home_checks"] += 1
+        return ("com.ss.android.ugc.aweme.main.MainActivity" if state["home_checks"] < 3
+                else "com.ss.android.ugc.aweme.live.LivePlayActivity")
+    nav.get_current_focus_activity = activity
+    assert nav.wait_live_page(time.monotonic() + 30, lambda: False) is True
+    assert taps == [("540", "1470")]

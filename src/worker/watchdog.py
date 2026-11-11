@@ -2,6 +2,10 @@
 
 录制期间不向模拟器索取截图；画面来自采集会话的录像流分析（StreamMonitor）。
 画面检查不可用时只靠文件增长检测，不因此停止录制。
+
+画面冻结（流分析核实没有新帧，或文件停止增长）按分级投递恢复动作；画面静止（仍有新帧
+但画面中部几乎不变，例如平台提示页、主播长时间不动）只计时，由采集会话打标记并决定是否
+重新定位一次。
 """
 from dataclasses import dataclass
 import logging
@@ -23,6 +27,7 @@ class WatchdogSnapshot:
     video_frozen_sec: float
     file_stall_sec: float
     login_blocked: bool = False
+    picture_static_sec: float = 0.0
 
 
 class StallWatchdog:
@@ -57,10 +62,10 @@ class StallWatchdog:
         self._last_size_mb = None
         self._stall_start_time = None
         self._frozen_since = None
+        self._static_since = None
         self._reset_at = None
         self._frame_seq = None
         self._last_visual_probe_time = float('-inf')
-        self._low_motion_count = 0
         self._visual_stall_count = 0
         self._action_taken_level = 0
         self._motion = None
@@ -100,16 +105,16 @@ class StallWatchdog:
     def _sample_view(self, view, now):
         if view is None or not view.available:
             self._previous_roi = self._frame_seq = self._motion = None
-            self._frozen_since = None
-            self._low_motion_count = 0
+            self._frozen_since = self._static_since = None
             return
         if view.frozen_since is not None:
             # 流分析已核实录像本身没有新画面；新建看门狗只从自身创建时刻起算。
             since = max(view.frozen_since, self._reset_at)
             self._frozen_since = since if self._frozen_since is None else min(self._frozen_since, since)
-            self._low_motion_count = max(self._low_motion_count, 2)
+            self._static_since = None
             self._motion = 0.0
             return
+        self._frozen_since = None
         if view.frame is None or view.frame_seq == self._frame_seq:
             return  # 暂无新帧：是否冻结由流分析的无帧核实决定，这里不推断。
         self._frame_seq = view.frame_seq
@@ -119,15 +124,12 @@ class StallWatchdog:
         if self._previous_roi is not None and roi.shape == self._previous_roi.shape:
             self._motion = float(np.mean(np.abs(roi - self._previous_roi)) / 255.0)
             if self._motion < .003:
-                self._low_motion_count += 1
-                if self._frozen_since is None:
-                    self._frozen_since = now
+                if self._static_since is None:
+                    self._static_since = now
             else:
-                self._frozen_since = None
-                self._low_motion_count = 0
+                self._static_since = None
         else:
-            self._frozen_since = None
-            self._low_motion_count = 0
+            self._static_since = None
         self._previous_roi = roi
 
     def _post(self, kind: ActionType, gen: int, reason: str):
@@ -174,14 +176,15 @@ class StallWatchdog:
 
         frozen = now - self._frozen_since if self._frozen_since is not None else 0.0
         stalled = now - self._stall_start_time if self._stall_start_time is not None else 0.0
+        static = now - self._static_since if self._static_since is not None else 0.0
         snapshot = WatchdogSnapshot(gen, now, self._motion, frozen, stalled,
-                                    self._visual_stall_count > 0)
+                                    self._visual_stall_count > 0, static)
         with self._lock:
             self._snapshot = snapshot
         if self._visual_stall_count >= 2:
             self._post(ActionType.FATAL_STOP, gen, "login_blocked")
             return
-        duration = max(stalled, frozen if self._low_motion_count >= 2 else 0.0)
+        duration = max(stalled, frozen)
         reason = "file_progress_stalled" if stalled >= frozen else "video_frozen"
         if self._visual_stall_count == 1:
             duration = max(duration, self.stall_threshold_sec)

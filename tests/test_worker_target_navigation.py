@@ -52,7 +52,7 @@ def test_runtime_relocation_closes_capture_before_opening_profile(monkeypatch,tm
     assert len(calls)==2 and h.launched==[1,2]
     terminals=assert_paired(h.events())
     assert [e['event'] for e in terminals]==['segment_aborted','segment_finished']
-    assert h.controller._total_crash_count==1
+    assert len(h.controller._recovery_times)==1
 
 
 def test_cancel_during_target_navigation_never_starts_media(monkeypatch,tmp_path,valid_media):

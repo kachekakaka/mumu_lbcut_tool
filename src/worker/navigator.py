@@ -15,6 +15,8 @@ from src.worker.room_locator import (RoomEvidence, activity_records, fresh_profi
 logger = logging.getLogger(__name__)
 
 DOUYIN_PACKAGE = "com.ss.android.ugc.aweme"
+FAST_IDENTITY_TRIES = 6
+FAST_IDENTITY_INTERVAL_SEC = 1.0
 
 
 class WorkerNavigator:
@@ -39,6 +41,9 @@ class WorkerNavigator:
 
     def _invalidate_focus_cache(self) -> None:
         self._focus_snapshot_cache = None
+
+    def device_online(self) -> bool:
+        return self.adb_client.is_device_ready(timeout=3.0) or self.adb_client.ensure_connected(timeout=5.0)
 
     def _adb(self, *args: str, timeout: float = 5.0) -> str:
         """执行 ADB 命令，遇到断连自动有界重试。"""
@@ -282,6 +287,16 @@ class WorkerNavigator:
         old = self._operation_deadline
         self._operation_deadline = deadline
         main_seen_since = None
+        next_home_popup_check = 0.0
+
+        def dismiss_popup():
+            bypasser = PopupBypasser(self.adb_client)
+            bypasser.deadline = min(deadline, time.monotonic()+4)
+            if bypasser.detect_and_dismiss_popups():
+                self._invalidate_focus_cache()
+                return True
+            return False
+
         try:
             while time.monotonic() < deadline and not stop_requested():
                 act = self.get_current_focus_activity() or ''
@@ -295,16 +310,19 @@ class WorkerNavigator:
                     if main_seen_since is None:
                         main_seen_since = time.monotonic()
                     self.last_gate_reason = 'navigation_failed'
+                    # 首次启动的协议框、青少年模式等白名单弹窗叠在首页上，会吞掉直播 Intent。
+                    if time.monotonic() >= next_home_popup_check:
+                        next_home_popup_check = time.monotonic() + 3
+                        if dismiss_popup():
+                            main_seen_since = None
+                            continue
                     if time.monotonic()-main_seen_since >= 10:
                         return False
                 elif not act:
                     main_seen_since = None
                     self.last_gate_reason = 'page_probe_unavailable'
                 else:
-                    bypasser = PopupBypasser(self.adb_client)
-                    bypasser.deadline = min(deadline, time.monotonic()+4)
-                    if bypasser.detect_and_dismiss_popups():
-                        self._invalidate_focus_cache()
+                    dismiss_popup()
                 self._navigation_sleep(.5, deadline, stop_requested)
             return False
         finally:
@@ -403,14 +421,24 @@ class WorkerNavigator:
             if 'LivePlayActivity' not in current_activity:
                 return RoomEvidence()
             # 先读取当前 Activity 顶部 Fragment 参数；成功时完全跳过 UIAutomator 和头像点击。
-            activity_top = self._adb('shell', 'dumpsys', 'activity', 'top',
-                                     timeout=min(8.0, max(1.0, operation_deadline-time.monotonic())))
-            fast_evidence = current_live_fragment_evidence(activity_top, current_activity)
-            if fast_evidence is not None:
-                fast_identity = True
-                logger.info('从当前 LivePlayFragment 取得身份：room_id=%s uid=%s',
-                            fast_evidence.room_id, fast_evidence.anchor_uid)
-                return fast_evidence
+            # 直播页刚打开时参数可能尚未就绪，先短暂重读，避免过早落入耗时且需点击的资料卡取证。
+            for fast_try in range(FAST_IDENTITY_TRIES):
+                activity_top = self._adb('shell', 'dumpsys', 'activity', 'top',
+                                         timeout=min(8.0, max(1.0, operation_deadline-time.monotonic())))
+                fast_evidence = current_live_fragment_evidence(activity_top, current_activity)
+                if fast_evidence is not None:
+                    fast_identity = True
+                    logger.info('从当前 LivePlayFragment 取得身份：room_id=%s uid=%s（第 %d 次读取）',
+                                fast_evidence.room_id, fast_evidence.anchor_uid, fast_try+1)
+                    return fast_evidence
+                if fast_try+1 < FAST_IDENTITY_TRIES:
+                    if operation_deadline-time.monotonic() < FAST_IDENTITY_INTERVAL_SEC+15:
+                        break
+                    if not self._navigation_sleep(FAST_IDENTITY_INTERVAL_SEC, operation_deadline, stop_requested):
+                        return RoomEvidence(source='cancelled')
+                    current_activity = self.get_current_focus_activity() or ''
+                    if 'LivePlayActivity' not in current_activity:
+                        return RoomEvidence()
             frame = self._capture_frame_array()
             if frame is None:
                 return RoomEvidence(source='screenshot_unavailable')

@@ -11,6 +11,9 @@ from src.mvp.config import get_mumu_manager_exe, get_adb_exe
 
 logger = logging.getLogger(__name__)
 
+LAUNCH_RETRY_WINDOW_SEC = 45
+LAUNCH_RETRY_INTERVAL_SEC = 3
+
 
 class MuMuClient:
     """封装 MuMuManager.exe 的生命周期与控制接口。"""
@@ -67,6 +70,7 @@ class MuMuClient:
                 "vmindex": idx,
                 "name": val.get("name", f"player_{idx}"),
                 "is_running": is_running,
+                "android_started": bool(val.get("is_android_started", False)),
                 "android_version": val.get("android_version", "12.0"),
                 "adb_host": val.get("adb_host_ip", "127.0.0.1"),
                 "adb_port": val.get("adb_port"),
@@ -130,7 +134,17 @@ class MuMuClient:
             return True
 
         logger.info(f"正在启动 MuMu 实例 {vmindex}...")
-        self._run_manager("control", "-v", str(vmindex), "launch")
+        # 主程序刚拉起时后台服务未就绪，launch 会返回 -503 mainnx connect failed；
+        # 在限定时间内重发，开机等待从命令被受理时起算。
+        retry_until = time.time() + LAUNCH_RETRY_WINDOW_SEC
+        while True:
+            errcode = self._manager_errcode(self._run_manager("control", "-v", str(vmindex), "launch"))
+            if errcode == 0 or time.time() >= retry_until:
+                break
+            logger.info(f"实例 {vmindex} 启动命令未被受理 (errcode={errcode})，{LAUNCH_RETRY_INTERVAL_SEC}s 后重试")
+            time.sleep(LAUNCH_RETRY_INTERVAL_SEC)
+            if self.is_android_started(vmindex):
+                return True
 
         start_time = time.time()
         while time.time() - start_time < timeout_sec:
@@ -141,6 +155,18 @@ class MuMuClient:
 
         logger.error(f"实例 {vmindex} 启动超时 ({timeout_sec}s)。")
         return False
+
+    @staticmethod
+    def _manager_errcode(output: str) -> int:
+        """读取 MuMuManager JSON 输出中的 errcode；无此字段视为成功。"""
+        try:
+            data = json.loads(output)
+        except json.JSONDecodeError:
+            return 0
+        try:
+            return int(data.get("errcode", 0)) if isinstance(data, dict) else 0
+        except (TypeError, ValueError):
+            return 0
 
     def shutdown_player(self, vmindex: int) -> bool:
         """关闭指定实例。"""
@@ -328,6 +354,8 @@ class MuMuClient:
             self._run_manager("setting", "-v", str(vmindex), "-k", "dynamic_low_frame_rate_limit", "-val", "30")
             self._run_manager("setting", "-v", str(vmindex), "-k", "max_frame_rate", "-val", "60")
             self._run_manager("setting", "-v", str(vmindex), "-k", "renderer_strategy", "-val", "perf")
+        # MuMu 把 dx 存为“稳定”渲染（OpenGL）；Vulkan 下两路录制曾多次显卡驱动崩溃。下次开机生效。
+        self._run_manager("setting", "-v", str(vmindex), "-k", "renderer_mode", "-val", "dx")
 
         # 兼容旧代码显式传入 show_window 的情况
         effective_mode = window_mode

@@ -2,6 +2,7 @@
 
 计划切片只由 segment muxer 在关键帧处分装；不重启采集、不复制重叠内容。
 实际切点依赖关键帧，不能承诺任意秒数精确切割。此传输当前仅支持 Windows。
+设置总时长时由分装器在录像时间轴上截止（-t），最后一片在总时长处封口。
 """
 from collections import deque
 from dataclasses import dataclass
@@ -24,6 +25,8 @@ from src.worker.scrcpy_probe import PipelineLogDrainer
 from src.worker.stream_monitor import StreamMonitor
 
 log = logging.getLogger(__name__)
+
+SEGMENT_TIME_DELTA = 0.05
 
 
 class NamedPipeBridge:
@@ -139,7 +142,7 @@ class ContinuousPipeline:
     """一代采集会话只有一个 scrcpy 和一个 segmenter；故障恢复才另起一代。"""
     def __init__(self, serial, output_dir, scrcpy_exe, adb_exe, segment_duration_sec,
                  ffmpeg_exe=None, max_size=1280, bit_rate='4M', max_fps=None,
-                 start_index=1, producer_factory=None):
+                 start_index=1, producer_factory=None, total_duration_sec=0):
         self.serial, self.output_dir = serial, Path(output_dir).resolve()
         self.scrcpy_exe, self.adb_exe = Path(scrcpy_exe), Path(adb_exe)
         self.ffmpeg_exe = str(ffmpeg_exe or shutil.which('ffmpeg') or '')
@@ -148,6 +151,8 @@ class ContinuousPipeline:
         if segment_duration_sec <= 0 or start_index < 1:
             raise ValueError('分段时长和起始序号必须为正数')
         self.segment_duration_sec = segment_duration_sec
+        self.total_duration_sec = max(0.0, float(total_duration_sec or 0))
+        self.limit_reached = False
         self.start_index = start_index
         self.max_size, self.bit_rate, self.max_fps = max_size, bit_rate, max_fps
         self.producer_factory = producer_factory
@@ -176,10 +181,14 @@ class ContinuousPipeline:
         self.bridge = NamedPipeBridge()
         flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0
         self._mux_log = (self.directory/'segmenter.stderr.log').open('xb')
+        limit = []
+        if self.total_duration_sec:
+            # 切点允许提前 delta；截止点同样提前 delta，避免恰在总时长前的关键帧开出极短尾片。
+            limit = ['-t', f'{max(.1, self.total_duration_sec - SEGMENT_TIME_DELTA):.3f}']
         mux_cmd = [self.ffmpeg_exe,'-hide_banner','-loglevel','warning','-nostdin','-n',
-            '-f','matroska','-i','pipe:0','-map','0:v:0','-map','0:a:0','-c','copy',
+            '-f','matroska','-i','pipe:0','-map','0:v:0','-map','0:a:0','-c','copy',*limit,
             '-f','segment','-segment_time',str(self.segment_duration_sec),
-            '-segment_time_delta','0.05','-reset_timestamps','1',
+            '-segment_time_delta',str(SEGMENT_TIME_DELTA),'-reset_timestamps','1',
             '-segment_start_number',str(self.start_index),'-segment_format','mp4',
             '-segment_list',str(self.directory/'segments.csv'),'-segment_list_type','csv',
             '-progress','pipe:1',str(self.directory/'part_%06d.mp4')]
@@ -212,10 +221,7 @@ class ContinuousPipeline:
             else:
                 self._proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
                     text=True,encoding='utf8',errors='replace',env=env,creationflags=flags)
-            def capture_log(line):
-                self.logs.append(line)
-                log.info('[capture] %s',line)
-            self._capture_drainer=PipelineLogDrainer(self._proc,on_log_line=capture_log)
+            self._capture_drainer=PipelineLogDrainer(self._proc,on_log_line=self._log_capture_line)
             self._capture_drainer.start()
             self.started_at=time.monotonic()
             until=self.started_at+timeout_sec
@@ -232,6 +238,14 @@ class ContinuousPipeline:
         except BaseException:
             self.stop(timeout_sec=8)
             raise
+
+    def _log_capture_line(self, line):
+        self.logs.append(line)
+        # 分装器按总时长正常结束后关闭管道，scrcpy 随后写不进收尾数据并报 ERROR，属预期收尾。
+        if self.total_duration_sec and self._mux and self._mux.poll()==0:
+            log.info('[capture] (已录满总时长，预期收尾) %s',line)
+        else:
+            log.info('[capture] %s',line)
 
     def fragments(self):
         completed=read_fragment_manifest(self.directory)
@@ -251,6 +265,9 @@ class ContinuousPipeline:
                     and self._mux.poll() is None and self.bridge and not self.bridge.error)
 
     def get_exit_code(self):
+        if self.limit_reached:
+            # 分装器截止后字节桥写入失败、scrcpy 随之报错都是预期收尾，只看分装器是否正常结束。
+            return 0 if self._mux and self._mux.poll()==0 else 30
         if self.forced_stop or (self.bridge and self.bridge.error):return 30
         codes=[p.poll() for p in (self._proc,self._mux) if p]
         if any(c not in (None,0) for c in codes):return next(c for c in codes if c not in (None,0))
@@ -260,8 +277,29 @@ class ContinuousPipeline:
         # 传输进度单调累积，物理切片换文件不能触发文件倒退误报。
         return (self.bridge.bytes_forwarded if self.bridge else 0)/1048576
 
+    def media_time(self):
+        """分装器已写出的录像时间轴位置（秒）；尚无进度时为 None。"""
+        for key in ('out_time_us','out_time_ms'):  # ffmpeg 的 out_time_ms 实际也是微秒
+            try:
+                return max(0.0,int(self.progress.get(key))/1e6)
+            except (TypeError,ValueError):
+                continue
+        return None
+
     def get_current_segment_elapsed(self):
-        return max(0,time.monotonic()-self.started_at)
+        media=self.media_time()
+        if media is None:return 0.0
+        cut=max((f.end_pts for f in self._fragments.values() if f.closed and f.end_pts is not None),default=0.0)
+        return max(0.0,media-cut)
+
+    def reached_total_duration(self):
+        """分装器按 -t 正常结束即为录满总时长；其他原因退出仍按采集故障处理。"""
+        if self.limit_reached:return True
+        if not self.total_duration_sec or not self._mux or self._mux.poll()!=0:return False
+        if self._progress_thread:self._progress_thread.join(timeout=2)
+        media=self.media_time()
+        self.limit_reached=media is not None and media>=self.total_duration_sec-1.0
+        return self.limit_reached
 
     def failure_details(self):
         tail=''

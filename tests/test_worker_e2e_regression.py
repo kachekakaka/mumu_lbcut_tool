@@ -125,6 +125,7 @@ class TestWorkerE2ERegression(unittest.TestCase):
         stream = io.StringIO()
         with tempfile.TemporaryDirectory() as tmp_dir, \
              patch("src.worker.controller.MuMuClient") as mock_mumu, \
+             patch("src.worker.controller.DependencyManager"), \
              patch("src.worker.controller.WorkerNavigator") as mock_nav_cls, \
              patch("src.worker.continuous_session.ContinuousSession") as mock_session:
             mock_mumu.return_value.launch_player.return_value = True

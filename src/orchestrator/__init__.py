@@ -1,7 +1,7 @@
 """录播调度平台核心 SDK 与调用接口包。
 
 导出组件：
-- InstancePool: MuMu 模拟器实例池调度与状态隔离
+- InstancePool: MuMu 实例在线状态查询与抖音复位
 - InstanceSlot, InstanceStatus: 实例槽位与状态
 - WorkerProcessHandle: Worker 独立子进程控制句柄与异步 NDJSON 事件监听
 - WorkerLaunchSpec: Worker 启动规格参数

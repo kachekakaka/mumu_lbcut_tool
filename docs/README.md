@@ -27,7 +27,10 @@ docs/
 │  ├─ [20261101-开录前置门禁与视觉看门狗技术验证.md](证据/验证/20261101-开录前置门禁与视觉看门狗技术验证.md)
 │  ├─ [20261108-截图容错修复与15分钟实机验证.md](证据/验证/20261108-截图容错修复与15分钟实机验证.md)
 │  ├─ [20261108-运行期遮挡探针改用窗口状态验证.md](证据/验证/20261108-运行期遮挡探针改用窗口状态验证.md)
-│  └─ [20261109-冻结检测改用录像流实机验证.md](证据/验证/20261109-冻结检测改用录像流实机验证.md)
+│  ├─ [20261109-冻结检测改用录像流实机验证.md](证据/验证/20261109-冻结检测改用录像流实机验证.md)
+│  ├─ [20261111-录制自动恢复台式机实机验证.md](证据/验证/20261111-录制自动恢复台式机实机验证.md)
+│  ├─ [20261111-稳定渲染默认与Worker日志落盘验证.md](证据/验证/20261111-稳定渲染默认与Worker日志落盘验证.md)
+│  └─ [20261111-冷启动重试与导航取证修正验证.md](证据/验证/20261111-冷启动重试与导航取证修正验证.md)
 └─ adr/
    ├─ [0001-scrcpy-pipeline-for-audio-video-isolation.md](adr/0001-scrcpy-pipeline-for-audio-video-isolation.md)
    ├─ [0002-time-segmented-mp4-recording.md](adr/0002-time-segmented-mp4-recording.md)
@@ -41,12 +44,14 @@ docs/
    ├─ [0011-worker-responsibility-purification-and-offline-decoupling.md](adr/0011-worker-responsibility-purification-and-offline-decoupling.md)
    ├─ [0012-continuous-capture-segment-muxer.md](adr/0012-continuous-capture-segment-muxer.md)
    ├─ [0013-freeze-detection-from-captured-stream.md](adr/0013-freeze-detection-from-captured-stream.md)
-   └─ [0014-remove-restart-mode-and-dual-pipeline.md](adr/0014-remove-restart-mode-and-dual-pipeline.md)
+   ├─ [0014-remove-restart-mode-and-dual-pipeline.md](adr/0014-remove-restart-mode-and-dual-pipeline.md)
+   └─ [0015-auto-retry-while-live-without-manual-unblock.md](adr/0015-auto-retry-while-live-without-manual-unblock.md)
 
 archive/docs/                       仓库根目录下，按需
 ├─ 方案/
 │  ├─ [20261101-未登录弹窗阻断治理与门禁加固方案.md](../archive/docs/方案/20261101-未登录弹窗阻断治理与门禁加固方案.md)
-│  └─ [20261109-冻结检测改用录像流与旧录制路径清理方案.md](../archive/docs/方案/20261109-冻结检测改用录像流与旧录制路径清理方案.md)
+│  ├─ [20261109-冻结检测改用录像流与旧录制路径清理方案.md](../archive/docs/方案/20261109-冻结检测改用录像流与旧录制路径清理方案.md)
+│  └─ [20261110-录制自动恢复与运行期误判修正方案.md](../archive/docs/方案/20261110-录制自动恢复与运行期误判修正方案.md)
 └─ adr/                             已失效或被替代的决定
    └─ [0009-overlapping-dual-pipeline-seamless-slicing.md](../archive/docs/adr/0009-overlapping-dual-pipeline-seamless-slicing.md)
 ```

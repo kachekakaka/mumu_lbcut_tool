@@ -77,6 +77,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--web-rid", default=None, help="内部场次 ID 的网页入口备用值")
     parser.add_argument("--expected-anchor-uid", default=None, help="独立解析的主播 UID，不是 room_id")
     parser.add_argument("--job-id", default=None, help="调度任务关联标识")
+    parser.add_argument("--event-log", default=None,
+                        help="事件日志路径：stdout 断开（调度主控已退出）后事件改为追加到此文件，并平滑封口退出")
+    parser.add_argument("--log-file", default=None,
+                        help="运行日志另存路径（追加）；stderr 照常输出")
     return parser
 
 
@@ -147,7 +151,17 @@ def main(argv: list[str] | None = None) -> int:
         window_mode=eff_window_mode,
         window_pos_x=args.window_pos_x,
         window_pos_y=args.window_pos_y,
+        event_log_path=Path(args.event_log) if args.event_log else None,
     )
+
+    log_handler = None
+    if args.log_file:
+        # 由 Worker 自己写文件：主控被强杀后 stderr 管道失效，封口阶段的日志仍需保留。
+        Path(args.log_file).parent.mkdir(parents=True, exist_ok=True)
+        log_handler = logging.FileHandler(args.log_file, encoding="utf-8")
+        log_handler.setFormatter(logging.Formatter(
+            "[%(asctime)s] [%(levelname)s] (Worker) %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+        logging.getLogger().addHandler(log_handler)
 
     controller = WorkerController(config=config)
 
@@ -161,8 +175,12 @@ def main(argv: list[str] | None = None) -> int:
     if hasattr(signal, "SIGBREAK"):
         signal.signal(signal.SIGBREAK, _signal_handler)
 
-    exit_code = controller.run()
-    return exit_code
+    try:
+        return controller.run()
+    finally:
+        if log_handler:
+            logging.getLogger().removeHandler(log_handler)
+            log_handler.close()
 
 
 if __name__ == "__main__":

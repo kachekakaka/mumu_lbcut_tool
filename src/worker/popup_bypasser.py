@@ -21,6 +21,7 @@ class PopupBypasser:
         (r"更新|发现新版本", r"以后再说|暂不更新|取消"),
         (r"服务协议|隐私政策", r"同意并继续|同意|我知道了"),
         (r"通讯录|朋友推荐", r"拒绝|暂不|取消"),
+        (r"向您发送通知", r"不允许"),
     ]
 
     def __init__(self, adb_client: AdbDeviceClient):
@@ -104,7 +105,8 @@ class PopupBypasser:
                 )
                 for m in node_matches:
                     text, x1, y1, x2, y2 = m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(4)), int(m.group(5))
-                    if re.search(btn_re, text):
+                    # 按钮文案整段匹配：首次启动协议框的“不同意”排在“同意”之前，子串匹配会点错。
+                    if re.fullmatch(btn_re, text.strip()):
                         cx = (x1 + x2) // 2
                         cy = (y1 + y2) // 2
                         logger.info(f"命中白名单关闭按钮: text='{text}', 坐标=({cx}, {cy})，执行穿透点击...")

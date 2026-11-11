@@ -49,7 +49,7 @@ def wait_for(predicate, timeout):
     return predicate()
 
 
-def test_motion_then_still_picture_triggers_freeze_only_in_still_part():
+def test_still_picture_with_real_frames_is_static_not_frozen():
     data = make_mkv(30, 10, vf='tpad=stop_mode=clone:stop_duration=30', total=40)
     monitor = StreamMonitor(FFMPEG)
     per_second = {}
@@ -77,17 +77,19 @@ def test_motion_then_still_picture_triggers_freeze_only_in_still_part():
     pipe = SimpleNamespace(is_recording=lambda: True, monitor=Replay(), size=0)
     pipe.get_current_file_size_mb = lambda: pipe.size
     nav = SimpleNamespace(get_current_focus_activity=lambda: 'LivePlayActivity')
-    actions, motions = [], {}
+    actions, motions, static = [], {}, {}
     dog = StallWatchdog(pipe, nav, 'room', generation_provider=lambda: 1,
                         on_post_action=lambda a: actions.append((pipe.monitor.second, a)))
     for second in range(40):
         pipe.monitor.second, pipe.size = second, second + 1
         dog.check_once(float(second))
         motions[second] = dog.snapshot().video_motion
+        static[second] = dog.snapshot().picture_static_sec
     assert all(motions[s] > .003 for s in (5, 10))
-    assert actions and actions[0][0] == 25
-    assert actions[0][1].action_type == ActionType.IN_PLACE_HEAL and actions[0][1].reason == 'video_frozen'
-    assert all(a.reason == 'video_frozen' for _, a in actions)
+    # 静止画面每秒仍有真实解码帧：只计静止时长，不投递冻结恢复动作。
+    assert actions == []
+    assert static[10] == 0 and static[25] >= 10 and static[39] >= 24
+    assert dog.snapshot().video_frozen_sec == 0
 
 
 def test_killed_analyzer_rejoins_from_next_cluster_without_counting_decode_noise(tmp_path):

@@ -1,9 +1,12 @@
 """Worker NDJSON 标准事件流协议与发射器。"""
+from collections import deque
 from dataclasses import asdict, dataclass
 import json
+from pathlib import Path
 import sys
+import threading
 import time
-from typing import Any, TextIO
+from typing import Callable, TextIO
 import uuid
 
 
@@ -56,6 +59,7 @@ class StallDetectedEvent(BaseWorkerEvent):
     event: str = "stall_detected"
     stall_duration_sec: float = 0.0
     action: str = "intent_refresh"
+    reason: str = ""
 
 
 @dataclass
@@ -138,11 +142,24 @@ class RoomNavigationEvent(BaseWorkerEvent):
 
 
 class WorkerEventEmitter:
-    """负责将 Worker 内部生命周期事件以单行 JSON 格式流式输出至指定流（默认 stdout）。"""
+    """负责将 Worker 内部生命周期事件以单行 JSON 格式流式输出至指定流（默认 stdout）。
 
-    def __init__(self, stream: TextIO | None = None):
+    读端消失（调度主控已退出）时写入会失败：此后事件改为追加到 fallback_path，
+    并通知 on_stream_lost 让 Worker 平滑封口。管道缓冲中可能有已写出但主控来不及读取的
+    事件，所以切换时先补写最近的事件；重放按 event_id 去重。
+    """
+    RECENT_LIMIT = 200
+
+    def __init__(self, stream: TextIO | None = None, fallback_path: Path | str | None = None,
+                 on_stream_lost: Callable[[], None] | None = None):
         self.stream = stream or sys.stdout
         self.context: dict = {}
+        self.fallback_path = Path(fallback_path) if fallback_path else None
+        self.on_stream_lost = on_stream_lost
+        self.stream_lost = False
+        self._fallback = None
+        self._recent: deque[str] = deque(maxlen=self.RECENT_LIMIT)
+        self._lock = threading.Lock()
 
     def set_context(self, **values):
         self.context.update(values)
@@ -150,6 +167,54 @@ class WorkerEventEmitter:
     def emit(self, event_obj: BaseWorkerEvent):
         """发射单行 JSON。"""
         payload = {**self.context, **asdict(event_obj)}
-        line = json.dumps(payload, ensure_ascii=False)
-        self.stream.write(line + "\n")
-        self.stream.flush()
+        line = json.dumps(payload, ensure_ascii=False) + "\n"
+        lost_now = False
+        with self._lock:
+            if not self.stream_lost:
+                try:
+                    self.stream.write(line)
+                    self.stream.flush()
+                    self._recent.append(line)
+                    return
+                except (OSError, ValueError):
+                    self.stream_lost = lost_now = True
+                    self._open_fallback()
+            self._write_fallback(line)
+        if lost_now and self.on_stream_lost:
+            self.on_stream_lost()
+
+    def _open_fallback(self):
+        if not self.fallback_path:
+            return
+        try:
+            with open(self.fallback_path, "ab") as raw:
+                # 主控被强杀时最后一行可能不完整；补换行，不能把下一条事件接在残行后面。
+                if raw.tell():
+                    with open(self.fallback_path, "rb") as check:
+                        check.seek(-1, 2)
+                        if check.read(1) != b"\n":
+                            raw.write(b"\n")
+            self._fallback = open(self.fallback_path, "a", encoding="utf-8", buffering=1)
+            for line in self._recent:
+                self._fallback.write(line)
+            self._fallback.flush()
+        except OSError:
+            self._fallback = None
+
+    def _write_fallback(self, line: str):
+        if self._fallback is None:
+            return
+        try:
+            self._fallback.write(line)
+            self._fallback.flush()
+        except OSError:
+            self._fallback = None
+
+    def close(self):
+        with self._lock:
+            if self._fallback is not None:
+                try:
+                    self._fallback.close()
+                except OSError:
+                    pass
+                self._fallback = None

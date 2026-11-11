@@ -63,6 +63,7 @@ class WorkerConfig:
     expected_anchor_uid: str | None = None
     job_id: str | None = None
     navigation_timeout_sec: float = 300.0  # 从目标定位到开录就绪的总时限
+    event_log_path: Path | None = None     # 事件 stdout 断开（主控已退出）后改写到此日志
 
 
 class WorkerController:
@@ -75,13 +76,14 @@ class WorkerController:
     def __init__(self, config: WorkerConfig, emitter: WorkerEventEmitter | None = None):
         validate_navigation_timeout(config.navigation_timeout_sec)
         self.config = config
-        self.emitter = emitter or WorkerEventEmitter(stream=sys.stdout)
+        self.emitter = emitter or WorkerEventEmitter(stream=sys.stdout, fallback_path=config.event_log_path)
+        self.emitter.on_stream_lost = lambda: self.request_stop("event_stream_lost")
         self.stop_requested = False
+        self._stop_reason = ""
         self._fatal_error = False
+        self._exit_code = 0               # 录制期确认的专用退出码（如设备离线 20）
         self._login_blocked = False
         self._last_segment_failed = False
-        self._total_crash_count = 0
-        self.MAX_RECOVERY_RETRIES = 3
 
         # 权威任务级目录隔离 (原子排他)
         self.run_id = f"run_{int(time.time())}_{uuid.uuid4().hex}"
@@ -112,8 +114,10 @@ class WorkerController:
         self.target_room_id: str = ""
         self.target_uid: str = ""
 
-    def request_stop(self):
+    def request_stop(self, reason: str = "stop_requested"):
         """外部中断信号触发平稳停止，立即推进状态机。"""
+        if not self.stop_requested:
+            self._stop_reason = reason
         self.stop_requested = True
         if self.state_machine.state in {WorkerState.RECORDING, WorkerState.RECOVERING}:
             try:
@@ -128,7 +132,7 @@ class WorkerController:
             code = self._run_inner()
         except InterruptedError:
             code = EXIT_SUCCESS if self.stop_requested else EXIT_RECORDING_FAILED
-            self._failure_reason = "stop_requested" if self.stop_requested else "startup_interrupted"
+            self._failure_reason = self._stop_reason if self.stop_requested else "startup_interrupted"
         except Exception as exc:
             logger.exception("Worker 未处理异常")
             self._fatal_error = True
@@ -141,8 +145,11 @@ class WorkerController:
         if code:
             self.emitter.emit(WorkerFailedEvent(exit_code=code, reason=self._failure_reason or "worker_failed"))
         self.emitter.emit(WorkerStoppedEvent(exit_code=code,
-            reason=self._failure_reason or ("stop_requested" if self.stop_requested else "completed"),
+            reason=self._failure_reason or (self._stop_reason if self.stop_requested else "completed"),
             had_segment_errors=self._had_segment_errors))
+        close = getattr(self.emitter, "close", None)
+        if close:
+            close()
         return code
 
     def _run_inner(self) -> int:
@@ -227,15 +234,15 @@ class WorkerController:
             self._cleanup(instance_lock)
 
     def _consume_recovery_budget(self) -> bool:
+        """5 分钟内最多恢复 2 次；不设整场上限，频繁失败交给调度器退避后重开。"""
         now = time.monotonic()
         while self._recovery_times and now - self._recovery_times[0] > 300:
             self._recovery_times.popleft()
-        if self._total_crash_count >= self.MAX_RECOVERY_RETRIES or len(self._recovery_times) >= 2:
+        if len(self._recovery_times) >= 2:
             self._failure_reason = "recovery_budget_exhausted"
             self._fatal_error = True
             self.request_stop()
             return False
-        self._total_crash_count += 1
         self._recovery_times.append(now)
         return True
 

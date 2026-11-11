@@ -73,5 +73,72 @@ class TestWorkerEvents(unittest.TestCase):
         self.assertTrue(seg2["is_final"])
 
 
+class BrokenAfter:
+    """前 n 次写入成功，之后像读端已关闭的管道一样报错。"""
+    def __init__(self, n):
+        self.n, self.lines = n, []
+    def write(self, text):
+        if len(self.lines) >= self.n:
+            raise OSError(22, "Invalid argument")
+        self.lines.append(text)
+    def flush(self):
+        pass
+
+
+def test_stream_loss_switches_to_journal_and_requests_stop(tmp_path):
+    journal = tmp_path / "job.ndjson"
+    journal.write_text('{"event": "worker_started", "event_id": "a"}\n{"event": "heart', encoding="utf-8")
+    lost = []
+    emitter = WorkerEventEmitter(BrokenAfter(2), fallback_path=journal, on_stream_lost=lambda: lost.append(1))
+    for i in range(4):
+        emitter.emit(HeartbeatEvent(elapsed_sec=i))
+    emitter.close()
+    assert lost == [1] and emitter.stream_lost
+    lines = journal.read_text(encoding="utf-8").splitlines()
+    assert lines[1] == '{"event": "heart'
+    events = [json.loads(line) for line in lines[2:]]
+    # 补写已写入管道的最近事件，按 event_id 去重后四条心跳一条不少。
+    assert [e["elapsed_sec"] for e in events] == [0, 1, 2, 3]
+
+
+def test_stream_loss_without_journal_still_requests_stop():
+    lost = []
+    emitter = WorkerEventEmitter(BrokenAfter(0), on_stream_lost=lambda: lost.append(1))
+    emitter.emit(HeartbeatEvent())
+    emitter.emit(HeartbeatEvent())
+    assert lost == [1]
+
+
+def test_real_closed_stdout_pipe_switches_to_journal(tmp_path):
+    import subprocess
+    import sys
+    import time
+    from pathlib import Path
+    journal = tmp_path / "job.ndjson"
+    journal.touch()
+    script = (
+        "import sys,time\n"
+        "from src.worker.events import WorkerEventEmitter, HeartbeatEvent\n"
+        "stopped=[]\n"
+        f"e=WorkerEventEmitter(sys.stdout, fallback_path={str(journal)!r}, on_stream_lost=lambda: stopped.append(1))\n"
+        "for i in range(200):\n"
+        "    e.emit(HeartbeatEvent(elapsed_sec=i))\n"
+        "    if stopped: break\n"
+        "    time.sleep(.05)\n"
+        "e.emit(HeartbeatEvent(elapsed_sec=-1, status='stopped'))\n"
+        "e.close()\n"
+        "sys.exit(0 if stopped else 3)\n")
+    root = Path(__file__).resolve().parents[1]
+    proc = subprocess.Popen([sys.executable, "-u", "-c", script], cwd=root, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, text=True)
+    for _ in range(3):
+        proc.stdout.readline()
+    proc.stdout.close()
+    assert proc.wait(timeout=30) == 0
+    events = [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines()]
+    assert events[-1]["status"] == "stopped"
+    assert [e["elapsed_sec"] for e in events[:3]] == [0, 1, 2]
+
+
 if __name__ == "__main__":
     unittest.main()

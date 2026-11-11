@@ -86,6 +86,36 @@ class TestMuMuClient(unittest.TestCase):
             client.optimize_performance_for_recording(2, show_window=False)
             mock_apply.assert_called_with(2, window_mode="hidden", pos_x=None, pos_y=None)
 
+    def test_launch_retries_while_main_service_not_ready(self):
+        client = MuMuClient()
+        busy = '{"errcode": -503, "errmsg": "mainnx connect failed"}'
+        with patch.object(client, "ensure_main_process_running"), \
+             patch.object(client, "_run_manager", side_effect=[busy, busy, '{"errcode": 0}']) as manager, \
+             patch.object(client, "is_android_started", side_effect=[False, False, False, False, True]), \
+             patch("src.mvp.mumu_client.time.sleep"):
+            self.assertTrue(client.launch_player(2))
+        self.assertEqual(manager.call_count, 3)
+        manager.assert_called_with("control", "-v", "2", "launch")
+
+    def test_launch_gives_up_retrying_after_window(self):
+        client = MuMuClient()
+        busy = '{"errcode": -503, "errmsg": "mainnx connect failed"}'
+        clock = iter(range(0, 10000, 10))
+        with patch.object(client, "ensure_main_process_running"), \
+             patch.object(client, "_run_manager", return_value=busy) as manager, \
+             patch.object(client, "is_android_started", return_value=False), \
+             patch("src.mvp.mumu_client.time.sleep"), \
+             patch("src.mvp.mumu_client.time.time", side_effect=lambda: next(clock)):
+            self.assertFalse(client.launch_player(2, timeout_sec=30))
+        self.assertLessEqual(manager.call_count, 6)
+
+    def test_optimize_performance_sets_stable_renderer(self):
+        client = MuMuClient()
+        with patch.object(client, "_run_manager") as mock_manager, \
+             patch.object(client, "mute_player"), patch.object(client, "apply_window_display_mode"):
+            client.optimize_performance_for_recording(2, disable_dynamic_fps=False)
+        mock_manager.assert_called_once_with("setting", "-v", "2", "-k", "renderer_mode", "-val", "dx")
+
 
 if __name__ == "__main__":
     unittest.main()

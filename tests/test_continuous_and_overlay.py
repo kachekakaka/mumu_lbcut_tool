@@ -50,6 +50,23 @@ def test_no_window_and_no_control_are_used_for_continuous_capture():
     assert '-r' not in [p.strip("'\"") for p in source.split(',')]
 
 
+def test_capture_error_after_total_duration_cutoff_is_tagged_expected(tmp_path,caplog):
+    import logging
+    from types import SimpleNamespace
+    caplog.set_level(logging.INFO,logger='src.worker.continuous_pipeline')
+    line='ERROR: Failed to write trailer to \\\\.\\pipe\\mumu_capture_x'
+    p=ContinuousPipeline('synthetic',tmp_path,Path('scrcpy.exe'),Path('adb.exe'),2,total_duration_sec=300)
+    p._mux=SimpleNamespace(poll=lambda:None)
+    p._log_capture_line(line)
+    p._mux=SimpleNamespace(poll=lambda:0)
+    p._log_capture_line(line)
+    p.total_duration_sec=0
+    p._log_capture_line(line)
+    messages=[r.getMessage() for r in caplog.records]
+    assert messages==['[capture] '+line,'[capture] (已录满总时长，预期收尾) '+line,'[capture] '+line]
+    assert list(p.logs)==[line]*3
+
+
 def test_real_controller_rotates_without_restarting_capture(monkeypatch,tmp_path,valid_media):
     from worker_harness import build_worker,assert_paired
     # 只替换 capture/muxer 输出边界；Controller、事件、封口校验、会话均真实执行。

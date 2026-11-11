@@ -1,4 +1,4 @@
-"""单机最小调度器：持久化核对、FIFO、异步扫描、有限重试和保守重启对账。"""
+"""单机最小调度器：持久化核对、FIFO、异步扫描、在播期间退避重试、实例自动同步与复位、重启对账。"""
 from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
@@ -13,10 +13,14 @@ from src.mvp.room_resolver import ResolvedRoom, RoomStatus
 from src.orchestrator.instance_pool import InstancePool
 from src.orchestrator.models import WorkerLaunchSpec
 from src.orchestrator.room_scanner import RoomScanner
-from src.orchestrator.storage import Store
+from src.orchestrator.storage import NEEDS_FIX, Store
 from src.orchestrator.worker_process import WorkerProcessHandle
 
 logger = logging.getLogger(__name__)
+
+# 旧主控遗留的 Worker 写 stdout 失败后会自行封口退出（心跳间隔 3 秒）；超过此时限才转人工对账。
+OLD_WORKER_EXIT_WAIT_SEC = 120.0
+OLD_WORKER_PROBE_INTERVAL_SEC = 2.0
 
 
 class HostLease:
@@ -86,7 +90,7 @@ class Scheduler:
     def __init__(self, store: Store, output_dir: Path, instance_indices: list[int],
                  pool=None, scanner=None, handle_factory=WorkerProcessHandle,
                  clock=time.time, process_probe=inspect_job_process,
-                 scan_interval_sec: float = 30.0, max_attempts: int = 3,
+                 scan_interval_sec: float = 30.0,
                  ended_interval_sec: float = 10.0, auto_scan: bool = True,
                  segment_duration_sec: int = 1800, navigation_timeout_sec: float = 300.0):
         from src.worker.room_locator import validate_navigation_timeout
@@ -98,13 +102,13 @@ class Scheduler:
         self.output_dir = Path(output_dir).resolve()
         self.allowed = set(instance_indices)
         self.scan_interval = max(.1, scan_interval_sec)
-        self.max_attempts, self.ended_interval = max_attempts, ended_interval_sec
+        self.ended_interval = ended_interval_sec
         self.auto_scan, self.segment_duration = auto_scan, segment_duration_sec
         self.scanner = scanner or RoomScanner()
         self.pool = pool or InstancePool()
         self.handle_factory, self.process_probe = handle_factory, process_probe
         self._lease = HostLease(store.path.with_suffix(".host.lock"))
-        self._queries = ThreadPoolExecutor(max_workers=max(2, len(self.allowed) + 1), thread_name_prefix="scheduler-query")
+        self._queries = ThreadPoolExecutor(max_workers=2 * len(self.allowed) + 2, thread_name_prefix="scheduler-query")
         self._stoppers = ThreadPoolExecutor(max_workers=len(self.allowed), thread_name_prefix="scheduler-stop")
         self._events: queue.Queue = queue.Queue(maxsize=8192)
         self._event_pending = None
@@ -112,6 +116,10 @@ class Scheduler:
         self._scan_future = None
         self._scan_requested = []
         self._next_scan = 0.0
+        self._refresh_future, self._refresh_started = None, 0.0
+        self._resets = {}
+        self._waiting_exit = {}
+        self._next_waiting_probe = 0.0
         self._shutdown = False
         self._closed = False
         try:
@@ -195,6 +203,7 @@ class Scheduler:
                         target = db.execute("SELECT id FROM targets WHERE id=? AND enabled=1", (subject,)).fetchone()
                         if not target:
                             raise ValueError("目标不存在或已移除")
+                        db.execute("UPDATE targets SET note=NULL WHERE id=? AND note LIKE ?", (subject, NEEDS_FIX + "%"))
                         active = db.execute("SELECT id FROM jobs WHERE target_id=? AND status IN ('pending','starting','running','stopping','needs_reconcile')", (subject,)).fetchone()
                         if not active:
                             db.execute("UPDATE targets SET manual_requested=1,suppressed_session=NULL,attempts=0,retry_at=0 WHERE id=?", (subject,))
@@ -204,15 +213,6 @@ class Scheduler:
                             raise ValueError("目标不存在")
                     for job in self.store.rows("SELECT * FROM jobs WHERE target_id=? AND status IN ('pending','starting','running','stopping')", (subject,)):
                         self._stop_job(job["id"], "target_removed")
-                elif kind == "unblock":
-                    idx = int(subject)
-                    # 显式人工解封仍需重新发现设备，不能凭文件记录直接变空闲。
-                    slots = self.pool.refresh()
-                    if idx not in self.allowed or not any(s.vmindex == idx for s in slots):
-                        raise ValueError("实例不在允许列表或未发现")
-                    with self.store.transaction() as db:
-                        if not db.execute("UPDATE instances SET status='idle',reason=NULL WHERE vmindex=? AND job_id IS NULL", (idx,)).rowcount:
-                            raise ValueError("实例仍被任务占用，需要先对账")
                 elif kind == "reconcile":
                     self.reconcile(subject or None)
                 self.store.complete_command(command["id"])
@@ -233,6 +233,36 @@ class Scheduler:
         if self.auto_scan and self._scan_future is None and now >= self._next_scan and not self._shutdown:
             self._scan_requested = [t["raw"] for t in self.store.rows("SELECT raw FROM targets WHERE enabled=1")]
             self._scan_future = self._queries.submit(self.scanner.scan, self._scan_requested)
+            if self._refresh_future is None:
+                self._refresh_started = now
+                self._refresh_future = self._queries.submit(self.pool.refresh)
+
+    def _instances(self):
+        """收取实例刷新结果，并在后台复位登录强阻断后的实例。"""
+        if self._refresh_future and self._refresh_future.done():
+            try:
+                slots = self._refresh_future.result()
+            except Exception:
+                logger.exception("实例查询失败，保留原状态")
+            else:
+                self.store.sync_instances(slots, self.allowed, self._refresh_started)
+            self._refresh_future = None
+        for vmindex, future in list(self._resets.items()):
+            if not future.done():
+                continue
+            self._resets.pop(vmindex)
+            try:
+                ok = bool(future.result())
+            except Exception:
+                logger.exception("实例 %s 复位抖音异常", vmindex)
+                ok = False
+            self.store.finish_reset(vmindex, ok, self.clock())
+        if self._shutdown:
+            return
+        for slot in self.store.rows("SELECT vmindex FROM instances WHERE status='resetting' AND job_id IS NULL"):
+            index = slot["vmindex"]
+            if index in self.allowed and index not in self._resets:
+                self._resets[index] = self._queries.submit(self.pool.reset_app, index)
 
     def _reconcile_targets(self):
         now = self.clock()
@@ -254,7 +284,7 @@ class Scheduler:
                      and now - target["observed_at"] <= max(60, self.scan_interval * 2)
                      and (target["auto_record"] or target["manual_requested"])
                      and target["suppressed_session"] != target["session_key"]
-                     and target["attempts"] < self.max_attempts and now >= target["retry_at"])
+                     and not (target["note"] or "").startswith(NEEDS_FIX) and now >= target["retry_at"])
             if ready:
                 self.store.create_pending(target["id"], now)
 
@@ -307,7 +337,7 @@ class Scheduler:
             output_dir=self.output_dir / job_id, target_kind="room_id" if internal else "web_rid",
             web_rid=room.web_rid, expected_anchor_uid=getattr(room, "anchor_uid", None),
             allow_unconfirmed_identity=bool(target["allow_unconfirmed"]), job_id=job_id,
-            event_log_path=journal, segment_duration_sec=self.segment_duration,
+            event_log_path=journal, log_path=journal.with_suffix(".log"), segment_duration_sec=self.segment_duration,
             navigation_timeout_sec=self.navigation_timeout)
         # 先保存启动意图和产物关联，覆盖 Popen 后写 PID 前的异常窗口。
         with self.store.transaction() as db:
@@ -324,7 +354,7 @@ class Scheduler:
                 self._closing[job_id] = self._stoppers.submit(handle.stop, 60.0)
             else:
                 self._handles.pop(job_id, None)
-                # 启动失败也消耗一次重试，防止 Popen 错误无限重试。
+                # 启动失败计入失败次数，使退避间隔逐次加长。
                 with self.store.transaction() as db:
                     db.execute("UPDATE targets SET attempts=attempts+1 WHERE id=?", (target["id"],))
                 self.store.finish_job(job_id, 30, self.clock(), True, f"launch_failed: {exc}")
@@ -339,29 +369,66 @@ class Scheduler:
             if job["id"] in self._handles or job["id"] in self._verifying:
                 continue
             status = self.process_probe(job)
-            if status != "absent":
+            if status == "absent":
+                self._waiting_exit.pop(job["id"], None)
+                self._finish_orphan(job)
+            elif status == "alive":
+                # 新主控不在旧进程的控制台，发不出 Ctrl+Break；等 Worker 发现主控断开后自行封口。
+                if job["id"] not in self._waiting_exit:
+                    self._waiting_exit[job["id"]] = self.clock() + OLD_WORKER_EXIT_WAIT_SEC
+                    self.store.mark_waiting_exit(job["id"])
+            else:
+                self._waiting_exit.pop(job["id"], None)
                 self.store.finish_job(job["id"], 30, self.clock(), False,
-                                      "live_or_unowned_process_requires_reconciliation", hold_instance=True)
+                                      "unowned_process_requires_reconciliation", hold_instance=True)
+
+    def _watch_old_workers(self):
+        now = self.clock()
+        if not self._waiting_exit or now < self._next_waiting_probe:
+            return
+        self._next_waiting_probe = now + OLD_WORKER_PROBE_INTERVAL_SEC
+        for job_id, deadline in list(self._waiting_exit.items()):
+            job = self.store.row("SELECT * FROM jobs WHERE id=?", (job_id,))
+            if not job or job["status"] != "stopping":
+                self._waiting_exit.pop(job_id)
                 continue
-            complete = True
-            path = Path(job["event_log_path"]) if job["event_log_path"] else None
-            if path and path.exists():
-                try:
-                    with path.open(encoding="utf-8") as stream:
-                        for line in stream:
-                            if line.strip():
-                                self.store.record_event(job["id"], json.loads(line), self.clock())
-                except (OSError, ValueError):
-                    complete = False
-            self.store.finish_job(job["id"], 30, self.clock(), complete, "interrupted_host_restart")
-            with self.store.transaction() as db:
-                # 未知中断不自动续录同场，先保留证据，由用户显式 record 解除抑制。
-                db.execute("UPDATE targets SET suppressed_session=?,manual_requested=0 WHERE id=?", (job["session_key"], job["target_id"]))
+            status = self.process_probe(job)
+            if status == "absent":
+                self._waiting_exit.pop(job_id)
+                self._finish_orphan(job)
+            elif status != "alive" or now >= deadline:
+                self._waiting_exit.pop(job_id)
+                reason = "old_worker_did_not_exit" if status == "alive" else "unowned_process_requires_reconciliation"
+                self.store.finish_job(job_id, 30, now, False, reason, hold_instance=True)
+
+    def _finish_orphan(self, job: dict):
+        """进程已消失：重放 NDJSON 补齐事件，按其终止事件记录结果；不抑制本场，由退避规则续录。"""
+        complete, terminal = True, None
+        path = Path(job["event_log_path"]) if job["event_log_path"] else None
+        if path and path.exists():
+            try:
+                with path.open(encoding="utf-8") as stream:
+                    for line in stream:
+                        if line.strip():
+                            event = json.loads(line)
+                            self.store.record_event(job["id"], event, self.clock())
+                            if event.get("event") in ("worker_stopped", "worker_failed"):
+                                terminal = event
+            except (OSError, ValueError):
+                complete = False
+        code = terminal.get("exit_code") if terminal else None
+        code = 30 if code is None else int(code)
+        reason = (terminal or {}).get("reason") or "interrupted_host_restart"
+        stopped_at = (terminal or {}).get("timestamp")
+        self.store.finish_job(job["id"], code, self.clock(), complete and terminal is not None, reason,
+                              ended_at=stopped_at if isinstance(stopped_at, (int, float)) else None)
 
     def tick(self):
         self._collect()
         self._commands()
         self._scan()
+        self._instances()
+        self._watch_old_workers()
         self._reconcile_targets()
         self._dispatch()
         self._collect()

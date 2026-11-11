@@ -7,23 +7,19 @@ import time
 
 class InstanceStatus(Enum):
     """模拟器实例在调度池中的状态。"""
-    IDLE = "idle"            # 闲置就绪，可随时承接任务
+    IDLE = "idle"            # Android 已启动且无任务，可承接任务
     BUSY = "busy"            # 正在录制任务中
-    BLOCKED = "blocked"      # 遭遇严重阻断（如弹窗/登录阻断），需人工干预前被隔离
-    OFFLINE = "offline"      # 实例未启动或不可用
+    RESETTING = "resetting"  # 登录强阻断后正在冷启动抖音，不分配任务
+    OFFLINE = "offline"      # Android 未启动、未发现或 ADB 不通；重新在线后自动回到空闲
+    RECONCILE = "reconcile"  # 旧任务进程归属未确认，实例保留到人工对账
 
 
 @dataclass
 class InstanceSlot:
-    """模拟器实例槽位状态。"""
+    """一次实例扫描的结果：MuMu 报告 Android 已启动才视为在线。"""
     vmindex: int
     name: str = ""
     status: InstanceStatus = InstanceStatus.IDLE
-    current_target: str | None = None
-    current_job_id: str | None = None
-    last_acquired_at: float = 0.0
-    last_released_at: float = 0.0
-    blocked_reason: str | None = None
     raw_info: dict = field(default_factory=dict)
 
 
@@ -57,3 +53,4 @@ class WorkerLaunchSpec:
     expected_anchor_uid: str | None = None
     job_id: str | None = None
     event_log_path: Path | None = None
+    log_path: Path | None = None

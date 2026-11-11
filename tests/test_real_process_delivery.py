@@ -70,9 +70,11 @@ def test_actual_child_signal_tail_and_high_volume_logs(tmp_path, monkeypatch, va
         if event['event'] == 'segment_started':
             ready.set()
     handle = WorkerProcessHandle(WorkerLaunchSpec(1001, '123', tmp_path / 'recording',
-        job_id='owned-real-child', event_log_path=tmp_path / 'events.ndjson'), on_event=callback)
+        job_id='owned-real-child', event_log_path=tmp_path / 'events.ndjson', log_path=tmp_path / 'events.log'),
+        on_event=callback)
     handle.start()
     try:
+        assert handle.command[handle.command.index('--log-file') + 1] == str(tmp_path / 'events.log')
         assert ready.wait(5)
         assert handle.stop(timeout_sec=8) == 0
         assert handle.events_complete
@@ -129,7 +131,7 @@ def test_two_real_children_fifo_and_cli_stop(tmp_path, monkeypatch, valid_media)
         store.add_target(raw, allow_unconfirmed=True)
     scanner = RoomScanner(Resolver())
     pool = InstancePool(SimpleNamespace(list_available_instances=lambda: [
-        {'vmindex': i, 'name': f'Synthetic VM {i}'} for i in (1001, 1002)]))
+        {'vmindex': i, 'name': f'Synthetic VM {i}', 'android_started': True} for i in (1001, 1002)]))
     scheduler = Scheduler(store, tmp_path / 'recordings', [1001, 1002], pool=pool, scanner=scanner, auto_scan=False)
     def pump(predicate):
         deadline = time.monotonic() + 6

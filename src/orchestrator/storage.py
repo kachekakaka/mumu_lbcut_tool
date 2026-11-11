@@ -1,4 +1,4 @@
-"""最小调度持久化：SQLite 事务、活跃任务/实例唯一约束、幂等事件和人工命令。"""
+"""最小调度持久化：SQLite 事务、活跃任务/实例唯一约束、幂等事件、任务结果规则和人工命令。"""
 from contextlib import contextmanager
 import hashlib
 import json
@@ -12,6 +12,10 @@ import uuid
 from src.mvp.room_resolver import ResolvedRoom
 
 ACTIVE = ("pending", "starting", "running", "stopping", "needs_reconcile")
+NEEDS_FIX = "needs_fix: "          # targets.note 前缀：目标无效，停止自动开录直到 record 或重新添加
+RETRY_BASE_SEC, RETRY_MAX_SEC = 5, 300
+# 这些停止原因已由目标状态决定后续（移除、确认下播、换场、主控正常退出），无需退避。
+SETTLED_STOPS = ("target_removed", "anchor_offline", "live_session_changed", "scheduler_shutdown")
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS targets (
  id TEXT PRIMARY KEY, raw TEXT UNIQUE NOT NULL, canonical TEXT UNIQUE NOT NULL,
@@ -55,6 +59,19 @@ CREATE TABLE IF NOT EXISTS commands (
  status TEXT NOT NULL DEFAULT 'pending', result TEXT, created_at REAL NOT NULL
 );
 """
+
+
+def retry_delay(attempts: int) -> float:
+    """失败退避：5 秒起按次翻倍，最长 5 分钟，不限次数。"""
+    return min(RETRY_MAX_SEC, RETRY_BASE_SEC * 2 ** min(max(attempts - 1, 0), 6))
+
+
+def requested_total_duration(command_json: str | None) -> float:
+    try:
+        cmd = json.loads(command_json or "[]")
+        return float(cmd[cmd.index("--total-duration") + 1])
+    except (ValueError, IndexError, TypeError):
+        return 0.0
 
 
 def canonical_target(raw: str) -> str:
@@ -114,6 +131,7 @@ class Store:
         with self.transaction() as db:
             old = db.execute("SELECT id FROM targets WHERE canonical=?", (canonical,)).fetchone()
             if old:
+                db.execute("UPDATE targets SET note=NULL WHERE id=? AND note LIKE ?", (old[0], NEEDS_FIX + "%"))
                 return old[0]
             key = uuid.uuid4().hex
             db.execute("INSERT INTO targets(id,raw,canonical,auto_record,allow_unconfirmed,created_at) VALUES(?,?,?,?,?,?)",
@@ -158,24 +176,34 @@ class Store:
                     db.execute("""UPDATE targets SET trusted_status='ended',confirmed_at=?,suppressed_session=NULL,
                         manual_requested=0,attempts=0,retry_at=0 WHERE id=?""", (now, target_id))
 
-    def sync_instances(self, slots, allowed: set[int], now: float):
+    def sync_instances(self, slots, allowed: set[int], observed_at: float):
+        """按一次扫描结果同步允许列表内的实例：在线且无任务为 idle，未启动或未发现为 offline。
+
+        有任务占用、正在复位、或扫描开始后状态又被改写的实例保持不变，避免旧扫描结果覆盖新状态。
+        """
+        found = {slot.vmindex: slot for slot in slots if slot.vmindex in allowed}
         with self.transaction() as db:
-            seen = set()
-            for slot in slots:
-                if slot.vmindex not in allowed:
-                    continue
-                seen.add(slot.vmindex)
-                observed = getattr(slot.status, "value", slot.status)
-                existing = db.execute("SELECT * FROM instances WHERE vmindex=?", (slot.vmindex,)).fetchone()
+            for index in sorted(allowed):
+                slot = found.get(index)
+                observed = getattr(slot.status, "value", slot.status) if slot else "offline"
+                status = "idle" if observed == "idle" else "offline"
+                reason = "not_discovered" if slot is None else (None if status == "idle" else "android_not_started")
+                name = slot.name if slot else ""
+                existing = db.execute("SELECT * FROM instances WHERE vmindex=?", (index,)).fetchone()
                 if not existing:
-                    status = "offline" if observed == "offline" else "idle"
-                    db.execute("INSERT INTO instances(vmindex,name,status,updated_at) VALUES(?,?,?,?)",
-                               (slot.vmindex, slot.name, status, now))
-                else:
-                    db.execute("UPDATE instances SET name=?,updated_at=? WHERE vmindex=?", (slot.name, now, slot.vmindex))
-            # 已占用或故障隔离的实例不得因为刷新被误恢复为空闲。
-            for index in allowed - seen:
-                db.execute("UPDATE instances SET status='offline',reason='not_discovered' WHERE vmindex=? AND job_id IS NULL", (index,))
+                    db.execute("INSERT INTO instances(vmindex,name,status,reason,updated_at) VALUES(?,?,?,?,?)",
+                               (index, name, status, reason, observed_at))
+                    continue
+                if existing["job_id"] or existing["status"] == "resetting" \
+                        or existing["updated_at"] > observed_at:
+                    continue
+                db.execute("UPDATE instances SET name=?,status=?,reason=?,updated_at=? WHERE vmindex=?",
+                           (name or existing["name"], status, reason, observed_at, index))
+
+    def finish_reset(self, vmindex: int, ok: bool, now: float):
+        with self.transaction() as db:
+            db.execute("UPDATE instances SET status=?,reason=?,updated_at=? WHERE vmindex=? AND status='resetting' AND job_id IS NULL",
+                       ("idle" if ok else "offline", None if ok else "reset_failed", now, vmindex))
 
     def create_pending(self, target_id: str, now: float) -> str | None:
         with self.transaction() as db:
@@ -221,7 +249,7 @@ class Store:
             job = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
             if not job or job["status"] not in ACTIVE:
                 return
-            if reason in ("manual_stop", "scheduler_shutdown"):
+            if reason == "manual_stop":
                 db.execute("UPDATE targets SET suppressed_session=session_key,manual_requested=0 WHERE id=?", (job["target_id"],))
             if job["status"] == "pending":
                 db.execute("UPDATE jobs SET status='cancelled',stop_reason=?,ended_at=? WHERE id=?", (reason, time.time(), job_id))
@@ -245,8 +273,9 @@ class Store:
                 old = db.execute("SELECT * FROM segments WHERE job_id=? AND segment_index=?", (job_id, idx)).fetchone()
                 if kind == "segment_started":
                     db.execute("UPDATE segments SET started=1,raw_path=? WHERE job_id=? AND segment_index=?", (event.get("file_path"), job_id, idx))
-                    # Popen 成功不等于开始录制；首片开始后才将任务标为 running。
-                    db.execute("UPDATE jobs SET status='running' WHERE id=? AND status='starting'", (job_id,))
+                    # Popen 成功不等于开始录制；首片开始后才将任务标为 running，并把失败计数清零。
+                    if db.execute("UPDATE jobs SET status='running' WHERE id=? AND status='starting'", (job_id,)).rowcount:
+                        db.execute("UPDATE targets SET attempts=0 WHERE id=(SELECT target_id FROM jobs WHERE id=?)", (job_id,))
                 elif kind == "segment_quality_warning":
                     # 同一切片可先后出现遮挡、低帧率、画面检查不可用，全部保留为列表。
                     risks = json.loads(old["risk_json"]) if old["risk_json"] else []
@@ -264,7 +293,8 @@ class Store:
                         event.get("file_size_mb"), int(bool(event.get("is_final"))), event.get("reason"), job_id, idx))
 
     def finish_job(self, job_id: str, code: int, now: float, collection_complete: bool,
-                   reason: str = "", hold_instance: bool = False):
+                   reason: str = "", hold_instance: bool = False, ended_at: float | None = None):
+        """ended_at：Worker 实际退出时刻（对账时取自日志）；缺省为 now。退避仍从 now 起算。"""
         with self.transaction() as db:
             job = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
             segs = list(db.execute("SELECT * FROM segments WHERE job_id=?", (job_id,)))
@@ -280,19 +310,29 @@ class Store:
             if hold_instance:
                 status = "needs_reconcile"
             db.execute("UPDATE jobs SET status=?,exit_code=?,error_reason=?,ended_at=?,collection_complete=? WHERE id=?",
-                       (status, code, reason or None, now, int(collection_complete and not incomplete), job_id))
+                       (status, code, reason or None, ended_at or now, int(collection_complete and not incomplete), job_id))
             if job["vmindex"] is not None:
-                slot_status = "reconcile" if hold_instance else ("blocked" if code == 15 else "offline" if code == 20 else "idle")
-                db.execute("UPDATE instances SET status=?,job_id=?,reason=?,updated_at=? WHERE vmindex=?",
-                           (slot_status, job_id if hold_instance else None, reason or None, now, job["vmindex"]))
-            if not code or job["stop_reason"] or code in (9, 10, 18):
+                slot_status = "reconcile" if hold_instance else ("resetting" if code == 15 else "offline" if code == 20 else "idle")
+                db.execute("UPDATE instances SET status=?,job_id=?,reason=?,updated_at=? WHERE vmindex=? AND (job_id IS NULL OR job_id=?)",
+                           (slot_status, job_id if hold_instance else None, reason or None, now, job["vmindex"], job_id))
+            stop = job["stop_reason"]
+            if stop == "manual_stop" or (code == 0 and requested_total_duration(job["command_json"]) > 0):
                 db.execute("UPDATE targets SET suppressed_session=?,manual_requested=0 WHERE id=?", (job["session_key"], job["target_id"]))
-            else:
+            elif code == 9:
+                db.execute("UPDATE targets SET note=?,manual_requested=0 WHERE id=?",
+                           (NEEDS_FIX + (reason or "target_invalid"), job["target_id"]))
+            elif stop not in SETTLED_STOPS:
                 attempts = db.execute("SELECT attempts FROM targets WHERE id=?", (job["target_id"],)).fetchone()[0]
-                db.execute("UPDATE targets SET retry_at=? WHERE id=?", (now + min(120, 5 * (2 ** min(attempts, 5))), job["target_id"]))
+                db.execute("UPDATE targets SET retry_at=? WHERE id=?", (now + retry_delay(attempts), job["target_id"]))
+
+    def mark_waiting_exit(self, job_id: str):
+        """旧主控遗留的本任务进程仍在运行：等它发现主控断开后自行封口退出。"""
+        with self.transaction() as db:
+            db.execute("UPDATE jobs SET status='stopping',error_reason='waiting_old_worker_exit' WHERE id=?", (job_id,))
+            db.execute("UPDATE instances SET status='busy' WHERE job_id=?", (job_id,))
 
     def enqueue_command(self, kind: str, subject: str, now=None) -> str:
-        if kind not in {"record", "stop", "remove", "unblock", "reconcile"}:
+        if kind not in {"record", "stop", "remove", "reconcile"}:
             raise ValueError("未知控制命令")
         key = uuid.uuid4().hex
         with self.transaction() as db:

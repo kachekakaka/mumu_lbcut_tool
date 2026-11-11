@@ -5,7 +5,9 @@
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import logging
+import os
 from pathlib import Path
+import subprocess
 import time
 
 from src.worker.continuous_pipeline import ContinuousPipeline
@@ -16,6 +18,10 @@ from src.worker.state_machine import WorkerState, ActionType
 from src.worker.watchdog import StallWatchdog
 
 log=logging.getLogger(__name__)
+
+STATIC_MARK_SEC=10.0
+STATIC_RELOCATE_SEC=120.0
+EXIT_DEVICE_UNAVAILABLE=20
 
 
 @dataclass
@@ -49,11 +55,12 @@ class OverlayRecoveryEvent(BaseWorkerEvent):
 class ContinuousSession:
     def __init__(self, controller, serial, scrcpy_exe, adb_exe,
                  pipeline_factory=ContinuousPipeline, watchdog_factory=StallWatchdog,
-                 clock=time.monotonic, sleeper=time.sleep):
+                 clock=time.monotonic, sleeper=time.sleep, device_probe=None):
         self.c=controller
         self.serial,self.scrcpy,self.adb=serial,scrcpy_exe,adb_exe
         self.pipeline_factory,self.watchdog_factory=pipeline_factory,watchdog_factory
         self.clock,self.sleep=clock,sleeper
+        self.device_online=device_probe or self._adb_device_online
         self.pipe=None
         self.ledger={}
         self.pending={}
@@ -74,6 +81,30 @@ class ContinuousSession:
         self.quality_marks={}
         self.low_frame_rate=False
         self.frame_rate_ok_since=None
+        self.on_live_page=False
+        self.static_relocated=False
+        self.media_done=0.0
+        self.limit_reached=False
+
+    def _adb_device_online(self):
+        try:
+            result=subprocess.run([str(self.adb),'-s',self.serial,'get-state'],capture_output=True,text=True,
+                timeout=5,creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0)
+        except (OSError,subprocess.SubprocessError):
+            return False
+        return result.returncode==0 and result.stdout.strip()=='device'
+
+    def device_lost(self):
+        c=self.c
+        c._failure_reason='device_offline'
+        c._exit_code=EXIT_DEVICE_UNAVAILABLE
+        c._fatal_error=True
+        c.request_stop()
+
+    def remaining_duration(self):
+        """总时长按已录媒体时长扣减；未设总时长时返回 None。"""
+        total=self.c.config.total_duration_sec
+        return max(0.0,total-self.media_done) if total else None
 
     def start_epoch(self):
         c=self.c
@@ -83,12 +114,13 @@ class ContinuousSession:
         self.quality_marks={}
         self.low_frame_rate=False
         self.frame_rate_ok_since=None
+        self.on_live_page=False
         c.current_generation_id+=1
         c.action_dispatcher.current_generation_id=c.current_generation_id
         start_index=max(self.ledger,default=0)+1
         self.pipe=self.pipeline_factory(serial=self.serial,output_dir=c.task_output_dir,
             scrcpy_exe=self.scrcpy,adb_exe=self.adb,segment_duration_sec=c.config.segment_duration_sec,
-            start_index=start_index)
+            start_index=start_index,total_duration_sec=self.remaining_duration() or 0)
         c._pipeline=self.pipe
         self.pipe.wait_hook=c._pipeline_wait_tick
         self.pipe.start()
@@ -166,6 +198,7 @@ class ContinuousSession:
         if c._watchdog:c._watchdog.stop()
         if not self.pipe or self.epoch_ended:return
         ok=self.pipe.stop()
+        self.media_done+=self.pipe.media_time() or 0.0
         reason=interrupted or ('' if ok else 'capture_or_muxer_exit_failed')
         self.sync(ending=True,final=final and not reason,interrupted=reason)
         c.emitter.emit(CaptureSessionEvent(action='stopped',capture_pid=self.pipe._proc.pid if self.pipe._proc else 0,
@@ -177,19 +210,39 @@ class ContinuousSession:
     def recover(self,reason,relocate):
         c=self.c
         if c.stop_requested:return False
+        # 设备离线时重新定位或重开采集都无意义；以 20 退出，由调度器同步实例在线状态后重开。
+        if not self.device_online():
+            self.device_lost();return False
         if not c._consume_recovery_budget():return False
         c.state_machine.transition_to(WorkerState.RECOVERING)
-        c.emitter.emit(StallDetectedEvent(action='relocate_target' if relocate else 'restart_capture'))
+        action='relocate_target' if relocate else 'restart_capture'
+        c.emitter.emit(StallDetectedEvent(action=action,reason=reason))
         self.end_epoch(interrupted=reason)
+        if c.stop_requested:return False
+        remaining=self.remaining_duration()
+        if remaining is not None and remaining<1:
+            self.limit_reached=True
+            return False
         if relocate:
             landing=c._locate_target_room()
+            if c.stop_requested:return False
             if not landing.success:
+                if not self.device_online():
+                    self.device_lost();return False
                 c._failure_reason=landing.reason;c._fatal_error=True;c.request_stop();return False
-        if c.stop_requested:return False
         self.bad_pages=0
-        self.start_epoch()
+        try:
+            self.start_epoch()
+        except InterruptedError:
+            return False
+        except Exception as exc:
+            log.exception('重建采集失败')
+            if not self.device_online():
+                self.device_lost();return False
+            c._failure_reason='capture_restart_failed: '+str(exc);c._fatal_error=True;c.request_stop()
+            return False
         c._failure_reason=''
-        c.emitter.emit(StallHealedEvent(action='relocate_target' if relocate else 'restart_capture'))
+        c.emitter.emit(StallHealedEvent(action=action))
         return True
 
     def check_stream_quality(self):
@@ -214,8 +267,10 @@ class ContinuousSession:
         current=[idx for idx,row in self.ledger.items() if row['epoch']==self.epoch]
         if not current:return
         latest=max(current)
+        static=self.picture_static_sec()
         for flag,active,lookback in (('visual_check_unavailable',monitor.unavailable,0),
-                                     ('low_frame_rate',self.low_frame_rate,60)):
+                                     ('low_frame_rate',self.low_frame_rate,60),
+                                     ('static_picture',static>=STATIC_MARK_SEC,static)):
             if not active:
                 self.quality_marks.pop(flag,None)
                 continue
@@ -224,6 +279,27 @@ class ContinuousSession:
                 episode['marked'].add(latest)
                 c.emitter.emit(SegmentQualityWarningEvent(segment_index=latest,flag=flag,
                     suspected_start_time=episode['since']))
+
+    def watchdog_snapshot(self):
+        c=self.c
+        dog=getattr(c,'_watchdog',None)
+        snap=dog.snapshot() if dog else None
+        if snap is None or snap.generation_id!=c.current_generation_id:return None
+        return snap
+
+    def picture_static_sec(self):
+        snap=self.watchdog_snapshot()
+        return snap.picture_static_sec if snap else 0.0
+
+    def check_static_picture(self):
+        """有帧但画面不变：满 2 分钟且确认仍在直播页时重新定位一次；画面恢复变化后才重新计。"""
+        snap=self.watchdog_snapshot()
+        if snap is None:return
+        if snap.video_motion is not None and not snap.picture_static_sec and not snap.video_frozen_sec:
+            self.static_relocated=False
+        elif snap.picture_static_sec>=STATIC_RELOCATE_SEC and not self.static_relocated and self.on_live_page:
+            self.static_relocated=True
+            self.recover('static_picture_timeout',True)
 
     def heartbeat_fps(self):
         monitor=getattr(self.pipe,'monitor',None)
@@ -239,6 +315,7 @@ class ContinuousSession:
             self.surface_future=None
             if self.surface_gen!=c.current_generation_id:return
             activity=observation.get('activity','')
+            self.on_live_page='LivePlayActivity' in activity
             if 'LivePlayActivity' not in activity:
                 self.bad_pages+=1
                 if self.bad_pages>=2:self.recover('runtime_left_live_page',True)
@@ -295,8 +372,12 @@ class ContinuousSession:
         try:
             self.start_epoch()
             self.started=self.clock()
-            while not c.stop_requested:
+            while not c.stop_requested and not self.limit_reached:
                 self.sync()
+                if self.pipe.reached_total_duration():
+                    # 封装器已按总时长在录像时间轴上截止并封好最后一片。
+                    self.limit_reached=True
+                    break
                 if not self.pipe.is_recording():
                     log.error('持续采集异常: %s',self.pipe.failure_details())
                     if not self.recover('capture_process_exited',False):break
@@ -313,19 +394,23 @@ class ContinuousSession:
                 if c.stop_requested:break
                 self.check_stream_quality()
                 self.poll_surface()
-                if c.stop_requested:break
+                if c.stop_requested or self.limit_reached:break
+                self.check_static_picture()
+                if c.stop_requested or self.limit_reached:break
                 now=self.clock()
                 if now-self.last_heartbeat>=c.config.heartbeat_interval_sec:
                     snap=c._watchdog.snapshot() if c._watchdog else None
                     c.emitter.emit(HeartbeatEvent(elapsed_sec=int(now-self.started),
+                        segment_elapsed_sec=int(self.pipe.get_current_segment_elapsed()),
                         file_size_mb=round(self.pipe.get_current_file_size_mb(),2),status=c.state_machine.state.value.lower(),
                         room_identity_status=c.identity_status.value.lower(),fps=self.heartbeat_fps(),
                         video_motion=snap.video_motion if snap else None))
                     self.last_heartbeat=now
-                if c.config.total_duration_sec and now-self.started>=c.config.total_duration_sec:break
                 self.sleep(.1)
         finally:
             self.close()
+        if c._exit_code:
+            return c._exit_code
         if c._fatal_error or c._last_segment_failed or not self.ledger:
             c._failure_reason=c._failure_reason or self.last_error or 'no_recorded_segment'
             return 30

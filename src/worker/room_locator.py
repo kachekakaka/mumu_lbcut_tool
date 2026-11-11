@@ -172,6 +172,13 @@ def locate_target(navigator, target: str, *, target_kind: str = 'auto',
             success, reason = False, 'cancelled'
         return LandingResult(success, reason, last_status, last_evidence, attempted)
 
+    def device_lost():
+        # 探测失败多数只是页面慢；只有 adb 确认实例掉线才提前结束，交给上层换实例，不耗尽整段预算。
+        if stop_requested() or navigator.device_online():
+            return False
+        emit('device_lost', 'device_unavailable')
+        return True
+
     for attempt in range(1, max_attempts+1):
         if stop_requested():
             return finish(False, 'cancelled')
@@ -191,12 +198,16 @@ def locate_target(navigator, target: str, *, target_kind: str = 'auto',
         emit('navigate', last_reason if attempt > 1 else '', stage_deadline=until)
         if not navigator.navigate_route(target, web_rid, route, until, stop_requested):
             last_reason = 'intent_failed'
+            if device_lost():
+                return finish(False, 'device_unavailable')
             continue
         phase = 'live_page'
         until = min(preparation_deadline, time.monotonic()+45)
         emit('wait_live_page', 'wait_page_loading', stage_deadline=until)
         if not navigator.wait_live_page(deadline=until, stop_requested=stop_requested):
             last_reason = navigator.last_gate_reason or 'page_probe_unavailable'
+            if last_reason == 'page_probe_unavailable' and device_lost():
+                return finish(False, 'device_unavailable')
             emit('retry', last_reason)
             continue
 
@@ -241,6 +252,8 @@ def locate_target(navigator, target: str, *, target_kind: str = 'auto',
             if stop_requested():
                 return finish(False, 'cancelled')
             last_reason = navigator.last_gate_reason or 'page_probe_unavailable'
+            if last_reason == 'page_probe_unavailable' and device_lost():
+                return finish(False, 'device_unavailable')
             if last_reason in {'navigation_failed', 'login_blocked'}:
                 emit('page_changed', last_reason)
                 last_status, last_evidence = IdentityStatus.UNCONFIRMED, None

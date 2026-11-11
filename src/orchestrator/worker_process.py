@@ -74,7 +74,9 @@ class WorkerProcessHandle:
                             ("--target-kind", self.spec.target_kind),
                             ("--web-rid", self.spec.web_rid),
                             ("--expected-anchor-uid", self.spec.expected_anchor_uid),
-                            ("--job-id", self.spec.job_id)):
+                            ("--job-id", self.spec.job_id),
+                            ("--event-log", self.spec.event_log_path),
+                            ("--log-file", self.spec.log_path)):
             if value is not None and value != "":
                 cmd += [flag, str(value)]
         if self.spec.event_log_path:

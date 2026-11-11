@@ -35,12 +35,14 @@ class Network:
 class Child:
     """外部子进程替身；事件回调仍经过真实 Scheduler 的入队、事务和收尾。"""
     serial = 100000
-    def __init__(self, spec, on_event):
+    def __init__(self, spec, on_event, record=True, extra_args=()):
         Child.serial += 1
         self.spec, self.on_event = spec, on_event
         self.proc = SimpleNamespace(pid=Child.serial)
         self.created_at = time.time()
-        self.command = ['python', '-m', 'src.worker.cli', '--job-id', spec.job_id]
+        self.command = ['python', '-m', 'src.worker.cli', '--job-id', spec.job_id, *extra_args]
+        self.record = record
+        self.code = 0
         self.event_errors = []
         self.events_complete = False
         self.forced_stop = False
@@ -55,20 +57,26 @@ class Child:
         self.file = self.spec.output_dir / 'segment.mp4'
         self.file.parent.mkdir(parents=True)
         self.emit('worker_started', pid=self.proc.pid)
-        self.emit('segment_started', segment_index=1, file_path=str(self.file))
+        if self.record:
+            self.emit('segment_started', segment_index=1, file_path=str(self.file))
+    def exit(self, code, reason='injected_exit'):
+        """Worker 自行退出：封口已开始的切片后报告退出码。"""
+        if self.record:
+            self.file.write_bytes(b'synthetic-process-boundary-artifact')
+            self.emit('segment_finished', segment_index=1, file_path=str(self.file), duration_sec=1,
+                      file_size_mb=.01, is_final=True)
+        self.terminal_event = dict(event='worker_stopped', reason=reason)
+        self.emit('worker_stopped', reason=reason, exit_code=code)
+        self.code = code
+        self.alive = False
+        self.events_complete = True
+        return code
     def is_alive(self):
         return self.alive
     def poll_exit_code(self):
-        return None if self.alive else 0
+        return None if self.alive else self.code
     def stop(self, timeout_sec=30):
-        self.file.write_bytes(b'synthetic-process-boundary-artifact')
-        self.emit('segment_finished', segment_index=1, file_path=str(self.file), duration_sec=1,
-                  file_size_mb=.01, is_final=True)
-        self.terminal_event = dict(event='worker_stopped', reason='stop_requested')
-        self.emit('worker_stopped', reason='stop_requested', exit_code=0)
-        self.alive = False
-        self.events_complete = True
-        return 0
+        return self.exit(0, 'stop_requested')
     def wait(self, timeout=None):
         return self.poll_exit_code()
 
@@ -77,22 +85,32 @@ class Child:
 def system(tmp_path):
     clock, network = Clock(), Network()
     store = Store(tmp_path / 'state' / 'orchestrator.sqlite3')
-    mumu = SimpleNamespace(list_available_instances=lambda: [dict(vmindex=i, name=f'VM{i}') for i in (1, 2)])
+    vms = {1: True, 2: True}
+    mumu = SimpleNamespace(list_available_instances=lambda: [
+        dict(vmindex=i, name=f'VM{i}', android_started=started) for i, started in sorted(vms.items())])
     pool = InstancePool(mumu)
-    children = []
+    resets = []
+    env = SimpleNamespace(clock=clock, network=network, store=store, children=[], tmp=tmp_path, pool=pool,
+                          vms=vms, resets=resets, reset_ok=True, child_options={})
+    def reset_app(vmindex):
+        resets.append(vmindex)
+        return env.reset_ok
+    pool.reset_app = reset_app
     def factory(**kw):
-        c = Child(**kw)
-        children.append(c)
+        c = Child(**kw, **env.child_options)
+        env.children.append(c)
         return c
-    scheduler = Scheduler(store, tmp_path / 'recordings', [1, 2], pool=pool,
-        scanner=RoomScanner(network), handle_factory=factory, clock=clock,
-        ended_interval_sec=1, auto_scan=False, process_probe=lambda job: 'absent')
-    env = SimpleNamespace(clock=clock, network=network, store=store, scheduler=scheduler,
-                          children=children, tmp=tmp_path, pool=pool, factory=factory)
+    env.factory = factory
+    env.scheduler = new_scheduler(env)
     yield env
-    scheduler.close()
+    env.scheduler.close()
     store.close()
 
+
+def new_scheduler(env):
+    return Scheduler(env.store, env.tmp / 'recordings', [1, 2], pool=env.pool,
+        scanner=RoomScanner(env.network), handle_factory=env.factory, clock=env.clock,
+        ended_interval_sec=1, auto_scan=False, process_probe=lambda job: 'absent')
 
 def observe(env, values):
     env.clock.advance(2)
@@ -185,7 +203,24 @@ def test_pending_launch_uses_fresh_room_not_old_scan(system):
     assert not e.children
 
 
-def test_start_failures_are_bounded(system):
+def row(env, sql, *params):
+    return env.store.row(sql, params)
+
+
+def start_one(env, raw='A'):
+    target = env.store.add_target(raw, now=env.clock())
+    observe(env, {raw: RoomStatus.LIVE})
+    count = len(env.children)
+    pump(env, lambda: len(env.children) == count + 1 and (not env.children[-1].record or
+         row(env, 'SELECT status FROM jobs WHERE id=?', env.children[-1].spec.job_id)['status'] == 'running'))
+    return target, row(env, 'SELECT * FROM jobs WHERE id=?', env.children[-1].spec.job_id)
+
+
+def job_status(env, job_id):
+    return row(env, 'SELECT status FROM jobs WHERE id=?', job_id)['status']
+
+
+def test_start_failures_retry_with_doubling_backoff_without_limit(system):
     e = system
     class BrokenChild(Child):
         def start(self):
@@ -195,40 +230,249 @@ def test_start_failures_are_bounded(system):
         calls.append(kw)
         return BrokenChild(**kw)
     e.scheduler.handle_factory = factory
-    e.scheduler.max_attempts = 2
-    e.store.add_target('A', now=e.clock())
-    observe(e, {'A': RoomStatus.LIVE})
-    pump(e, lambda: len(calls) == 1)
-    e.clock.advance(60)
-    observe(e, {'A': RoomStatus.LIVE})
-    pump(e, lambda: len(calls) == 2)
-    e.clock.advance(300)
-    observe(e, {'A': RoomStatus.LIVE})
-    for _ in range(5):
-        e.scheduler.tick()
-    assert len(calls) == 2
-
-
-def test_reconcile_keeps_live_instance_reserved_and_never_kills(system):
-    e = system
     target = e.store.add_target('A', now=e.clock())
     observe(e, {'A': RoomStatus.LIVE})
-    pump(e, lambda: len(e.children) == 1)
-    job = e.store.rows('SELECT * FROM jobs')[0]
-    # 模拟主控内存丢失，不真正创建或终止 OS 进程。
-    e.scheduler._handles.clear()
-    e.scheduler.process_probe = lambda record: 'alive'
-    e.scheduler.reconcile()
-    assert e.store.row('SELECT status FROM jobs WHERE id=?', (job['id'],))['status'] == 'needs_reconcile'
-    assert e.store.row('SELECT status FROM instances WHERE vmindex=?', (job['vmindex'],))['status'] == 'reconcile'
+    delays = []
+    for n in range(1, 9):
+        pump(e, lambda: len(calls) == n and job_status(e, calls[-1]['spec'].job_id) == 'failed')
+        t = row(e, 'SELECT * FROM targets WHERE id=?', target)
+        delays.append(round(t['retry_at'] - e.clock()))
+        assert t['suppressed_session'] is None
+        for _ in range(3):
+            e.scheduler.tick()
+        assert len(calls) == n
+        e.clock.advance(delays[-1])
+        observe(e, {'A': RoomStatus.LIVE})
+    assert delays == [5, 10, 20, 40, 80, 160, 300, 300]
+    # 进入 running 后失败计数清零，下一次故障从 5 秒重新开始。
+    e.scheduler.handle_factory = e.factory
+    pump(e, lambda: e.children and job_status(e, e.children[-1].spec.job_id) == 'running')
+    assert row(e, 'SELECT attempts FROM targets WHERE id=?', target)['attempts'] == 0
+    e.children[-1].exit(30)
+    pump(e, lambda: job_status(e, e.children[-1].spec.job_id) == 'failed')
+    assert row(e, 'SELECT retry_at FROM targets WHERE id=?', target)['retry_at'] == pytest.approx(e.clock() + 5)
+
+
+@pytest.mark.parametrize('code', [10, 18, 30, 17, 2, 0])
+def test_worker_failures_retry_same_session_after_backoff(system, code):
+    e = system
+    target, job = start_one(e)
+    e.children[0].exit(code)
+    pump(e, lambda: job_status(e, job['id']) in ('failed', 'finished'))
+    t = row(e, 'SELECT * FROM targets WHERE id=?', target)
+    assert t['suppressed_session'] is None and t['note'] is None
+    assert t['retry_at'] == pytest.approx(e.clock() + 5)
+    assert row(e, 'SELECT status FROM instances WHERE vmindex=?', job['vmindex'])['status'] == 'idle'
     for _ in range(3):
         e.scheduler.tick()
     assert len(e.children) == 1
+    e.clock.advance(5)
+    observe(e, {'A': RoomStatus.LIVE})
+    pump(e, lambda: len(e.children) == 2)
+    assert e.children[1].spec.job_id != job['id']
+
+
+def test_total_duration_completion_suppresses_session(system):
+    e = system
+    e.child_options = dict(extra_args=('--total-duration', '60'))
+    target, job = start_one(e)
+    e.children[0].exit(0, 'total_duration_reached')
+    pump(e, lambda: job_status(e, job['id']) == 'finished')
+    assert row(e, 'SELECT suppressed_session FROM targets WHERE id=?', target)['suppressed_session'] == job['session_key']
+    e.clock.advance(400)
+    for _ in range(3):
+        observe(e, {'A': RoomStatus.LIVE})
+        e.scheduler.tick()
+    assert len(e.children) == 1
+
+
+def test_invalid_target_needs_fix_until_record(system):
+    e = system
+    e.child_options = dict(record=False)
+    target, job = start_one(e)
+    e.children[0].exit(9, 'target_invalid')
+    pump(e, lambda: job_status(e, job['id']) == 'failed')
+    assert row(e, 'SELECT note FROM targets WHERE id=?', target)['note'] == 'needs_fix: target_invalid'
+    for _ in range(3):
+        e.clock.advance(400)
+        observe(e, {'A': RoomStatus.LIVE})
+        e.scheduler.tick()
+    assert len(e.children) == 1
+    # 下一场同样不自动开录。
+    observe(e, {'A': RoomStatus.ENDED})
+    observe(e, {'A': RoomStatus.ENDED})
+    e.network.rooms['A'] = ResolvedRoom('A', RoomStatus.LIVE, room_id='room-A-2')
+    snap = e.scheduler.scanner.scan(['A'])
+    e.clock.advance(2)
+    snap.timestamp = e.clock()
+    e.scheduler.apply_snapshot(snap)
+    for _ in range(3):
+        e.scheduler.tick()
+    assert len(e.children) == 1
+    e.store.enqueue_command('record', target)
+    pump(e, lambda: len(e.children) == 2)
+    assert row(e, 'SELECT note FROM targets WHERE id=?', target)['note'] is None
+    e.children[1].exit(9, 'target_invalid')
+    pump(e, lambda: row(e, 'SELECT note FROM targets WHERE id=?', target)['note'])
+    # 重新添加同一地址也解除“需要修正”。
+    assert e.store.add_target('A', now=e.clock()) == target
+    assert row(e, 'SELECT note FROM targets WHERE id=?', target)['note'] is None
+
+
+@pytest.mark.parametrize('reset_ok', [True, False])
+def test_login_blocked_resets_instance_then_retries(system, reset_ok):
+    e = system
+    e.reset_ok = reset_ok
+    e.child_options = dict(record=False)
+    target, job = start_one(e)
+    vm = job['vmindex']
+    e.children[0].exit(15, 'login_blocked')
+    pump(e, lambda: e.resets == [vm] and row(e, 'SELECT status FROM instances WHERE vmindex=?', vm)['status'] != 'resetting')
+    slot = row(e, 'SELECT * FROM instances WHERE vmindex=?', vm)
+    assert (slot['status'], slot['reason']) == (('idle', None) if reset_ok else ('offline', 'reset_failed'))
+    assert row(e, 'SELECT suppressed_session FROM targets WHERE id=?', target)['suppressed_session'] is None
+    e.clock.advance(5)
+    observe(e, {'A': RoomStatus.LIVE})
+    pump(e, lambda: len(e.children) == 2)
+    assert e.children[1].spec.vmindex == (vm if reset_ok else 3 - vm)
+
+
+def test_device_offline_moves_job_to_other_instance(system):
+    e = system
+    e.child_options = dict(record=False)
+    target, job = start_one(e)
+    e.children[0].exit(20, 'device_offline')
+    pump(e, lambda: job_status(e, job['id']) == 'failed')
+    assert row(e, 'SELECT status FROM instances WHERE vmindex=?', job['vmindex'])['status'] == 'offline'
+    e.clock.advance(5)
+    observe(e, {'A': RoomStatus.LIVE})
+    pump(e, lambda: len(e.children) == 2)
+    assert e.children[1].spec.vmindex != job['vmindex']
+
+
+def test_instance_refresh_follows_power_state_but_keeps_busy_slot(system):
+    e = system
+    e.scheduler.auto_scan = True
+    def refreshed(vm, status):
+        e.clock.advance(31)
+        pump(e, lambda: row(e, 'SELECT status FROM instances WHERE vmindex=?', vm)['status'] == status)
+    e.vms[2] = False
+    refreshed(2, 'offline')
+    assert row(e, 'SELECT reason FROM instances WHERE vmindex=2')['reason'] == 'android_not_started'
+    e.vms[2] = True
+    refreshed(2, 'idle')
+    target, job = start_one(e)
+    assert job['vmindex'] == 1
+    e.vms.update({1: False, 2: False})
+    refreshed(2, 'offline')
+    slot = row(e, 'SELECT * FROM instances WHERE vmindex=1')
+    assert (slot['status'], slot['job_id']) == ('busy', job['id'])
+    # 查询失败保持原状态。
+    def broken():
+        raise RuntimeError('MuMuManager unavailable')
+    e.pool.refresh = broken
+    e.clock.advance(31)
+    for _ in range(20):
+        e.scheduler.tick()
+        time.sleep(.005)
+    assert row(e, 'SELECT status FROM instances WHERE vmindex=2')['status'] == 'offline'
+
+
+def test_scheduler_shutdown_does_not_suppress_session(system):
+    e = system
+    target, job = start_one(e)
+    e.scheduler.close()
+    assert job_status(e, job['id']) == 'finished'
+    assert row(e, 'SELECT suppressed_session FROM targets WHERE id=?', target)['suppressed_session'] is None
+    e.scheduler = new_scheduler(e)
+    observe(e, {'A': RoomStatus.LIVE})
+    pump(e, lambda: len(e.children) == 2)
+
+
+def write_journal(job, events):
+    path = Path(job['event_log_path'])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(''.join(json.dumps(ev) + '\n' for ev in events), encoding='utf-8')
+
+
+def test_reconcile_absent_process_replays_journal_and_resumes(system):
+    e = system
+    target, job = start_one(e)
+    child = e.children[0]
+    assert child.spec.log_path == Path(job['event_log_path']).with_suffix('.log')
+    stopped_at = e.clock() - 100
+    write_journal(job, [
+        dict(event='segment_started', event_id=f"{job['id']}:2", job_id=job['id'], segment_index=1, file_path=str(child.file)),
+        dict(event='segment_finished', event_id='late-1', job_id=job['id'], segment_index=1, file_path=str(child.file),
+             duration_sec=1, file_size_mb=.01, is_final=True),
+        dict(event='worker_stopped', event_id='late-2', job_id=job['id'], reason='event_stream_lost', exit_code=0,
+             timestamp=stopped_at)])
+    e.scheduler._handles.clear()
+    e.scheduler.reconcile()
+    finished = row(e, 'SELECT * FROM jobs WHERE id=?', job['id'])
+    assert (finished['status'], finished['error_reason'], finished['collection_complete']) == ('finished', 'event_stream_lost', 1)
+    assert finished['ended_at'] == stopped_at
+    assert row(e, 'SELECT status FROM segments WHERE job_id=?', job['id'])['status'] == 'finished'
+    assert row(e, 'SELECT suppressed_session FROM targets WHERE id=?', target)['suppressed_session'] is None
+    e.clock.advance(5)
+    observe(e, {'A': RoomStatus.LIVE})
+    pump(e, lambda: len(e.children) == 2)
+
+
+def test_reconcile_waits_for_owned_old_worker_then_resumes(system):
+    e = system
+    target, job = start_one(e)
+    e.scheduler._handles.clear()
+    e.scheduler.process_probe = lambda record: 'alive'
+    e.scheduler.reconcile()
+    waiting = row(e, 'SELECT * FROM jobs WHERE id=?', job['id'])
+    assert (waiting['status'], waiting['error_reason']) == ('stopping', 'waiting_old_worker_exit')
+    assert row(e, 'SELECT status FROM instances WHERE vmindex=?', job['vmindex'])['status'] == 'busy'
+    for _ in range(3):
+        e.clock.advance(3)
+        observe(e, {'A': RoomStatus.LIVE})
+        e.scheduler.tick()
+    assert len(e.children) == 1 and job_status(e, job['id']) == 'stopping'
+    # 旧 Worker 自行封口退出后，按退避续录同一场。
+    e.scheduler.process_probe = lambda record: 'absent'
+    e.clock.advance(3)
+    e.scheduler.tick()
+    assert job_status(e, job['id']) == 'failed'
+    assert row(e, 'SELECT error_reason FROM jobs WHERE id=?', job['id'])['error_reason'] == 'interrupted_host_restart'
+    e.clock.advance(5)
+    observe(e, {'A': RoomStatus.LIVE})
+    pump(e, lambda: len(e.children) == 2)
+
+
+def test_reconcile_old_worker_not_exiting_or_unowned_needs_manual(system):
+    e = system
+    target, job = start_one(e)
+    e.scheduler._handles.clear()
+    e.scheduler.process_probe = lambda record: 'alive'
+    e.scheduler.reconcile()
+    e.clock.advance(121)
+    e.scheduler.tick()
+    held = row(e, 'SELECT * FROM jobs WHERE id=?', job['id'])
+    assert (held['status'], held['error_reason']) == ('needs_reconcile', 'old_worker_did_not_exit')
+    assert row(e, 'SELECT status FROM instances WHERE vmindex=?', job['vmindex'])['status'] == 'reconcile'
+    # 归属无法确认：保持人工对账，不派新任务，也不终止进程。
+    e.scheduler.process_probe = lambda record: 'unknown'
+    e.scheduler.reconcile(job['id'])
+    assert job_status(e, job['id']) == 'needs_reconcile'
+    for _ in range(3):
+        e.clock.advance(10)
+        observe(e, {'A': RoomStatus.LIVE})
+        e.scheduler.tick()
+    assert len(e.children) == 1 and e.children[0].alive
     e.scheduler.process_probe = lambda record: 'absent'
     e.scheduler.reconcile(job['id'])
-    assert e.store.row('SELECT status FROM jobs WHERE id=?', (job['id'],))['status'] == 'failed'
-    assert e.store.row('SELECT suppressed_session FROM targets WHERE id=?', (target,))['suppressed_session'] == job['session_key']
+    assert job_status(e, job['id']) == 'failed'
+    assert row(e, 'SELECT suppressed_session FROM targets WHERE id=?', target)['suppressed_session'] is None
 
+
+def test_unblock_command_is_removed(system):
+    with pytest.raises(ValueError):
+        system.store.enqueue_command('unblock', '1')
 
 def test_database_preserves_previous_records_on_reopen(tmp_path):
     path = tmp_path / 'state.sqlite3'

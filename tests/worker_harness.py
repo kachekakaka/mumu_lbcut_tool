@@ -1,4 +1,5 @@
 """保留真实 Controller/状态机/采集会话/封口校验，只替换设备与采集进程边界。"""
+from concurrent import futures
 import io
 import json
 from pathlib import Path
@@ -66,9 +67,11 @@ class PassiveWatchdog:
 
 def build_worker(monkeypatch, tmp_path, valid_media, *, total=4, segment=2,
                  gate=True, gate_reason="render_timeout", uid="900001", expected_uid="900001",
-                 allow_unconfirmed=False, crashes=(), broken_segments=(), watchdog_factory=PassiveWatchdog):
+                 allow_unconfirmed=False, crashes=(), broken_segments=(), watchdog_factory=PassiveWatchdog,
+                 device_online=lambda: True):
     """crashes 为采集会话序号（从 1 起），对应会话启动 0.5 秒后采集进程退出；
-    broken_segments 为写入损坏内容的分段序号。"""
+    broken_segments 为写入损坏内容的分段序号。总时长按分装器截止模拟：
+    每代采集录满传入的 total_duration_sec 后分装器正常退出。"""
     import src.worker.controller as cm
     import src.worker.continuous_session as cs
     clock = FakeClock()
@@ -77,9 +80,12 @@ def build_worker(monkeypatch, tmp_path, valid_media, *, total=4, segment=2,
 
     class CapturePipe:
         """每 segment 秒产生一个分段文件；停止或退出后全部分段视为封口。"""
-        def __init__(self, output_dir, start_index, **kwargs):
+        def __init__(self, output_dir, start_index, total_duration_sec=0, **kwargs):
             self.output_dir = Path(output_dir)
             self.base = start_index
+            self.limit = total_duration_sec
+            self.ended_at = None
+            self.stopped = False
             self.epoch = len(pipelines) + 1
             self.start_count = self.stop_count = 0
             self.rows = {}
@@ -93,14 +99,30 @@ def build_worker(monkeypatch, tmp_path, valid_media, *, total=4, segment=2,
             self.start_count += 1
             self.alive = True
             self.begin = clock.monotonic()
+        def span(self):
+            end = self.ended_at if self.ended_at is not None else clock.monotonic()
+            return min(end - self.begin, self.limit) if self.limit else end - self.begin
+        def _end(self, code):
+            self.alive = False
+            self.exit_code = code
+            self.ended_at = clock.monotonic()
         def is_recording(self):
             if self.alive and self.epoch in crashes and clock.monotonic() - self.begin >= .5:
-                self.alive = False
-                self.exit_code = 9
+                self._end(9)
             return self.alive
+        def reached_total_duration(self):
+            if self.alive and self.limit and clock.monotonic() - self.begin >= self.limit:
+                self._end(0)
+            return bool(self.limit) and self.exit_code == 0 and self.span() >= self.limit
+        def media_time(self):
+            return self.span()
+        def get_current_segment_elapsed(self):
+            return self.span() % segment
         def fragments(self):
             if self.alive:
-                n = max(1, int((clock.monotonic() - self.begin) // segment) + 1)
+                # 截止点上的关键帧不会开出新片：录满时按总时长前一刻计算片数。
+                span = min(clock.monotonic() - self.begin, self.limit - 1e-6) if self.limit else clock.monotonic() - self.begin
+                n = max(1, int(span // segment) + 1)
                 for off in range(n):
                     idx = self.base + off
                     if idx not in self.rows:
@@ -115,10 +137,11 @@ def build_worker(monkeypatch, tmp_path, valid_media, *, total=4, segment=2,
             return [Fragment(i, p, not self.alive or i < latest, (i - self.base) * segment,
                              (i - self.base + 1) * segment) for i, p in sorted(self.rows.items())]
         def stop(self, *args, **kwargs):
-            if self.alive:
+            if not self.stopped:
+                self.stopped = True
                 self.stop_count += 1
-                self.alive = False
-                self.exit_code = 0
+            if self.alive:
+                self._end(0)
             return self.exit_code == 0
         teardown = stop
         def get_exit_code(self):
@@ -135,6 +158,8 @@ def build_worker(monkeypatch, tmp_path, valid_media, *, total=4, segment=2,
             self.route = None
         def configure_target(self, kind, web_rid):
             self.route = (kind, web_rid)
+        def device_online(self):
+            return device_online()
         def navigate_route(self, target, web_rid, route, deadline, stop_requested):
             return not stop_requested()
         def wait_live_page(self, **kwargs):
@@ -158,9 +183,17 @@ def build_worker(monkeypatch, tmp_path, valid_media, *, total=4, segment=2,
         optimize_performance_for_recording=lambda *args, **kw: None))
     original_init = cs.ContinuousSession.__init__
     def init(self, *args, **kwargs):
-        # 真实封口校验在线程池中执行；每次假睡眠让出少量真实时间供其完成。
+        session = self
+        def sleeper(sec):
+            # 封口校验是线程池里的真实 ffprobe，耗时按真实时间计；先等它完成再推进假时钟，
+            # 否则机器繁忙时假时间会先耗尽 24 秒校验期限，误报 validation_deadline_exceeded。
+            pending = list(getattr(session, 'pending', {}).values())
+            if pending:
+                futures.wait(pending, timeout=10)
+            clock.sleep(sec)
+            time.sleep(.003)
         original_init(self, *args, pipeline_factory=CapturePipe, watchdog_factory=watchdog_factory,
-                      clock=clock.monotonic, sleeper=lambda sec: (clock.sleep(sec), time.sleep(.003)))
+                      clock=clock.monotonic, sleeper=sleeper, device_probe=device_online)
     monkeypatch.setattr(cs.ContinuousSession, '__init__', init)
     stream = io.StringIO()
     config = WorkerConfig(vmindex=321, target="7704666294802123554", target_kind="room_id",
