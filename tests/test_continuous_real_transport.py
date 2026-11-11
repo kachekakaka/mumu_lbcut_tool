@@ -1,5 +1,5 @@
 """真实 Windows 命名管道 + ffmpeg 无重编码分段；不是 MuMu 实机测试。"""
-import hashlib,json,os,shutil,subprocess,sys,time
+import json,os,subprocess,sys,time
 from pathlib import Path
 import pytest
 import src.worker.stream_monitor as stream_monitor
@@ -8,8 +8,8 @@ from src.worker.continuous_pipeline import ContinuousPipeline,NamedPipeBridge
 
 @pytest.mark.skipif(os.name!='nt',reason='当前产品传输为 Windows 命名管道')
 @pytest.mark.parametrize('analyzer',['real','stuck'])
-def test_realtime_segments_preserve_every_encoded_packet(monkeypatch,tmp_path,valid_media,analyzer):
-    ff=shutil.which('ffmpeg');probe=shutil.which('ffprobe')
+def test_realtime_segments_preserve_every_encoded_packet(monkeypatch,tmp_path,valid_media,media_tools,analyzer):
+    ff=str(media_tools.ffmpeg);probe=str(media_tools.ffprobe)
     spawned=[]
     original_init=stream_monitor.Analyzer.__init__
     def track(self,*args,**kwargs):
@@ -36,7 +36,7 @@ def test_realtime_segments_preserve_every_encoded_packet(monkeypatch,tmp_path,va
             stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,encoding='utf8',
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
     p=ContinuousPipeline('synthetic',tmp_path/'out',Path('scrcpy.exe'),Path('adb.exe'),
-                         segment_duration_sec=2,producer_factory=producer)
+                         segment_duration_sec=2,ffmpeg_exe=ff,producer_factory=producer)
     try:
         p.start();capture=p._proc.pid;mux=p._mux.pid
         before_stop=set();deadline=time.monotonic()+20
@@ -47,16 +47,19 @@ def test_realtime_segments_preserve_every_encoded_packet(monkeypatch,tmp_path,va
         assert p.stop(),p.failure_details()
         fragments=p.fragments();assert len(fragments)>=3 and len(before_stop)>=2
         assert all(f.closed for f in fragments)
-        def hashes(path,stream):
+        def packets(path,stream):
             data=json.loads(subprocess.check_output([probe,'-v','error','-select_streams',stream,
-                '-show_packets','-show_data_hash','sha256','-show_entries','packet=data_hash',
+                '-show_packets','-show_data','-show_entries','packet=data',
                 '-of','json',str(path)],timeout=10))
-            return [packet['data_hash'] for packet in data['packets']]
+            return [packet['data'] for packet in data['packets']]
         for stream in ('v:0','a:0'):
-            expected=hashes(reference,stream)
-            actual=[h for f in fragments for h in hashes(f.path,stream)]
+            expected=packets(reference,stream)
+            actual=[packet for f in fragments for packet in packets(f.path,stream)]
             assert expected and actual==expected
-        for a,b in zip(fragments,fragments[1:]):assert abs(a.end_pts-b.start_pts)<.0001
+        # 循环输入含 AAC padding；不同版本的 CSV 端点可留间隔。
+        # 无漏包/重包由上面的全部编码包逐字节、按顺序对比判定。
+        for a,b in zip(fragments,fragments[1:]):
+            assert a.start_pts < a.end_pts <= b.start_pts < b.end_pts
         assert p.bridge.bytes_forwarded==reference.stat().st_size
         assert (p.monitor.frame_seq>0)==(analyzer=='real')
         assert spawned and all(a.proc.poll() is not None for a in spawned)
@@ -65,9 +68,8 @@ def test_realtime_segments_preserve_every_encoded_packet(monkeypatch,tmp_path,va
 
 
 @pytest.mark.skipif(os.name!='nt',reason='当前产品传输为 Windows 命名管道')
-def test_total_duration_is_cut_by_muxer_on_media_timeline(tmp_path):
-    ff=shutil.which('ffmpeg');probe=shutil.which('ffprobe')
-    if not ff or not probe:pytest.skip('需要 ffmpeg/ffprobe')
+def test_total_duration_is_cut_by_muxer_on_media_timeline(tmp_path,media_tools):
+    ff=str(media_tools.ffmpeg);probe=str(media_tools.ffprobe)
     # 与 scrcpy 输出一致：Constrained Baseline、无 B 帧、2 秒一个关键帧（分装器 -t 按 DTS 截止）。
     source=tmp_path/'baseline.mp4'
     subprocess.run([ff,'-v','error','-n','-f','lavfi','-i','testsrc=size=96x64:rate=8','-f','lavfi',
@@ -80,7 +82,7 @@ def test_total_duration_is_cut_by_muxer_on_media_timeline(tmp_path):
             stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,encoding='utf8',
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
     p=ContinuousPipeline('synthetic',tmp_path/'out',Path('scrcpy.exe'),Path('adb.exe'),
-                         segment_duration_sec=4,producer_factory=producer,total_duration_sec=8)
+                         segment_duration_sec=4,ffmpeg_exe=ff,producer_factory=producer,total_duration_sec=8)
     elapsed=[]
     try:
         p.start();deadline=time.monotonic()+30

@@ -1,7 +1,6 @@
 """真实 ffmpeg 解码的录像流分析离线集成测试；不是 MuMu 实机测试。"""
 import io
 import json
-import shutil
 import subprocess
 import time
 from types import SimpleNamespace
@@ -14,8 +13,12 @@ from src.worker.state_machine import ActionType
 from src.worker.stream_monitor import MonitorView, StreamMonitor
 from src.worker.watchdog import StallWatchdog
 
-FFMPEG = shutil.which('ffmpeg')
-pytestmark = pytest.mark.skipif(not FFMPEG, reason='需要 ffmpeg')
+FFMPEG = None
+
+
+@pytest.fixture(autouse=True)
+def pinned_media_tools(monkeypatch, media_tools):
+    monkeypatch.setattr(__name__ + '.FFMPEG', str(media_tools.ffmpeg))
 
 
 def make_mkv(rate, duration, vf=None, total=None):
@@ -121,7 +124,8 @@ class QualitySession:
     def __init__(self, monitor):
         self.stream = io.StringIO()
         controller = SimpleNamespace(emitter=WorkerEventEmitter(self.stream), current_generation_id=1)
-        self.session = ContinuousSession(controller, 'serial', 'scrcpy', 'adb')
+        self.session = ContinuousSession(controller, 'serial', 'scrcpy', 'adb',
+                                         SimpleNamespace(ffmpeg='ffmpeg', ffprobe='ffprobe'))
         self.session.pipe = SimpleNamespace(monitor=monitor)
         self.session.ledger[1] = {'epoch': self.session.epoch, 'terminal': False}
 

@@ -190,6 +190,7 @@ class WorkerController:
             self.task_output_dir.mkdir(parents=True, exist_ok=False)
 
             dep_mgr = DependencyManager()
+            media_tools = dep_mgr.get_media_tools()
             scrcpy_exe = dep_mgr.ensure_scrcpy()
             adb_exe = dep_mgr.get_adb_path()
 
@@ -229,7 +230,7 @@ class WorkerController:
                 return self._landing_exit_code(landing.reason)
 
             from src.worker.continuous_session import ContinuousSession
-            return ContinuousSession(self, serial, scrcpy_exe, adb_exe).run()
+            return ContinuousSession(self, serial, scrcpy_exe, adb_exe, media_tools).run()
         finally:
             self._cleanup(instance_lock)
 

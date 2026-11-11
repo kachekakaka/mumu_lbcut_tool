@@ -9,6 +9,7 @@ import pytest
 
 from src.worker.continuous_pipeline import read_fragment_manifest, Fragment, ContinuousPipeline
 from src.worker.navigator import WorkerNavigator
+from src.mvp.dep_manager import MediaTools
 
 
 
@@ -55,7 +56,8 @@ def test_capture_error_after_total_duration_cutoff_is_tagged_expected(tmp_path,c
     from types import SimpleNamespace
     caplog.set_level(logging.INFO,logger='src.worker.continuous_pipeline')
     line='ERROR: Failed to write trailer to \\\\.\\pipe\\mumu_capture_x'
-    p=ContinuousPipeline('synthetic',tmp_path,Path('scrcpy.exe'),Path('adb.exe'),2,total_duration_sec=300)
+    p=ContinuousPipeline('synthetic',tmp_path,Path('scrcpy.exe'),Path('adb.exe'),2,
+                         ffmpeg_exe=Path('ffmpeg.exe'),total_duration_sec=300)
     p._mux=SimpleNamespace(poll=lambda:None)
     p._log_capture_line(line)
     p._mux=SimpleNamespace(poll=lambda:0)
@@ -103,7 +105,8 @@ def test_runtime_overlay_recovery_keeps_same_capture_process(tmp_path):
     class Watchdog:
         def __init__(self,**kw):pass
         def start(self):pass
-    s=ContinuousSession(c,'serial',Path('scrcpy'),Path('adb'),watchdog_factory=Watchdog)
+    s=ContinuousSession(c,'serial',Path('scrcpy'),Path('adb'),
+                        MediaTools(Path('ffmpeg.exe'),Path('ffprobe.exe')),watchdog_factory=Watchdog)
     s.pipe=object();original=s.pipe;s.epoch=1;s.last_clear_wall=time.time()-5;s.last_surface=now
     s.ledger={1:{'epoch':1,'terminal':False,'wall':time.time()}}
     sync_count=[0]

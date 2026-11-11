@@ -27,7 +27,8 @@ docs/
 │  ├─ [20261111-稳定渲染默认与Worker日志落盘验证.md](证据/验证/20261111-稳定渲染默认与Worker日志落盘验证.md)
 │  ├─ [20261111-冷启动重试与导航取证修正验证.md](证据/验证/20261111-冷启动重试与导航取证修正验证.md)
 │  ├─ [20261111-调度控制台后端接口验证.md](证据/验证/20261111-调度控制台后端接口验证.md)
-│  └─ [20261111-调度控制台前端联调验证.md](证据/验证/20261111-调度控制台前端联调验证.md)
+│  ├─ [20261111-调度控制台前端联调验证.md](证据/验证/20261111-调度控制台前端联调验证.md)
+│  └─ [20261112-固定FFmpeg9与AAC音轨修复验证.md](证据/验证/20261112-固定FFmpeg9与AAC音轨修复验证.md)
 └─ adr/
    ├─ [0001-scrcpy-pipeline-for-audio-video-isolation.md](adr/0001-scrcpy-pipeline-for-audio-video-isolation.md)
    ├─ [0002-time-segmented-mp4-recording.md](adr/0002-time-segmented-mp4-recording.md)

@@ -11,6 +11,8 @@ DEV_DIR = REPO_ROOT.parent / "mumu_lbcut_tool_dev"
 TMP_DIR = DEV_DIR / "mumu_lbcut_tool_tmp"
 TOOLS_DIR = DEV_DIR / "tools"
 SCRCPY_DIR = TOOLS_DIR / "scrcpy"
+FFMPEG_BUILD = "9.0.2-full_build-www.gyan.dev"
+FFMPEG_DIR = TOOLS_DIR / "ffmpeg-9.0.2-full_build"
 
 # 测试产物目录
 MVP_OUTPUT_DIR = TMP_DIR / "20261020-mvp"

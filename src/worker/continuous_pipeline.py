@@ -14,7 +14,6 @@ import logging
 import os
 from pathlib import Path
 import re
-import shutil
 import signal
 import subprocess
 import threading
@@ -141,13 +140,11 @@ def read_fragment_manifest(directory: Path) -> dict[int, Fragment]:
 class ContinuousPipeline:
     """一代采集会话只有一个 scrcpy 和一个 segmenter；故障恢复才另起一代。"""
     def __init__(self, serial, output_dir, scrcpy_exe, adb_exe, segment_duration_sec,
-                 ffmpeg_exe=None, max_size=1280, bit_rate='4M', max_fps=None,
+                 ffmpeg_exe, max_size=1280, bit_rate='4M', max_fps=None,
                  start_index=1, producer_factory=None, total_duration_sec=0):
         self.serial, self.output_dir = serial, Path(output_dir).resolve()
         self.scrcpy_exe, self.adb_exe = Path(scrcpy_exe), Path(adb_exe)
-        self.ffmpeg_exe = str(ffmpeg_exe or shutil.which('ffmpeg') or '')
-        if not self.ffmpeg_exe or not shutil.which('ffprobe'):
-            raise FileNotFoundError('连续采集需要 ffmpeg 与 ffprobe；不会降级伪报成功')
+        self.ffmpeg_exe = str(ffmpeg_exe)
         if segment_duration_sec <= 0 or start_index < 1:
             raise ValueError('分段时长和起始序号必须为正数')
         self.segment_duration_sec = segment_duration_sec
@@ -185,8 +182,9 @@ class ContinuousPipeline:
         if self.total_duration_sec:
             # 切点允许提前 delta；截止点同样提前 delta，避免恰在总时长前的关键帧开出极短尾片。
             limit = ['-t', f'{max(.1, self.total_duration_sec - SEGMENT_TIME_DELTA):.3f}']
+        # MuMu 的 AAC-LC 包没有关键包标记；只放行音频的初始非关键包，保留视频关键帧门禁。
         mux_cmd = [self.ffmpeg_exe,'-hide_banner','-loglevel','warning','-nostdin','-n',
-            '-f','matroska','-i','pipe:0','-map','0:v:0','-map','0:a:0','-c','copy',*limit,
+            '-f','matroska','-i','pipe:0','-map','0:v:0','-map','0:a:0','-c','copy','-copyinkf:a',*limit,
             '-f','segment','-segment_time',str(self.segment_duration_sec),
             '-segment_time_delta',str(SEGMENT_TIME_DELTA),'-reset_timestamps','1',
             '-segment_start_number',str(self.start_index),'-segment_format','mp4',

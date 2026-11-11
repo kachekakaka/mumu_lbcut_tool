@@ -4,7 +4,7 @@
 
 当前交付不包含上传服务、跨主机接管或已经通过长稳实测的承诺；网页控制台已完成台式机真实录制联调，第二设备与真实手机访问尚待验证。操作入口与网页构建见 [调度运行说明](docs/最小调度运行说明.md)，后端接口及剩余验收见 [控制台后端方案](docs/方案/20261111-调度控制台后端接口实施方案.md)，页面见 [控制台前端方案](docs/方案/20261111-调度控制台前端方案.md)。
 
-运行环境：Windows、Python 3.11、MuMu、可用的 scrcpy 和 ffprobe。Python 运行依赖见 `requirements.txt`，测试依赖见 `requirements-test.txt` 和 [测试入口](tests/README.md)；真实媒体测试需 ffmpeg。
+运行环境：Windows、Python 3.11、MuMu、scrcpy，以及固定的 Gyan FFmpeg/ffprobe 9.0.2 full build。媒体工具部署见 [运行说明](docs/最小调度运行说明.md#固定媒体工具部署)。Python 运行依赖见 `requirements.txt`，测试依赖见 `requirements-test.txt` 和 [测试入口](tests/README.md)。
 
 ## 文档入口
 
@@ -42,7 +42,7 @@
 | `../mumu_lbcut_tool_dev/runtime-console/` | v2 控制台默认长期调度数据库与事件日志；仅 `run --data-dir` 可指定其他独立目录 |
 | `../mumu_lbcut_tool_dev/runtime/` | 保留旧运行数据及共享实例锁；新服务不读取旧库、不迁移或覆盖已有数据库 |
 | 用户指定的 `--output-dir` | 正式录像目录；按调度任务与 Worker run_id 分层，禁止覆盖已有录像 |
-| `../mumu_lbcut_tool_dev/tools/` | 已准备的 scrcpy、ADB/媒体工具；部署探测与安装仍需按目标环境确认 |
+| `../mumu_lbcut_tool_dev/tools/` | scrcpy 与固定媒体工具；ffmpeg/ffprobe 成套放入 `ffmpeg-9.0.2-full_build/bin/`，二进制不进 Git，具体部署见运行说明 |
 
 临时与测试材料按任务或批次分子目录，例如 `mumu_lbcut_tool_tmp/20261020-任务名称/`；同日多批次追加序号。打包产物使用独立目录或文件名，不覆盖已有版本。打包目录存放产物，验包运行和解压副本放入临时目录；打包产物不混入私人配置或测试运行数据。
 

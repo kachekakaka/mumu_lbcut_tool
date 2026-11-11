@@ -230,7 +230,8 @@ class SessionRig:
     def __init__(self, monitor):
         self.stream = io.StringIO()
         controller = SimpleNamespace(emitter=WorkerEventEmitter(self.stream), current_generation_id=1)
-        self.session = ContinuousSession(controller, 'serial', 'scrcpy', 'adb')
+        self.session = ContinuousSession(controller, 'serial', 'scrcpy', 'adb',
+                                         SimpleNamespace(ffmpeg='ffmpeg', ffprobe='ffprobe'))
         self.session.pipe = SimpleNamespace(monitor=monitor)
         self.add_segment(1)
 

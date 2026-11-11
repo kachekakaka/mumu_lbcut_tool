@@ -1,4 +1,5 @@
-"""外部二进制依赖（scrcpy、adb）管理模块。"""
+"""外部工具管理：媒体工具固定构建和目录，不使用系统 PATH 回退。"""
+from dataclasses import dataclass
 from pathlib import Path
 import os
 import shutil
@@ -6,8 +7,9 @@ import urllib.request
 import zipfile
 import json
 import logging
+import subprocess
 
-from src.mvp.config import SCRCPY_DIR, TOOLS_DIR, get_adb_exe
+from src.mvp.config import SCRCPY_DIR, FFMPEG_DIR, FFMPEG_BUILD, get_adb_exe
 
 logger = logging.getLogger(__name__)
 
@@ -15,12 +17,49 @@ SCRCPY_RELEASE_API = "https://api.github.com/repos/Genymobile/scrcpy/releases/la
 SCRCPY_DEFAULT_WIN64_URL = "https://github.com/Genymobile/scrcpy/releases/download/v3.1/scrcpy-win64-v3.1.zip"
 
 
+@dataclass(frozen=True)
+class MediaTools:
+    ffmpeg: Path
+    ffprobe: Path
+
+
 class DependencyManager:
     """管理 scrcpy 及 ADB 等外部工具的检查与获取。"""
 
-    def __init__(self, scrcpy_dir: Path = SCRCPY_DIR):
+    def __init__(self, scrcpy_dir: Path = SCRCPY_DIR, ffmpeg_dir: Path = FFMPEG_DIR):
         self.scrcpy_dir = scrcpy_dir
         self.scrcpy_exe_path = self.scrcpy_dir / "scrcpy.exe"
+        self.ffmpeg_dir = Path(ffmpeg_dir).resolve()
+
+    def get_media_tools(self) -> MediaTools:
+        """开机前校验成套固定工具；部署包负责携带文件，运行期不下载或升级。"""
+        paths = [self.ffmpeg_dir / "bin" / (name + ".exe") for name in ("ffmpeg", "ffprobe")]
+        configurations = []
+        compilers = []
+        for name, path in zip(("ffmpeg", "ffprobe"), paths):
+            if not path.is_file():
+                raise FileNotFoundError(f"缺少固定媒体工具：{path}；请部署 Gyan {FFMPEG_BUILD} 的 ffmpeg/ffprobe 配套文件")
+            try:
+                result = subprocess.run([str(path), "-version"], capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=8,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise RuntimeError(f"固定媒体工具无法执行：{path}：{exc}") from exc
+            lines = result.stdout.splitlines()
+            if result.returncode or not lines or not lines[0].startswith(f"{name} version {FFMPEG_BUILD} "):
+                actual = lines[0] if lines else result.stderr.strip()[:200]
+                raise RuntimeError(f"媒体工具版本不符：{path}；要求 {FFMPEG_BUILD}，实际 {actual}")
+            compiler = next((line for line in lines if line.startswith("built with ")), "")
+            configuration = next((line for line in lines if line.startswith("configuration: ")), "")
+            if not compiler or not configuration:
+                raise RuntimeError(f"媒体工具缺少构建信息：{path}")
+            compilers.append(compiler)
+            configurations.append(configuration)
+            logger.info("固定媒体工具：%s | %s | %s", path, lines[0], compiler)
+        if compilers[0] != compilers[1] or configurations[0] != configurations[1]:
+            raise RuntimeError("ffmpeg 与 ffprobe 的构建配置不一致，必须部署同一 Gyan 发行包中的配套文件")
+        logger.info("固定媒体工具构建配置：%s", configurations[0])
+        return MediaTools(*paths)
 
     def get_adb_path(self) -> Path:
         """获取并校验 ADB 执行路径。"""

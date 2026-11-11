@@ -5,7 +5,7 @@ import logging
 import math
 import os
 from pathlib import Path
-import shutil
+from src.mvp.dep_manager import DependencyManager
 
 from src.worker.executor import run_command
 
@@ -37,9 +37,10 @@ def verify_segment_file(file_path: Path, min_size_bytes: int = 0,
     if size == 0:
         result.reject_reason = "零字节空文件，写入截断"
         return result
-    probe = ffprobe_exe or shutil.which("ffprobe")
-    if not probe:
-        result.reject_reason = "未检测到 ffprobe，无法验证双轨媒体"
+    try:
+        probe = ffprobe_exe or DependencyManager().get_media_tools().ffprobe
+    except (OSError, RuntimeError) as exc:
+        result.reject_reason = f"固定媒体工具不可用：{exc}"
         return result
     cmd = [str(probe), "-v", "error", "-show_entries",
            "stream=codec_type,codec_name,duration,nb_frames:format=duration,size",

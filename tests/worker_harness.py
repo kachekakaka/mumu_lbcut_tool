@@ -176,8 +176,10 @@ def build_worker(monkeypatch, tmp_path, valid_media, *, total=4, segment=2,
 
     monkeypatch.setattr(cm, "time", clock)
     monkeypatch.setattr(cm, "WorkerNavigator", Navigator)
+    media_tools = cm.DependencyManager().get_media_tools()
     monkeypatch.setattr(cm, "DependencyManager", lambda: SimpleNamespace(
-        ensure_scrcpy=lambda: Path("scrcpy.exe"), get_adb_path=lambda: Path("adb.exe")))
+        ensure_scrcpy=lambda: Path("scrcpy.exe"), get_adb_path=lambda: Path("adb.exe"),
+        get_media_tools=lambda: media_tools))
     monkeypatch.setattr(cm, "MuMuClient", lambda **kw: SimpleNamespace(
         launch_player=lambda index: True, connect_adb=lambda index: "synthetic-device",
         optimize_performance_for_recording=lambda *args, **kw: None))

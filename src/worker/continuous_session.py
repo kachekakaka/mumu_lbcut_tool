@@ -53,11 +53,12 @@ class OverlayRecoveryEvent(BaseWorkerEvent):
 
 
 class ContinuousSession:
-    def __init__(self, controller, serial, scrcpy_exe, adb_exe,
+    def __init__(self, controller, serial, scrcpy_exe, adb_exe, media_tools,
                  pipeline_factory=ContinuousPipeline, watchdog_factory=StallWatchdog,
                  clock=time.monotonic, sleeper=time.sleep, device_probe=None):
         self.c=controller
         self.serial,self.scrcpy,self.adb=serial,scrcpy_exe,adb_exe
+        self.media_tools=media_tools
         self.pipeline_factory,self.watchdog_factory=pipeline_factory,watchdog_factory
         self.clock,self.sleep=clock,sleeper
         self.device_online=device_probe or self._adb_device_online
@@ -119,7 +120,8 @@ class ContinuousSession:
         c.action_dispatcher.current_generation_id=c.current_generation_id
         start_index=max(self.ledger,default=0)+1
         self.pipe=self.pipeline_factory(serial=self.serial,output_dir=c.task_output_dir,
-            scrcpy_exe=self.scrcpy,adb_exe=self.adb,segment_duration_sec=c.config.segment_duration_sec,
+            scrcpy_exe=self.scrcpy,adb_exe=self.adb,ffmpeg_exe=self.media_tools.ffmpeg,
+            segment_duration_sec=c.config.segment_duration_sec,
             start_index=start_index,total_duration_sec=self.remaining_duration() or 0)
         c._pipeline=self.pipe
         self.pipe.wait_hook=c._pipeline_wait_tick
@@ -163,7 +165,7 @@ class ContinuousSession:
             row['final']=bool(final and f.index==latest)
             target=c.task_output_dir/f'{c.target_room_id}_{c.run_id}_{f.index:06d}.mp4'
             self.pending[f.index]=self.pool.submit(finalize_segment,f.path,target,
-                allow_short_tail=ending,timeout=8.0)
+                ffprobe_exe=self.media_tools.ffprobe,allow_short_tail=ending,timeout=8.0)
         self.collect()
 
     def abort(self,index,reason):
