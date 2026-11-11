@@ -14,7 +14,8 @@ docs/
 ├─ [待办.md](待办.md)
 ├─ 术语.md                          按需
 ├─ 方案/
-│  └─ [20261105-录播调度平台架构与功能实施方案.md](方案/20261105-录播调度平台架构与功能实施方案.md)
+│  ├─ [20261105-录播调度平台架构与功能实施方案.md](方案/20261105-录播调度平台架构与功能实施方案.md)
+│  └─ [20261111-调度控制台前端方案.md](方案/20261111-调度控制台前端方案.md)
 ├─ 证据/验证/
 │  ├─ [20261020-MVP技术可行性验证.md](证据/验证/20261020-MVP技术可行性验证.md)
 │  ├─ [20261031-录播Worker技术验证.md](证据/验证/20261031-录播Worker技术验证.md)
@@ -39,7 +40,8 @@ docs/
    ├─ [0012-continuous-capture-segment-muxer.md](adr/0012-continuous-capture-segment-muxer.md)
    ├─ [0013-freeze-detection-from-captured-stream.md](adr/0013-freeze-detection-from-captured-stream.md)
    ├─ [0014-remove-restart-mode-and-dual-pipeline.md](adr/0014-remove-restart-mode-and-dual-pipeline.md)
-   └─ [0015-auto-retry-while-live-without-manual-unblock.md](adr/0015-auto-retry-while-live-without-manual-unblock.md)
+   ├─ [0015-auto-retry-while-live-without-manual-unblock.md](adr/0015-auto-retry-while-live-without-manual-unblock.md)
+   └─ [0016-console-frontend-separate-build-and-private-network-access.md](adr/0016-console-frontend-separate-build-and-private-network-access.md)
 
 archive/docs/                       仓库根目录下，按需
 ├─ 方案/

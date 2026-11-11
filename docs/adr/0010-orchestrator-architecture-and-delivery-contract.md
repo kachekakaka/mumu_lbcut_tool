@@ -3,7 +3,7 @@
 为了实现对多台 MuMu 模拟器和多直播间的高可靠并发编排，调度平台（Orchestrator）采用基于 FastAPI 的内嵌 Web 控制台与 RESTful API 的单进程常驻主控架构。采用 SQLite 持久化任务与切片元数据，并支持通过 YAML 批量导入监控主播；调度策略采用先进先出（FIFO）无抢占排队；容灾机制采取“优先切机漂移，原实例后台 ADB 强杀复位；无空闲则原地自愈”；切片产物不执行本地强制物理删除，而是通过标准 HTTP Webhook 契约对接外部上传服务（如 biliup 上传服务），实现录播控制与视频发布的清晰解耦。
 
 ## Status
-accepted
+accepted（第 1 条的前端形态由 [ADR 0016](0016-console-frontend-separate-build-and-private-network-access.md) 修订；第 4 条“维护态、无空闲实例时原地重试”的容灾处理已由 [ADR 0015](0015-auto-retry-while-live-without-manual-unblock.md) 取代）
 
 ## Context
 随着录播 Worker（执行单元）的成熟，系统需要一套工业级的上层调度平台，解决多模拟器并发分配、开播批量巡检、风控阻断自愈、切片交付等实际运营问题。以往单体录屏软件要么缺乏多开协调，要么直接在录制器内部耦合大文件上传逻辑，导致职责过载且极易因网络或鉴权异常阻塞主录制管线。
