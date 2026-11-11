@@ -12,10 +12,10 @@ docs/
 ├─ [需求说明.md](需求说明.md)
 ├─ 设计说明.md                      按需
 ├─ [待办.md](待办.md)
-├─ 术语.md                          按需
 ├─ 方案/
 │  ├─ [20261105-录播调度平台架构与功能实施方案.md](方案/20261105-录播调度平台架构与功能实施方案.md)
-│  └─ [20261111-调度控制台前端方案.md](方案/20261111-调度控制台前端方案.md)
+│  ├─ [20261111-调度控制台前端方案.md](方案/20261111-调度控制台前端方案.md)
+│  └─ [20261111-调度控制台后端接口实施方案.md](方案/20261111-调度控制台后端接口实施方案.md)
 ├─ 证据/验证/
 │  ├─ [20261020-MVP技术可行性验证.md](证据/验证/20261020-MVP技术可行性验证.md)
 │  ├─ [20261031-录播Worker技术验证.md](证据/验证/20261031-录播Worker技术验证.md)
@@ -25,7 +25,9 @@ docs/
 │  ├─ [20261109-冻结检测改用录像流实机验证.md](证据/验证/20261109-冻结检测改用录像流实机验证.md)
 │  ├─ [20261111-录制自动恢复台式机实机验证.md](证据/验证/20261111-录制自动恢复台式机实机验证.md)
 │  ├─ [20261111-稳定渲染默认与Worker日志落盘验证.md](证据/验证/20261111-稳定渲染默认与Worker日志落盘验证.md)
-│  └─ [20261111-冷启动重试与导航取证修正验证.md](证据/验证/20261111-冷启动重试与导航取证修正验证.md)
+│  ├─ [20261111-冷启动重试与导航取证修正验证.md](证据/验证/20261111-冷启动重试与导航取证修正验证.md)
+│  ├─ [20261111-调度控制台后端接口验证.md](证据/验证/20261111-调度控制台后端接口验证.md)
+│  └─ [20261111-调度控制台前端联调验证.md](证据/验证/20261111-调度控制台前端联调验证.md)
 └─ adr/
    ├─ [0001-scrcpy-pipeline-for-audio-video-isolation.md](adr/0001-scrcpy-pipeline-for-audio-video-isolation.md)
    ├─ [0002-time-segmented-mp4-recording.md](adr/0002-time-segmented-mp4-recording.md)
@@ -41,7 +43,8 @@ docs/
    ├─ [0013-freeze-detection-from-captured-stream.md](adr/0013-freeze-detection-from-captured-stream.md)
    ├─ [0014-remove-restart-mode-and-dual-pipeline.md](adr/0014-remove-restart-mode-and-dual-pipeline.md)
    ├─ [0015-auto-retry-while-live-without-manual-unblock.md](adr/0015-auto-retry-while-live-without-manual-unblock.md)
-   └─ [0016-console-frontend-separate-build-and-private-network-access.md](adr/0016-console-frontend-separate-build-and-private-network-access.md)
+   ├─ [0016-console-frontend-separate-build-and-private-network-access.md](adr/0016-console-frontend-separate-build-and-private-network-access.md)
+   └─ [0017-console-control-scope-and-session-intent.md](adr/0017-console-control-scope-and-session-intent.md)
 
 archive/docs/                       仓库根目录下，按需
 ├─ 方案/
@@ -61,6 +64,8 @@ archive/docs/                       仓库根目录下，按需
 
 当前专项验证：[持续采集与遮挡恢复](证据/验证/20261106-持续采集与遮挡恢复验证.md)；前期结果：[目标直播定位与实录验证](证据/验证/20261106-目标直播定位与实录验证.md)。
 
+领域词汇表已位于仓库根目录 [CONTEXT.md](../CONTEXT.md)，不在本目录另建重复术语正文。
+
 ## 文档职责与入口
 
 | 位置 | 唯一正文职责 | 创建时机 |
@@ -68,7 +73,7 @@ archive/docs/                       仓库根目录下，按需
 | [docs/需求说明.md](需求说明.md) | 已确认的目标、行为、边界和验收要求；明确标记尚未实现的部分 | 需求需要持久维护时 |
 | `docs/设计说明.md` | 当前架构、模块职责、数据与接口约束，以及代码和测试入口 | 技术设计确定后 |
 | [docs/待办.md](待办.md) | 未完工作、已知缺陷、未验证事项及对应依据 | 出现需跨任务跟踪的事项时 |
-| `docs/术语.md` | 易混概念及业务术语，不重复实现参数 | 确有术语解释需要时 |
+| [CONTEXT.md](../CONTEXT.md) | 已有领域词汇表：易混概念及业务术语，不重复实现参数；不另建重复术语正文 | 已有，按概念变化维护 |
 | [docs/方案/](方案/) | 待审阅、待实施、实施中、待验证或暂停的专项方案 | 用户要求或同意编写方案时 |
 | `docs/证据/验证/YYYYMMDD-任务名称.md` | 需要长期保留的验证摘要、环境、结果、未测项与外部材料位置 | 形成有留存价值的验证结论时 |
 | [docs/adr/](adr/) | 仍有效的重大取舍、原因和影响 | 存在值得长期解释的设计决定时 |
@@ -129,6 +134,7 @@ ADR 的有效性与方案是否完成分开判断：仍适用的决定留在 `do
 ## 当前最小调度入口
 
 - [最小调度运行说明](最小调度运行说明.md)
+- [控制台后端验证](证据/验证/20261111-调度控制台后端接口验证.md)
 - [最小调度闭环与回归验证](证据/验证/20261105-最小调度闭环与回归验证.md)
 
 当前实机补验：[MuMu 渲染诊断与直播遮挡恢复验收](证据/验证/20261106-MuMu渲染诊断与直播遮挡恢复验收.md)。

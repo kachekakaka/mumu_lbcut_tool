@@ -26,11 +26,22 @@ class InstanceSlot:
 class JobStatus(Enum):
     """录播任务生命周期状态。"""
     PENDING = "pending"        # 等待分配可用实例
+    STARTING = "starting"
     RUNNING = "running"        # Worker 已拉起，正在录制
     STOPPING = "stopping"      # 正在请求优雅封口退出
     FINISHED = "finished"      # 正常结束（下播或达到总时长限制）
     FAILED = "failed"          # 异常失败终止
-    OFFLINE = "offline"        # 目标确诊未开播
+    NEEDS_RECONCILE = "needs_reconcile"
+    FINISHED_WITH_WARNINGS = "finished_with_warnings"
+    CANCELLED = "cancelled"
+
+
+class CommandStatus(Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    INTERRUPTED = "interrupted"
 
 
 @dataclass

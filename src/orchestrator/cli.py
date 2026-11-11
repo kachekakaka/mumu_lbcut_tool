@@ -1,35 +1,49 @@
-"""最小调度 CLI：SQLite 命令队列与单进程运行入口，不包含 WebUI/上传服务。"""
+"""调度 CLI：run 启动统一服务，其余入口只访问 HTTP。"""
 import argparse
 import json
 import logging
 from pathlib import Path
-import signal
-import threading
-import time
-
-from src.orchestrator.storage import Store
+import uuid
+import requests
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_DATA_DIR = REPO_ROOT.parent / "mumu_lbcut_tool_dev" / "runtime"
+DEFAULT_DATA_DIR = REPO_ROOT.parent / "mumu_lbcut_tool_dev" / "runtime-console"
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="MuMu 自动录播最小调度器")
-    parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR,
-                        help="长期运行数据目录；不放在临时产物目录")
+    parser = argparse.ArgumentParser(description="MuMu 调度控制台")
     sub = parser.add_subparsers(dest="command", required=True)
     add = sub.add_parser("add", help="新增监控目标；重复地址返回既有 ID")
-    add.add_argument("target")
+    add.add_argument("target", nargs="+")
     add.add_argument("--manual-only", action="store_true")
     add.add_argument("--allow-unconfirmed-identity", action="store_true",
                      help="显式接受身份未确认风险，不能放行确诊错房")
-    sub.add_parser("status", help="查看实例、任务、目标和切片")
-    for name, key in (("record", "target_id"), ("remove", "target_id"), ("stop", "job_id")):
+    status = sub.add_parser("status", help="通过 HTTP 查看分页状态或命令结果")
+    status.add_argument("--command-id")
+    status.add_argument("--limit", type=int, default=50)
+    status.add_argument("--offset", type=int, default=0)
+    status.add_argument("--history", action="store_true")
+    controls = [add]
+    for name, key in (("record", "target_id"), ("remove", "target_id")):
         p = sub.add_parser(name)
         p.add_argument(key)
+        controls.append(p)
+    stop = sub.add_parser("stop")
+    stop.add_argument("job_id", nargs="?")
+    stop.add_argument("--target-id")
+    stop.add_argument("--session-key")
+    controls.append(stop)
     rec = sub.add_parser("reconcile", help="请求对账；不会接管未知进程")
     rec.add_argument("job_id", nargs="?", default="")
+    controls.append(rec)
+    for client in [status, *controls]:
+        client.add_argument("--server", default="http://127.0.0.1:8000")
+    for client in controls:
+        client.add_argument("--request-id", help="同一次操作重试必须使用原 UUID")
     run = sub.add_parser("run", help="运行调度；Ctrl+C 平滑停止本主控任务")
+    run.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
+    run.add_argument("--host", default="127.0.0.1")
+    run.add_argument("--port", type=int, default=8000)
     run.add_argument("--instances", required=True, help="明确允许使用的实例，例如 2,3")
     run.add_argument("--output-dir", type=Path, required=True)
     run.add_argument("--navigation-timeout", type=float, default=300.0,
@@ -45,63 +59,56 @@ def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    if args.command == "run":
-        try:
-            from src.worker.room_locator import validate_navigation_timeout
-            validate_navigation_timeout(args.navigation_timeout)
-            indices = [int(x) for x in args.instances.split(",")]
-            if not indices or any(i < 0 for i in indices):
-                raise ValueError()
-            if args.scan_interval <= 0 or args.segment_duration <= 0:
-                raise ValueError()
-            if args.max_runtime < 0:
-                raise ValueError()
-        except ValueError:
-            parser.error("实例索引或时间参数非法")
-    store = Store(args.data_dir.resolve() / "orchestrator.sqlite3")
+    request_id = None
     try:
-        if args.command == "add":
-            key = store.add_target(args.target, auto_record=not args.manual_only,
-                                   allow_unconfirmed=args.allow_unconfirmed_identity)
-            print(json.dumps({"target_id": key}, ensure_ascii=False))
-        elif args.command == "status":
-            result = {name: store.rows(f"SELECT * FROM {name}") for name in
-                      ("targets", "instances", "jobs", "segments", "commands")}
-            print(json.dumps(result, ensure_ascii=False, indent=2))
-        elif args.command != "run":
-            subject = getattr(args, "target_id", getattr(args, "job_id", ""))
-            key = store.enqueue_command(args.command, str(subject))
-            print(json.dumps({"command_id": key, "status": "queued", "note": "由运行中的调度器执行"}, ensure_ascii=False))
+        if args.command == "run":
+            from src.orchestrator.server import ServerConfig, run_server
+            config = ServerConfig(args.data_dir.resolve(), args.output_dir.resolve(), [int(v) for v in args.instances.split(",")],
+                host=args.host, port=args.port, scan_interval=args.scan_interval, segment_duration=args.segment_duration,
+                navigation_timeout=args.navigation_timeout, max_runtime=args.max_runtime)
+            return run_server(config)
+        if args.command == "stop" and (bool(args.job_id) == bool(args.target_id) or bool(args.target_id) != bool(args.session_key)):
+            parser.error("stop JOB_ID 与 stop --target-id ID --session-key KEY 必须二选一")
+        def call(method, path, **kw):
+            response = requests.request(method, args.server.rstrip("/") + "/api/" + path, timeout=10, **kw)
+            data = response.json()
+            if not response.ok:
+                raise RuntimeError(json.dumps(data, ensure_ascii=False))
+            return data
+        if args.command == "status":
+            if args.command_id:
+                result = call("GET", "commands/" + args.command_id)
+            else:
+                params = dict(limit=args.limit, offset=args.offset)
+                result = dict(system=call("GET", "system"), overview=call("GET", "overview", params=params))
+                for name in ("instances", "targets", "jobs", "segments"):
+                    filters = dict(params, active="false" if args.history else "true") if name == "jobs" else params
+                    result[name] = call("GET", name, params=filters)
         else:
-            from src.orchestrator.scheduler import Scheduler
-            scheduler = Scheduler(store, args.output_dir, indices,
-                scan_interval_sec=args.scan_interval,
-                segment_duration_sec=args.segment_duration, navigation_timeout_sec=args.navigation_timeout)
-            stop = threading.Event()
-            def request_stop(signum, frame):
-                stop.set()
-            old = {}
-            for sig in (signal.SIGINT, signal.SIGTERM):
-                old[sig] = signal.signal(sig, request_stop)
-            if hasattr(signal, "SIGBREAK"):
-                old[signal.SIGBREAK] = signal.signal(signal.SIGBREAK, request_stop)
-            started = time.monotonic()
-            try:
-                while not stop.is_set():
-                    scheduler.tick()
-                    if args.max_runtime and time.monotonic() - started >= args.max_runtime:
-                        break
-                    stop.wait(.2)
-            finally:
-                scheduler.close()
-                for sig, handler in old.items():
-                    signal.signal(sig, handler)
+            request_id = str(uuid.UUID(args.request_id)) if args.request_id else str(uuid.uuid4())
+            method, body = "POST", {}
+            if args.command == "add":
+                path = "targets"
+                body = dict(targets=args.target, manual_only=args.manual_only, allow_unconfirmed_identity=args.allow_unconfirmed_identity)
+            elif args.command == "remove":
+                method, path = "DELETE", "targets/" + args.target_id
+            elif args.command == "record":
+                path = "targets/" + args.target_id + "/record"
+            elif args.command == "stop":
+                path = "targets/" + args.target_id + "/stop" if args.target_id else "jobs/" + args.job_id + "/stop"
+                body = dict(session_key=args.session_key) if args.target_id else {}
+            else:
+                path, body = "reconcile", dict(job_id=args.job_id or None)
+            result = call(method, path, json=body, headers={"Idempotency-Key": request_id})
+            result["request_id"] = request_id
+        print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
-    except Exception:
-        logging.exception("调度命令失败；数据库与录像保留供对账")
+    except requests.RequestException:
+        print(json.dumps(dict(code="connection_failed", message="无法确认服务端结果；保留原请求编号，恢复连接后用相同参数和编号重试", request_id=request_id), ensure_ascii=False))
         return 1
-    finally:
-        store.close()
+    except Exception as exc:
+        print(json.dumps(dict(code="command_failed", message=str(exc), request_id=request_id), ensure_ascii=False))
+        return 1
 
 
 if __name__ == "__main__":

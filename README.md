@@ -1,10 +1,10 @@
 # mumu_lbcut_tool
 
-本项目包含 MuMu 单路录播 Worker，以及 SQLite 持久化的最小自动调度 CLI。调度层负责开下播查询、去重排队和实例分配；Worker 负责本地准入、采集、有限恢复与切片封口。
+本项目包含 MuMu 单路录播 Worker、SQLite 持久化调度器、控制台 HTTP 后端和网页控制台。调度 CLI 与网页通过 HTTP 查询和控制；调度层负责开下播查询、去重排队和实例分配，Worker 负责本地准入、采集、有限恢复与切片封口。
 
-当前交付不包含完整 WebUI、上传服务、跨主机接管或已经通过长稳实测的承诺。操作入口见 [最小调度运行说明](docs/最小调度运行说明.md)，验证范围见 [本轮回归记录](docs/证据/验证/20261105-最小调度闭环与回归验证.md)。
+当前交付不包含上传服务、跨主机接管或已经通过长稳实测的承诺；网页控制台已完成台式机真实录制联调，第二设备与真实手机访问尚待验证。操作入口与网页构建见 [调度运行说明](docs/最小调度运行说明.md)，后端接口及剩余验收见 [控制台后端方案](docs/方案/20261111-调度控制台后端接口实施方案.md)，页面见 [控制台前端方案](docs/方案/20261111-调度控制台前端方案.md)。
 
-运行环境：Windows、Python 3.11、MuMu、可用的 scrcpy 和 ffprobe。Python 运行依赖见 `requirements.txt`，测试另需 pytest；真实媒体测试需 ffmpeg。
+运行环境：Windows、Python 3.11、MuMu、可用的 scrcpy 和 ffprobe。Python 运行依赖见 `requirements.txt`，测试依赖见 `requirements-test.txt` 和 [测试入口](tests/README.md)；真实媒体测试需 ffmpeg。
 
 ## 文档入口
 
@@ -26,6 +26,7 @@
 │  ├─ .gitignore                    本地文件忽略规则
 │  ├─ docs/
 │  │  └─ README.md                  文档结构与生命周期
+│  ├─ web/                         网页控制台源码；web/dist/ 构建结果与 node_modules 不进 Git
 │  ├─ tests/                       测试代码、固定夹具与测试说明（按需）
 │  └─ archive/docs/                归档方案与失效决定（按需）
 └─ mumu_lbcut_tool_dev/             仓外工作目录
@@ -35,10 +36,11 @@
 
 | 位置 | 存放内容与边界 |
 | --- | --- |
-| 本仓库 | `src/worker/`、`src/orchestrator/`、源码依赖、长期文档与可重复测试；不保存运行数据库或真实录像 |
+| 本仓库 | `src/worker/`、`src/orchestrator/`、`web/`（网页控制台源码及其单元测试）、源码依赖、长期文档与可重复测试；不保存运行数据库、真实录像或网页构建结果 |
 | `../mumu_lbcut_tool_dev/mumu_lbcut_tool_tmp/` | 临时脚本、草稿、探针、构建中间文件、测试输入副本、输出、日志、截图、报告及验包解压副本 |
 | `../mumu_lbcut_tool_dev/mumu_lbcut_tool_dists/` | 打包生成的程序目录、安装包、便携包及发布压缩包；测试包同样放在这里，并在名称中注明测试用途 |
-| `../mumu_lbcut_tool_dev/runtime/` | 默认长期调度数据库、事件日志和实例锁。调度 CLI 可用 `--data-dir` 指定独立目录；不清理、不覆盖已有数据库 |
+| `../mumu_lbcut_tool_dev/runtime-console/` | v2 控制台默认长期调度数据库与事件日志；仅 `run --data-dir` 可指定其他独立目录 |
+| `../mumu_lbcut_tool_dev/runtime/` | 保留旧运行数据及共享实例锁；新服务不读取旧库、不迁移或覆盖已有数据库 |
 | 用户指定的 `--output-dir` | 正式录像目录；按调度任务与 Worker run_id 分层，禁止覆盖已有录像 |
 | `../mumu_lbcut_tool_dev/tools/` | 已准备的 scrcpy、ADB/媒体工具；部署探测与安装仍需按目标环境确认 |
 

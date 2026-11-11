@@ -5,35 +5,36 @@ from pathlib import Path
 from unittest.mock import Mock
 
 from src.mvp.room_resolver import ResolvedRoom, RoomStatus
-from src.orchestrator.room_scanner import RoomScanner
+from src.orchestrator.storage import Store
+from console_helpers import observe_room
 from src.orchestrator.models import WorkerLaunchSpec
 from src.orchestrator.worker_process import WorkerProcessHandle
 from src.worker.navigator import WorkerNavigator
 
 
-def test_unknown_must_not_erase_last_confirmed_live():
-    resolver = Mock()
-    scanner = RoomScanner(resolver=resolver)
-    live, ended = [], []
-    for status in (RoomStatus.LIVE, RoomStatus.UNKNOWN, RoomStatus.ENDED):
-        resolver.batch_resolve.return_value = {
-            "123": ResolvedRoom(web_rid="123", status=status)
-        }
-        scanner.detect_changes(["123"], live.append, ended.append)
-    assert len(live) == 1
-    assert len(ended) == 1
+def test_unknown_must_not_erase_last_confirmed_live(tmp_path):
+    store = Store(tmp_path / 'state.sqlite3')
+    try:
+        target = store.add_target('123')
+        for n, status in enumerate((RoomStatus.LIVE, RoomStatus.UNKNOWN, RoomStatus.ENDED, RoomStatus.ENDED)):
+            observe_room(store, target, ResolvedRoom('123', status), 10 + n * 2)
+            expected = 'ended' if n == 3 else 'live'
+            assert store.row('SELECT trusted_status FROM targets WHERE id=?', (target,))['trusted_status'] == expected
+    finally:
+        store.close()
 
 
-def test_unknown_then_live_must_not_start_duplicate():
-    resolver = Mock()
-    scanner = RoomScanner(resolver=resolver)
-    live = []
-    for status in (RoomStatus.LIVE, RoomStatus.UNKNOWN, RoomStatus.LIVE):
-        resolver.batch_resolve.return_value = {
-            "123": ResolvedRoom(web_rid="123", status=status)
-        }
-        scanner.detect_changes(["123"], live.append)
-    assert len(live) == 1
+def test_unknown_then_live_must_not_start_duplicate(tmp_path):
+    store = Store(tmp_path / 'state.sqlite3')
+    try:
+        target = store.add_target('123')
+        ids = []
+        for n, status in enumerate((RoomStatus.LIVE, RoomStatus.UNKNOWN, RoomStatus.LIVE)):
+            observe_room(store, target, ResolvedRoom('123', status), 10 + n * 2)
+            ids.append(store.create_pending(target, 10 + n * 2))
+        assert len(set(ids)) == 1
+    finally:
+        store.close()
 
 
 def test_short_id_refresh_uses_same_web_route_as_launch(tmp_path):

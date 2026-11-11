@@ -12,8 +12,9 @@ import psutil
 from src.mvp.room_resolver import ResolvedRoom, RoomStatus
 from src.orchestrator.instance_pool import InstancePool
 from src.orchestrator.models import WorkerLaunchSpec
-from src.orchestrator.room_scanner import RoomScanner
-from src.orchestrator.storage import NEEDS_FIX, Store
+from src.orchestrator.room_scanner import ObservationDispatcher
+from src.orchestrator.room_query_process import QueryProcesses
+from src.orchestrator.storage import NEEDS_FIX, Store, ControlError
 from src.orchestrator.worker_process import WorkerProcessHandle
 
 logger = logging.getLogger(__name__)
@@ -88,7 +89,7 @@ def inspect_job_process(job: dict) -> str:
 
 class Scheduler:
     def __init__(self, store: Store, output_dir: Path, instance_indices: list[int],
-                 pool=None, scanner=None, handle_factory=WorkerProcessHandle,
+                 pool=None, query_executor=None, handle_factory=WorkerProcessHandle,
                  clock=time.time, process_probe=inspect_job_process,
                  scan_interval_sec: float = 30.0,
                  ended_interval_sec: float = 10.0, auto_scan: bool = True,
@@ -104,7 +105,6 @@ class Scheduler:
         self.scan_interval = max(.1, scan_interval_sec)
         self.ended_interval = ended_interval_sec
         self.auto_scan, self.segment_duration = auto_scan, segment_duration_sec
-        self.scanner = scanner or RoomScanner()
         self.pool = pool or InstancePool()
         self.handle_factory, self.process_probe = handle_factory, process_probe
         self._lease = HostLease(store.path.with_suffix(".host.lock"))
@@ -113,7 +113,6 @@ class Scheduler:
         self._events: queue.Queue = queue.Queue(maxsize=8192)
         self._event_pending = None
         self._handles, self._closing, self._verifying = {}, {}, {}
-        self._scan_future = None
         self._scan_requested = []
         self._next_scan = 0.0
         self._refresh_future, self._refresh_started = None, 0.0
@@ -122,22 +121,22 @@ class Scheduler:
         self._next_waiting_probe = 0.0
         self._shutdown = False
         self._closed = False
+        self.room_queries = None
         try:
+            self.store.interrupt_commands(self.clock())
+            self.room_queries = query_executor or QueryProcesses()
+            self.observations = ObservationDispatcher(store, self.room_queries, clock)
             self.store.sync_instances(self.pool.refresh(), self.allowed, self.clock())
             self.reconcile()
         except BaseException:
-            self._queries.shutdown(wait=False, cancel_futures=True)
-            self._stoppers.shutdown(wait=False, cancel_futures=True)
-            self._lease.close()
+            try:
+                if self.room_queries:
+                    self.room_queries.close()
+            finally:
+                self._queries.shutdown(wait=False, cancel_futures=True)
+                self._stoppers.shutdown(wait=False, cancel_futures=True)
+                self._lease.close()
             raise
-
-    def apply_snapshot(self, snapshot):
-        for target in self.store.rows("SELECT * FROM targets WHERE enabled=1"):
-            room = snapshot.observations.get(target["raw"])
-            if room is None:
-                continue
-            self.store.observe(target["id"], room, snapshot.timestamp,
-                               ended_interval_sec=self.ended_interval)
 
     def _drain_events(self):
         for _ in range(2000):
@@ -188,54 +187,95 @@ class Scheduler:
             self._closing[job_id] = self._stoppers.submit(self._handles[job_id].stop, 60.0)
 
     def _commands(self):
-        for command in self.store.rows("SELECT * FROM commands WHERE status='pending' ORDER BY created_at LIMIT 30"):
+        for command in self.store.rows("SELECT * FROM commands WHERE status='pending' ORDER BY created_at,id LIMIT 30"):
+            if self._shutdown:
+                break
             kind, subject = command["kind"], command["subject"]
             try:
-                if kind == "stop":
-                    job = self.store.row("SELECT * FROM jobs WHERE id=?", (subject,))
-                    if not job:
-                        raise ValueError("任务不存在")
-                    if job["status"] == "needs_reconcile":
-                        raise ValueError("任务需对账，当前主控没有其控制句柄，不发送不明信号")
-                    self._stop_job(subject, "manual_stop")
-                elif kind == "record":
-                    with self.store.transaction() as db:
-                        target = db.execute("SELECT id FROM targets WHERE id=? AND enabled=1", (subject,)).fetchone()
-                        if not target:
-                            raise ValueError("目标不存在或已移除")
-                        db.execute("UPDATE targets SET note=NULL WHERE id=? AND note LIKE ?", (subject, NEEDS_FIX + "%"))
-                        active = db.execute("SELECT id FROM jobs WHERE target_id=? AND status IN ('pending','starting','running','stopping','needs_reconcile')", (subject,)).fetchone()
-                        if not active:
-                            db.execute("UPDATE targets SET manual_requested=1,suppressed_session=NULL,attempts=0,retry_at=0 WHERE id=?", (subject,))
-                elif kind == "remove":
-                    with self.store.transaction() as db:
-                        if not db.execute("UPDATE targets SET enabled=0,manual_requested=0 WHERE id=?", (subject,)).rowcount:
-                            raise ValueError("目标不存在")
-                    for job in self.store.rows("SELECT * FROM jobs WHERE target_id=? AND status IN ('pending','starting','running','stopping')", (subject,)):
-                        self._stop_job(job["id"], "target_removed")
-                elif kind == "reconcile":
-                    self.reconcile(subject or None)
-                self.store.complete_command(command["id"])
-            except (ValueError, RuntimeError) as exc:
-                self.store.complete_command(command["id"], str(exc))
+                with self.store.transaction() as db:
+                    db.execute("UPDATE commands SET status='running',started_at=? WHERE id=?", (self.clock(), command["id"]))
+                    if kind == "record":
+                        self.store.validate_subject(kind, subject)
+                        result = self.store.existing_record(subject)
+                        if result is None:
+                            target = self.store.row("SELECT * FROM targets WHERE id=?", (subject,))
+                            if not self.observations.dispatch("manual", target, command["id"]):
+                                raise ControlError("query_busy", "手动查询繁忙，请稍后重试")
+                            continue
+                    else:
+                        result = self.store.apply_control(command, self.clock())
+                    self.store.complete_command(command["id"], result, now=self.clock())
+            except ControlError as exc:
+                self.store.complete_command(command["id"], error_code=exc.code, message=str(exc), now=self.clock())
+
+    def _query_results(self):
+        for source, meta, subject, result in self.observations.collect():
+            if source == "verify":
+                self._verifying.pop(subject, None)
+            if source == "manual":
+                self._manual_result(meta, subject, result)
+                continue
+            with self.store.transaction():
+                job = self.store.row("SELECT * FROM jobs WHERE id=?", (subject,)) if source == "verify" else None
+                if source == "verify" and (not job or job["status"] != "starting" or job["session_key"] != meta["session_key"]):
+                    continue
+                accepted = self.store.apply_observation(meta, result.room, self.ended_interval)
+            if source != "verify" or not accepted:
+                continue
+            target = self.store.row("SELECT * FROM targets WHERE id=?", (meta["target_id"],))
+            if not target["enabled"] or target["session_key"] != job["session_key"]:
+                self.store.request_stop(subject, "live_session_changed")
+            elif result.room.status != RoomStatus.LIVE:
+                self.store.defer_start(subject, self.clock(), "prelaunch_not_confirmed_live")
+            else:
+                self._launch(job, target, result.room)
+
+    def _manual_result(self, meta, command_id, result):
+        try:
+            with self.store.transaction() as db:
+                cmd = self.store.row("SELECT * FROM commands WHERE id=?", (command_id,))
+                if not cmd or cmd["status"] != "running":
+                    return
+                t = self.store.row("SELECT * FROM targets WHERE id=?", (meta["target_id"],))
+                existing = self.store.existing_record(t["id"]) if t and t["enabled"] else None
+                if existing and self.store.active_job(t["id"])["session_key"] == t["session_key"]:
+                    self.store.complete_command(command_id, existing, now=self.clock())
+                    return
+                if not t or not t["enabled"] or t["control_revision"] != meta["revision"] or t["session_key"] != meta["session_key"]:
+                    raise ControlError("target_changed", "主播控制状态已变化，请刷新后重试")
+                if not self.store.apply_observation(meta, result.room, self.ended_interval):
+                    raise ControlError("target_changed", "已有更新的开播观测，请重试")
+                # 查询失败仍可保存有序 UNKNOWN/ENDED 观测，但不改变原有控制标记。
+                error = result.error or ("target_not_live" if result.room.status == RoomStatus.ENDED else "live_status_unknown" if result.room.status != RoomStatus.LIVE else None)
+                if error:
+                    self.store.complete_command(command_id, error_code=error, message={"target_not_live":"主播当前未开播", "live_query_timeout":"开播查询超时", "live_status_unknown":"暂时无法确认开播"}.get(error, "开播查询失败"), now=self.clock())
+                    return
+                t = self.store.row("SELECT * FROM targets WHERE id=?", (t["id"],))
+                if not t["enabled"]:
+                    self.store.complete_command(command_id, error_code="target_changed", message="解析结果与已有监控目标重复", now=self.clock())
+                    return
+                db.execute("UPDATE targets SET record_session_key=session_key,suppressed_session=NULL,note=CASE WHEN note LIKE ? THEN NULL ELSE note END,attempts=0,retry_at=0,updated_at=?,control_revision=control_revision+1 WHERE id=?", (NEEDS_FIX + "%", self.clock(), t["id"]))
+                job_id = self.store.create_pending(t["id"], self.clock())
+                self.store.complete_command(command_id, dict(target_id=t["id"], job_id=job_id, outcome="queued"), now=self.clock())
+        except ControlError as exc:
+            self.store.complete_command(command_id, error_code=exc.code, message=str(exc), now=self.clock())
 
     def _scan(self):
+        if self._shutdown:
+            return
         now = self.clock()
-        if self._scan_future and self._scan_future.done():
-            try:
-                result = self._scan_future.result()
-            except Exception:
-                logger.exception("扫描失败，保留最后可信状态")
-            else:
-                self.apply_snapshot(result)
-            self._scan_future = None
+        if self.auto_scan and not self._scan_requested and now >= self._next_scan and not self._shutdown:
+            self._scan_requested = [t["id"] for t in self.store.rows("SELECT id FROM targets WHERE enabled=1 ORDER BY created_at,id")]
             self._next_scan = now + self.scan_interval
-        if self.auto_scan and self._scan_future is None and now >= self._next_scan and not self._shutdown:
-            self._scan_requested = [t["raw"] for t in self.store.rows("SELECT raw FROM targets WHERE enabled=1")]
-            self._scan_future = self._queries.submit(self.scanner.scan, self._scan_requested)
             if self._refresh_future is None:
                 self._refresh_started = now
                 self._refresh_future = self._queries.submit(self.pool.refresh)
+        for target_id in list(self._scan_requested):
+            target = self.store.row("SELECT * FROM targets WHERE id=? AND enabled=1", (target_id,))
+            if not target or self.observations.dispatch("scan", target):
+                self._scan_requested.remove(target_id)
+            elif not self.room_queries.available("scan"):
+                break
 
     def _instances(self):
         """收取实例刷新结果，并在后台复位登录强阻断后的实例。"""
@@ -277,46 +317,32 @@ class Scheduler:
                     self._stop_job(active["id"], "anchor_offline")
                 elif target["session_key"] != active["session_key"]:
                     self._stop_job(active["id"], "live_session_changed")
+                elif active["status"] == "stopping" and active["id"] in self._handles:
+                    self._stop_job(active["id"], active["stop_reason"] or "manual_stop")
                 continue
             if self._shutdown or not target["enabled"]:
                 continue
             ready = (target["trusted_status"] == "live" and target["observed_status"] == "live"
                      and now - target["observed_at"] <= max(60, self.scan_interval * 2)
-                     and (target["auto_record"] or target["manual_requested"])
-                     and target["suppressed_session"] != target["session_key"]
+                     and (target["auto_record"] or (target["record_session_key"] and target["record_session_key"] == target["session_key"]))
+                     and not (target["suppressed_session"] and target["suppressed_session"] == target["session_key"])
                      and not (target["note"] or "").startswith(NEEDS_FIX) and now >= target["retry_at"])
             if ready:
                 self.store.create_pending(target["id"], now)
 
     def _dispatch(self):
         now = self.clock()
-        for job_id, future in list(self._verifying.items()):
-            if not future.done():
-                continue
-            self._verifying.pop(job_id)
-            job = self.store.row("SELECT * FROM jobs WHERE id=?", (job_id,))
-            if not job:
-                continue
-            if job["status"] != "starting" or self._shutdown:
-                self.store.finish_job(job_id, 0, now, True, "cancelled_before_launch")
-                continue
-            try:
-                room = future.result()
-            except Exception:
-                room = ResolvedRoom(web_rid="", status=RoomStatus.UNKNOWN)
-            target = self.store.row("SELECT * FROM targets WHERE id=?", (job["target_id"],))
-            self.store.observe(target["id"], room, now, ended_interval_sec=self.ended_interval)
-            if getattr(room.status, "value", room.status) != "live":
-                self.store.defer_start(job_id, now, "prelaunch_not_confirmed_live")
-                continue
-            target = self.store.row("SELECT * FROM targets WHERE id=?", (job["target_id"],))
-            if not target["enabled"] or target["session_key"] != job["session_key"]:
-                self.store.request_stop(job_id, "live_session_changed")
-                self.store.finish_job(job_id, 0, now, True, "live_session_changed")
-                continue
-            self._launch(job, target, room)
+        for job in self.store.rows("SELECT * FROM jobs WHERE status='stopping' AND pid IS NULL"):
+            if job["id"] not in self._handles:
+                self.store.finish_job(job["id"], 0, now, True, "cancelled_before_launch")
         if self._shutdown:
             return
+        # 被新观测淘汰的启动复核留在 starting，下轮重新获取有界查询槽位。
+        for job in self.store.rows("SELECT * FROM jobs WHERE status='starting' AND pid IS NULL ORDER BY created_at,rowid"):
+            if job["id"] not in self._verifying and job["id"] not in self._handles:
+                target = self.store.row("SELECT * FROM targets WHERE id=?", (job["target_id"],))
+                if self.observations.dispatch("verify", target, job["id"]):
+                    self._verifying[job["id"]] = True
         for job in self.store.rows("SELECT * FROM jobs WHERE status='pending' ORDER BY created_at,rowid"):
             target = self.store.row("SELECT * FROM targets WHERE id=?", (job["target_id"],))
             if target["observed_status"] != "live" or now < target["retry_at"]:
@@ -326,8 +352,8 @@ class Scheduler:
             if not slot:
                 break
             if self.store.claim(job["id"], slot["vmindex"], now):
-                # 分配槽位后重新查一次当前场次；后台查询不阻塞其他录制的停止。
-                self._verifying[job["id"]] = self._queries.submit(self.scanner.resolver.resolve, target["raw"])
+                if self.observations.dispatch("verify", target, job["id"]):
+                    self._verifying[job["id"]] = True
 
     def _launch(self, job: dict, target: dict, room: ResolvedRoom):
         job_id = job["id"]
@@ -425,7 +451,14 @@ class Scheduler:
 
     def tick(self):
         self._collect()
+        if self._shutdown:
+            return
         self._commands()
+        self._query_results()
+        for job in self.store.rows("SELECT id FROM jobs WHERE reconcile_requested=1"):
+            self.reconcile(job["id"])
+            with self.store.transaction() as db:
+                db.execute("UPDATE jobs SET reconcile_requested=0 WHERE id=?", (job["id"],))
         self._scan()
         self._instances()
         self._watch_old_workers()
@@ -439,8 +472,18 @@ class Scheduler:
             return
         self._shutdown = True
         shutdown_errors = []
-        for job_id, future in list(self._verifying.items()):
-            future.cancel()
+        query_cleanup = ThreadPoolExecutor(max_workers=1, thread_name_prefix="query-cleanup")
+        query_closed = query_cleanup.submit(self.room_queries.close)
+        try:
+            self.store.interrupt_commands(self.clock())
+        except Exception as exc:
+            shutdown_errors.append(str(exc))
+        try:
+            unlaunched = [j["id"] for j in self.store.rows("SELECT id FROM jobs WHERE status='starting' AND pid IS NULL")]
+        except Exception as exc:
+            shutdown_errors.append(str(exc))
+            unlaunched = list(self._verifying)
+        for job_id in unlaunched:
             try:
                 self.store.request_stop(job_id, "scheduler_shutdown")
                 self.store.finish_job(job_id, 0, self.clock(), True, "cancelled_before_launch")
@@ -482,6 +525,11 @@ class Scheduler:
                     except Exception:
                         pass
         finally:
+            try:
+                query_closed.result(timeout=6)
+            except Exception as exc:
+                shutdown_errors.append(str(exc))
+            query_cleanup.shutdown(wait=False)
             self._queries.shutdown(wait=False, cancel_futures=True)
             self._stoppers.shutdown(wait=False, cancel_futures=True)
             self._lease.close()

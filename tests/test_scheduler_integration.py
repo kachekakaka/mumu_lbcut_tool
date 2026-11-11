@@ -7,9 +7,9 @@ import time
 import pytest
 from src.mvp.room_resolver import RoomStatus, ResolvedRoom
 from src.orchestrator.instance_pool import InstancePool
-from src.orchestrator.room_scanner import RoomScanner
 from src.orchestrator.scheduler import Scheduler
 from src.orchestrator.storage import Store
+from console_helpers import ImmediateQueries, observe_room
 
 
 class Clock:
@@ -28,8 +28,6 @@ class Network:
     def resolve(self, raw):
         self.resolved.append(raw)
         return self.rooms.get(raw, ResolvedRoom(raw, RoomStatus.UNKNOWN))
-    def batch_resolve(self, targets, max_workers=8):
-        return {t: self.resolve(t) for t in targets}
 
 
 class Child:
@@ -109,16 +107,16 @@ def system(tmp_path):
 
 def new_scheduler(env):
     return Scheduler(env.store, env.tmp / 'recordings', [1, 2], pool=env.pool,
-        scanner=RoomScanner(env.network), handle_factory=env.factory, clock=env.clock,
+        query_executor=ImmediateQueries(env.network), handle_factory=env.factory, clock=env.clock,
         ended_interval_sec=1, auto_scan=False, process_probe=lambda job: 'absent')
 
 def observe(env, values):
     env.clock.advance(2)
     for raw, status in values.items():
         env.network.rooms[raw] = ResolvedRoom(raw, status, room_id='room-' + raw)
-    snap = env.scheduler.scanner.scan(list(env.network.rooms))
-    snap.timestamp = env.clock()
-    env.scheduler.apply_snapshot(snap)
+    for target in env.store.rows("SELECT * FROM targets WHERE enabled=1"):
+        if target['raw'] in env.network.rooms:
+            observe_room(env.store, target['id'], env.network.rooms[target['raw']], env.clock())
 
 
 def pump(env, predicate):
@@ -302,10 +300,8 @@ def test_invalid_target_needs_fix_until_record(system):
     observe(e, {'A': RoomStatus.ENDED})
     observe(e, {'A': RoomStatus.ENDED})
     e.network.rooms['A'] = ResolvedRoom('A', RoomStatus.LIVE, room_id='room-A-2')
-    snap = e.scheduler.scanner.scan(['A'])
     e.clock.advance(2)
-    snap.timestamp = e.clock()
-    e.scheduler.apply_snapshot(snap)
+    observe_room(e.store, target, e.network.rooms['A'], e.clock())
     for _ in range(3):
         e.scheduler.tick()
     assert len(e.children) == 1
@@ -314,9 +310,9 @@ def test_invalid_target_needs_fix_until_record(system):
     assert row(e, 'SELECT note FROM targets WHERE id=?', target)['note'] is None
     e.children[1].exit(9, 'target_invalid')
     pump(e, lambda: row(e, 'SELECT note FROM targets WHERE id=?', target)['note'])
-    # 重新添加同一地址也解除“需要修正”。
+    # 重复添加不解除“需要修正”，必须显式重新开录。
     assert e.store.add_target('A', now=e.clock()) == target
-    assert row(e, 'SELECT note FROM targets WHERE id=?', target)['note'] is None
+    assert row(e, 'SELECT note FROM targets WHERE id=?', target)['note'] == 'needs_fix: target_invalid'
 
 
 @pytest.mark.parametrize('reset_ok', [True, False])

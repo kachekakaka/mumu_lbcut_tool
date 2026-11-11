@@ -116,23 +116,20 @@ def test_two_real_children_fifo_and_cli_stop(tmp_path, monkeypatch, valid_media)
     from types import SimpleNamespace
     from src.mvp.room_resolver import RoomStatus, ResolvedRoom
     from src.orchestrator.instance_pool import InstancePool
-    from src.orchestrator.room_scanner import RoomScanner
     from src.orchestrator.scheduler import Scheduler
     from src.orchestrator.storage import Store
     install_child_boundary(monkeypatch, tmp_path, valid_media)
     class Resolver:
         def resolve(self, raw):
             return ResolvedRoom(raw, RoomStatus.LIVE, room_id='77000000000000000' + raw)
-        def batch_resolve(self, targets, max_workers=8):
-            return {raw: self.resolve(raw) for raw in targets}
     state_dir = tmp_path / 'state'
     store = Store(state_dir / 'orchestrator.sqlite3')
     for raw in ('11', '12', '13'):
         store.add_target(raw, allow_unconfirmed=True)
-    scanner = RoomScanner(Resolver())
     pool = InstancePool(SimpleNamespace(list_available_instances=lambda: [
         {'vmindex': i, 'name': f'Synthetic VM {i}', 'android_started': True} for i in (1001, 1002)]))
-    scheduler = Scheduler(store, tmp_path / 'recordings', [1001, 1002], pool=pool, scanner=scanner, auto_scan=False)
+    from console_helpers import ImmediateQueries, observe_room, live_http
+    scheduler = Scheduler(store, tmp_path / 'recordings', [1001, 1002], pool=pool, query_executor=ImmediateQueries(Resolver()), auto_scan=False)
     def pump(predicate):
         deadline = time.monotonic() + 6
         while time.monotonic() < deadline:
@@ -142,18 +139,19 @@ def test_two_real_children_fifo_and_cli_stop(tmp_path, monkeypatch, valid_media)
             time.sleep(.02)
         assert predicate(), store.rows('SELECT * FROM jobs')
     try:
-        scheduler.apply_snapshot(scanner.scan(['11', '12', '13']))
+        for target in store.rows('SELECT * FROM targets'):
+            observe_room(store, target['id'], Resolver().resolve(target['raw']), time.time())
         pump(lambda: len(store.rows("SELECT * FROM jobs WHERE status='running'")) == 2
              and len(store.rows('SELECT * FROM segments')) == 2)
         jobs = store.rows('SELECT * FROM jobs ORDER BY created_at,rowid')
         assert [job['status'] for job in jobs] == ['running', 'running', 'pending']
         import os
-        cli = subprocess.run([sys.executable, '-m', 'src.orchestrator.cli', '--data-dir', str(state_dir),
-                              'stop', jobs[0]['id']], cwd=str(Path(__file__).resolve().parents[1]),
-                             env=dict(os.environ, PYTHONIOENCODING='utf-8'), capture_output=True,
-                             text=True, encoding='utf-8', timeout=5)
+        with live_http(store, tmp_path) as url:
+            cli = subprocess.run([sys.executable, '-m', 'src.orchestrator.cli', 'stop', jobs[0]['id'], '--server', url],
+                                 cwd=str(Path(__file__).resolve().parents[1]), env=dict(os.environ, PYTHONIOENCODING='utf-8'),
+                                 capture_output=True, text=True, encoding='utf-8', timeout=10)
         assert cli.returncode == 0, cli.stderr
-        assert json.loads(cli.stdout)['status'] == 'queued'
+        assert json.loads(cli.stdout)['status'] == 'pending'
         pump(lambda: store.row('SELECT status FROM jobs WHERE id=?', (jobs[0]['id'],))['status'] == 'finished'
              and store.row('SELECT status FROM jobs WHERE id=?', (jobs[2]['id'],))['status'] == 'running')
         assert store.row('SELECT collection_complete FROM jobs WHERE id=?', (jobs[0]['id'],))['collection_complete'] == 1

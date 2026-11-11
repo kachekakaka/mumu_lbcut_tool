@@ -5,27 +5,28 @@
 - InstanceSlot, InstanceStatus: 实例槽位与状态
 - WorkerProcessHandle: Worker 独立子进程控制句柄与异步 NDJSON 事件监听
 - WorkerLaunchSpec: Worker 启动规格参数
-- RoomScanner, ScanResult: 高并发多直播间开播状态监测器
+- ObservationDispatcher: 周期扫描、手动查询与启动复核的统一派发
 """
 from src.orchestrator.models import (
     InstanceSlot,
     InstanceStatus,
     JobStatus,
+    CommandStatus,
     WorkerLaunchSpec,
 )
 from src.orchestrator.instance_pool import InstancePool
 from src.orchestrator.worker_process import WorkerProcessHandle
-from src.orchestrator.room_scanner import RoomScanner, ScanResult
+from src.orchestrator.room_scanner import ObservationDispatcher
 
 __all__ = [
     "InstancePool",
     "InstanceSlot",
     "InstanceStatus",
     "JobStatus",
+    "CommandStatus",
     "WorkerLaunchSpec",
     "WorkerProcessHandle",
-    "RoomScanner",
-    "ScanResult",
+    "ObservationDispatcher",
 ]
 
 from src.orchestrator.storage import Store

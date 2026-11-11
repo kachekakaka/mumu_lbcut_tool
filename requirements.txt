@@ -3,3 +3,5 @@ gmssl==3.2.2
 numpy>=1.24.0
 Pillow>=10.0.0
 psutil>=5.9.0
+fastapi>=0.115,<1
+uvicorn>=0.30,<1

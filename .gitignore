@@ -46,4 +46,8 @@ scripts/*.jpg
 scripts/*.xml
 scripts/seg1_timeline/
 
+# 前端依赖与构建产物（构建结果随打包发布，不提交）
+web/node_modules/
+web/dist/
+
 # 技术栈确定后按实际工具补充依赖与缓存规则
