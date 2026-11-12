@@ -153,7 +153,7 @@ async function stop(job: Job) {
       <el-table-column label="切片 完成/中止" min-width="100">
         <template #default="{ row }">{{ row.finished_segment_count }} / {{ row.aborted_segment_count }}</template>
       </el-table-column>
-      <el-table-column label="结束原因与退出码" min-width="180">
+      <el-table-column label="中断、恢复与停止" min-width="220">
         <template #default="{ row }">{{ endText(row) }}</template>
       </el-table-column>
       <el-table-column label="操作" min-width="200" :fixed="mobile ? false : 'right'">

@@ -26,4 +26,4 @@ python -m pytest tests -q -p no:cacheprovider --basetemp "$TestRoot/work" --juni
 | `test_aac_without_keyflag.py` | 合成无关键标记 AAC 输入、旧命令丢音轨负对照、真实命名管道分段、所有编码包逐字节一致、逐流 DTS 单调、所有分段完整解码；不是 MuMu 实机 |
 | `test_continuous_real_transport.py`、`test_stream_monitor_media.py` | 固定版本真实媒体传输、总时长封口与分析分支重建；循环输入可能有 AAC padding，CSV 相邻端点不替代逐包无漏失校验 |
 
-自动化不启动真实 MuMu、不读取旧运行库。实机需另行确认允许的目标、实例与共享锁，使用独立数据和录像目录；验证命令结果后仍须核对任务、切片终态和 ffprobe，具体边界见[后端方案](../docs/方案/20261111-调度控制台后端接口实施方案.md#9-验收标准)。
+自动化不启动真实 MuMu、不读取旧运行库。实机需另行确认允许的目标、实例与共享锁，使用独立数据和录像目录；验证命令结果后仍须核对任务、切片终态和 ffprobe，具体边界见[后端方案](../archive/docs/方案/20261111-调度控制台后端接口实施方案.md#9-验收标准)。

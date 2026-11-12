@@ -88,6 +88,33 @@ def seed(store):
     return target, job
 
 
+def test_recovery_causes_survive_cancel_and_recent_event_limit(api):
+    client, store, runtime, config = api
+    target, job = seed(store)
+    store.record_event(job, dict(event='stall_detected', reason='login_prompt_detected'), 10)
+    store.record_event(job, dict(event='room_navigation', action='retry_picture', reason='render_timeout'), 11)
+    for n in range(55):
+        store.record_event(job, dict(event='room_navigation', event_id=f'wait-{n}', action='wait_picture', reason='return_to_live'), 12+n)
+    store.record_event(job, dict(event='room_navigation', action='navigation_exhausted', reason='cancelled'), 80)
+    store.record_event(job, dict(event='worker_stopped', reason='cancelled', exit_code=30), 81)
+    with store.transaction() as db:
+        db.execute("UPDATE jobs SET status='failed',ended_at=81,exit_code=30,stop_reason='anchor_offline',error_reason='cancelled' WHERE id=?", (job,))
+    expected = dict(trigger={'code':'login_prompt_detected','detail':None},
+                    last_failure={'code':'render_timeout','detail':None}, outcome='cancelled')
+    detail = client.get('/api/jobs/' + job).json()
+    assert detail['recovery_context'] == expected
+    assert not any(e['event'] == 'stall_detected' for e in detail['recent_events'])
+    assert detail['stop_reason']['code'] == 'anchor_offline'
+    assert detail['error_reason']['code'] == 'cancelled' and detail['status'] == 'failed'
+    assert client.get('/api/jobs?active=false').json()['items'][0]['recovery_context'] == expected
+    # 后续新一次中断必须清空上一次恢复原因，成功恢复不因最后正常退出而变为取消。
+    store.record_event(job, dict(event='stall_detected', reason='video_frozen'), 90)
+    store.record_event(job, dict(event='stall_healed'), 91)
+    store.record_event(job, dict(event='worker_stopped', reason='stop_requested', exit_code=0), 92)
+    assert client.get('/api/jobs/' + job).json()['recovery_context'] == dict(
+        trigger={'code':'video_frozen','detail':None}, last_failure=None, outcome='recovered')
+
+
 def test_filters_history_projection_and_snapshot(api):
     client, store, runtime, config = api
     target, job = seed(store)

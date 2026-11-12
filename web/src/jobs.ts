@@ -1,5 +1,5 @@
 import type { Job } from './api/types'
-import { exitCodeLabel, reasonLabel, stopReasonLabel } from './labels'
+import { exitCodeLabel, reasonLabel, recoveryOutcomeLabel, stopReasonLabel } from './labels'
 
 /** 心跳超过该秒数未更新时，提示帧率与时长不是实时值。 */
 export const STALE_HEARTBEAT_SEC = 30
@@ -11,8 +11,14 @@ export function heartbeatAge(job: Job, serverTime: number | null | undefined): n
 
 export function endText(job: Job): string {
   const parts: string[] = []
-  if (job.stop_reason) parts.push(stopReasonLabel(job.stop_reason))
-  if (job.error_reason) parts.push(reasonLabel(job.error_reason))
+  const recovery = job.recovery_context
+  if (recovery) {
+    if (recovery.trigger) parts.push(`中断：${reasonLabel(recovery.trigger)}`)
+    if (recovery.last_failure) parts.push(`恢复遇到：${reasonLabel(recovery.last_failure)}`)
+    parts.push(`恢复结果：${recoveryOutcomeLabel(recovery.outcome)}`)
+  }
+  if (job.stop_reason) parts.push(`停止：${stopReasonLabel(job.stop_reason)}`)
+  if (job.error_reason) parts.push(`退出：${reasonLabel(job.error_reason)}`)
   if (job.exit_code !== null) parts.push(`退出码 ${exitCodeLabel(job.exit_code)}`)
   return parts.length ? parts.join('；') : '—'
 }

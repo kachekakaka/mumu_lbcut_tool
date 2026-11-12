@@ -13,7 +13,7 @@ import time
 from src.mvp.room_resolver import ResolvedRoom, RoomResolver, RoomStatus
 
 MAX_MESSAGE = 65536
-CAPACITY = {"scan": 5, "verify": 1, "manual": 2}
+CAPACITY = {"scan": 5, "verify": 1, "manual": 2, "login": 1}
 
 
 class QueryJob:

@@ -35,7 +35,7 @@ class Host(Scheduler):
         queries = QueryProcesses(child_command=[sys.executable, str(Path(__file__).with_name('console_query_child.py'))])
         super().__init__(*a, **kw, pool=Pool(), query_executor=queries, auto_scan=False)
         if args.mode == 'blocked':
-            for source, count in (('scan', 5), ('verify', 1), ('manual', 2)):
+            for source, count in (('scan', 5), ('verify', 1), ('manual', 2), ('login', 1)):
                 for _ in range(count):
                     queries.submit(source, 'block_dns')
 

@@ -7,6 +7,7 @@ from pathlib import Path
 import queue
 import threading
 import time
+import uuid
 
 import psutil
 from src.mvp.room_resolver import ResolvedRoom, RoomStatus
@@ -22,6 +23,8 @@ logger = logging.getLogger(__name__)
 # 旧主控遗留的 Worker 写 stdout 失败后会自行封口退出（心跳间隔 3 秒）；超过此时限才转人工对账。
 OLD_WORKER_EXIT_WAIT_SEC = 120.0
 OLD_WORKER_PROBE_INTERVAL_SEC = 2.0
+LOGIN_CHECK_WINDOW_SEC = 120.0
+LOGIN_REASONS = {"login_prompt_detected", "login_blocked"}
 
 
 class HostLease:
@@ -118,6 +121,7 @@ class Scheduler:
         self._refresh_future, self._refresh_started = None, 0.0
         self._resets = {}
         self._waiting_exit = {}
+        self._login_checks = {}
         self._next_waiting_probe = 0.0
         self._shutdown = False
         self._closed = False
@@ -148,6 +152,11 @@ class Scheduler:
             job_id, event = self._event_pending
             # 数据库失败时保留当前事件，不静默丢弃；主循环异常会停止本主控创建的 Worker。
             self.store.record_event(job_id, event, self.clock())
+            if event.get("event") == "stall_detected" and event.get("reason") in LOGIN_REASONS:
+                # 同一次恢复重复通知不延长窗口，也不产生无界查询队列。
+                self._login_checks.setdefault(job_id, (self.clock(), self.clock() + LOGIN_CHECK_WINDOW_SEC, uuid.uuid4().hex))
+            elif event.get("event") in ("stall_healed", "worker_stopped"):
+                self._login_checks.pop(job_id, None)
             self._event_pending = None
 
     def _collect(self):
@@ -215,6 +224,9 @@ class Scheduler:
             if source == "manual":
                 self._manual_result(meta, subject, result)
                 continue
+            if source == "login":
+                self._login_result(meta, subject[0], subject[1], result)
+                continue
             with self.store.transaction():
                 job = self.store.row("SELECT * FROM jobs WHERE id=?", (subject,)) if source == "verify" else None
                 if source == "verify" and (not job or job["status"] != "starting" or job["session_key"] != meta["session_key"]):
@@ -229,6 +241,40 @@ class Scheduler:
                 self.store.defer_start(subject, self.clock(), "prelaunch_not_confirmed_live")
             else:
                 self._launch(job, target, result.room)
+
+    def _login_result(self, meta, job_id, token, result):
+        check = self._login_checks.get(job_id)
+        job = self.store.row("SELECT * FROM jobs WHERE id=?", (job_id,))
+        if not check or token != check[2] or self.clock() >= check[1] or not job or job["status"] not in ("starting", "running"):
+            return
+        with self.store.transaction():
+            accepted = self.store.apply_observation(meta, result.room, self.ended_interval)
+            target = self.store.row("SELECT * FROM targets WHERE id=?", (meta["target_id"],))
+            reason = ("observation_superseded" if not accepted else
+                      "anchor_offline" if target["trusted_status"] == "ended" else
+                      "anchor_ended_unconfirmed" if result.room.status == RoomStatus.ENDED else
+                      "anchor_live" if result.room.status == RoomStatus.LIVE else "live_status_unknown")
+            self.store.record_event(job_id, dict(event="login_status_checked", timestamp=self.clock(),
+                reason=reason, observed_status=result.room.status.value, accepted=accepted,
+                query_error=result.error), self.clock())
+        if accepted and target["trusted_status"] == "ended":
+            self._login_checks.pop(job_id, None)
+        else:
+            self._login_checks[job_id] = (self.clock() + max(1.0, self.ended_interval), check[1], token)
+
+    def _check_login_status(self):
+        """登录页不是下播证据；复用有序观测，以专用槽位及时核对。"""
+        now = self.clock()
+        for job_id, (due, deadline, token) in list(self._login_checks.items()):
+            job = self.store.row("SELECT * FROM jobs WHERE id=?", (job_id,))
+            target = self.store.row("SELECT * FROM targets WHERE id=?", (job["target_id"],)) if job else None
+            if (now >= deadline or not job or job["status"] not in ("starting", "running")
+                    or not target or not target["enabled"] or target["session_key"] != job["session_key"]
+                    or target["trusted_status"] == "ended"):
+                self._login_checks.pop(job_id, None)
+                continue
+            if now >= due:
+                self.observations.dispatch("login", target, (job_id, token))
 
     def _manual_result(self, meta, command_id, result):
         try:
@@ -272,6 +318,10 @@ class Scheduler:
                 self._refresh_future = self._queries.submit(self.pool.refresh)
         for target_id in list(self._scan_requested):
             target = self.store.row("SELECT * FROM targets WHERE id=? AND enabled=1", (target_id,))
+            if ("login", target_id) in self.observations.pending:
+                # 本轮已由优先复核接手，避免紧随其后的周期查询使优先结果过期。
+                self._scan_requested.remove(target_id)
+                continue
             if not target or self.observations.dispatch("scan", target):
                 self._scan_requested.remove(target_id)
             elif not self.room_queries.available("scan"):
@@ -455,6 +505,7 @@ class Scheduler:
             return
         self._commands()
         self._query_results()
+        self._check_login_status()
         for job in self.store.rows("SELECT id FROM jobs WHERE reconcile_requested=1"):
             self.reconcile(job["id"])
             with self.store.transaction() as db:

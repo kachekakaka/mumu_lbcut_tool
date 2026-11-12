@@ -25,7 +25,12 @@ TARGET_VIEW = f"""WITH base AS ({TARGET_SQL}), targets_view AS (SELECT *,
 JOB_SQL = """SELECT j.*,t.nickname,t.raw target_raw,
  (SELECT min(started_at) FROM segments s WHERE s.job_id=j.id) recording_started_at,
  (SELECT count(*) FROM segments s WHERE s.job_id=j.id AND s.status='finished') finished_segment_count,
- (SELECT count(*) FROM segments s WHERE s.job_id=j.id AND s.status='aborted') aborted_segment_count
+ (SELECT count(*) FROM segments s WHERE s.job_id=j.id AND s.status='aborted') aborted_segment_count,
+ (SELECT json_group_array(json(payload)) FROM
+   (SELECT e.payload FROM events e WHERE e.job_id=j.id
+    AND e.rowid >= (SELECT max(start.rowid) FROM events start WHERE start.job_id=j.id AND start.kind='stall_detected')
+    AND e.kind IN ('stall_detected','stall_healed','room_navigation','worker_stopped','worker_failed')
+    ORDER BY e.rowid)) recovery_events_json
  FROM jobs j LEFT JOIN targets t ON t.id=j.target_id"""
 SEGMENT_SQL = """SELECT s.*,j.target_id,t.nickname,t.raw target_raw,
  COALESCE(s.started_at,s.created_at) sort_time
@@ -47,6 +52,31 @@ def target_object(row):
     return data
 
 
+def recovery_context(row):
+    """摘要来自持久化事件，不从最终 cancelled 倒推中断原因。"""
+    events = json.loads(row["recovery_events_json"] or "[]")
+    if not events:
+        return None
+    context = dict(trigger=reason_object(events[0].get("reason")), last_failure=None, outcome="recovering")
+    failures = {"retry", "retry_picture", "page_changed", "budget_exhausted", "device_lost", "navigation_exhausted"}
+    for event in events[1:]:
+        kind, reason = event.get("event"), event.get("reason")
+        if kind == "stall_healed":
+            context["outcome"] = "recovered"
+        elif kind == "room_navigation":
+            if reason == "cancelled":
+                context["outcome"] = "cancelled"
+            elif event.get("action") in failures and reason:
+                context["last_failure"] = reason_object(reason)
+                if event.get("action") == "navigation_exhausted":
+                    context["outcome"] = "failed"
+        elif kind in ("worker_stopped", "worker_failed") and context["outcome"] != "recovered":
+            context["outcome"] = "cancelled" if reason in ("cancelled", "stop_requested") else "failed"
+    if context["outcome"] == "recovering" and row["ended_at"] is not None:
+        context["outcome"] = "failed"
+    return context
+
+
 def job_object(row):
     data = fields(row, "id,target_id,nickname,target_raw,vmindex,status,created_at,started_at,recording_started_at,ended_at,exit_code,stop_reason,error_reason,finished_segment_count,aborted_segment_count,reconcile_requested")
     for key in ("stop_reason", "error_reason"):
@@ -56,6 +86,7 @@ def job_object(row):
         data[key] = heartbeat.get(key)
     data["heartbeat_at"] = heartbeat.get("timestamp")
     data["reconcile_requested"] = bool(data["reconcile_requested"])
+    data["recovery_context"] = recovery_context(row)
     return data
 
 

@@ -114,10 +114,10 @@ def test_windows_signals_reclaim_all_queries(tmp_path, sig):
                 pids = json.loads((tmp_path / 'pids.json').read_text(encoding='utf-8'))
             except (FileNotFoundError, ValueError):
                 pass
-            if len(pids) == 8:
+            if len(pids) == 9:
                 break
             time.sleep(.05)
-        assert len(pids) == 8
+        assert len(pids) == 9
         started = time.monotonic()
         if sig == 'ctrl_c':
             subprocess.run([sys.executable, str(HOST.with_name('console_signal.py')), str(child.pid)], check=True, timeout=5)
@@ -138,13 +138,13 @@ def test_forced_host_death_kills_query_job_only(tmp_path):
         ready(child, number)
         deadline = time.monotonic() + 5
         pids = []
-        while len(pids) != 8 and time.monotonic() < deadline:
+        while len(pids) != 9 and time.monotonic() < deadline:
             try:
                 pids = json.loads((tmp_path / 'pids.json').read_text(encoding='utf-8'))
             except (FileNotFoundError, ValueError):
                 pass
             time.sleep(.05)
-        assert len(pids) == 8
+        assert len(pids) == 9
         identity = json.loads((tmp_path / 'worker.json').read_text(encoding='utf-8'))
         sentinel = psutil.Process(identity['pid'])
         assert sentinel.create_time() == identity['born']

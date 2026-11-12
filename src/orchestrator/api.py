@@ -138,6 +138,12 @@ class TargetResponse(StrictModel):
     active_job_status: str | None
 
 
+class RecoveryContextResponse(StrictModel):
+    trigger: ReasonResponse | None
+    last_failure: ReasonResponse | None
+    outcome: Literal["recovering", "recovered", "failed", "cancelled"]
+
+
 class JobResponse(StrictModel):
     id: str
     target_id: str
@@ -152,6 +158,7 @@ class JobResponse(StrictModel):
     exit_code: int | None
     stop_reason: ReasonResponse | None
     error_reason: ReasonResponse | None
+    recovery_context: RecoveryContextResponse | None
     elapsed_sec: float | None
     fps: float | None
     room_identity_status: str | None

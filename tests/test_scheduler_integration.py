@@ -218,6 +218,103 @@ def job_status(env, job_id):
     return row(env, 'SELECT status FROM jobs WHERE id=?', job_id)['status']
 
 
+def test_login_checks_end_without_waiting_for_periodic_scan(system):
+    e = system
+    target, job = start_one(e)
+    e.scheduler.auto_scan = True
+    e.scheduler._next_scan = e.clock() + 600
+    e.network.resolved.clear()
+    e.network.rooms['A'] = ResolvedRoom('A', RoomStatus.ENDED)
+    e.children[0].emit('stall_detected', reason='login_prompt_detected', action='relocate_target')
+    e.scheduler.tick()
+    e.scheduler.tick()
+    assert e.network.resolved == ['A']
+    assert row(e, 'SELECT trusted_status,ended_count FROM targets WHERE id=?', target) == {'trusted_status':'live', 'ended_count':1}
+    assert e.children[0].alive
+    e.clock.advance(.5)
+    e.scheduler.tick()
+    assert e.network.resolved == ['A']
+    e.clock.advance(.6)
+    pump(e, lambda: not e.children[0].alive)
+    assert e.network.resolved == ['A', 'A']
+    assert row(e, 'SELECT stop_reason FROM jobs WHERE id=?', job['id'])['stop_reason'] == 'anchor_offline'
+
+
+@pytest.mark.parametrize('status', [RoomStatus.LIVE, RoomStatus.UNKNOWN])
+def test_login_live_or_unknown_does_not_mean_offline(system, status):
+    e = system
+    target, job = start_one(e)
+    e.network.rooms['A'] = ResolvedRoom('A', status, room_id='room-A')
+    e.children[0].emit('stall_detected', reason='login_prompt_detected')
+    e.scheduler.tick()
+    e.scheduler.tick()
+    assert e.children[0].alive
+    assert row(e, 'SELECT trusted_status FROM targets WHERE id=?', target)['trusted_status'] == 'live'
+    assert row(e, 'SELECT stop_reason FROM jobs WHERE id=?', job['id'])['stop_reason'] is None
+    e.clock.advance(121)
+    e.scheduler.tick()
+    assert not e.scheduler._login_checks
+    assert e.children[0].alive
+
+
+@pytest.mark.parametrize('change', ['healed', 'removed', 'newer_observation', 'expired', 'new_recovery'])
+def test_login_late_result_cannot_override_current_state(system, change):
+    from console_helpers import DeferredQueries
+    from src.orchestrator.room_query_process import QueryResult
+    e = system
+    target, job = start_one(e)
+    queries = DeferredQueries()
+    e.scheduler.room_queries = e.scheduler.observations.executor = queries
+    e.children[0].emit('stall_detected', reason='login_prompt_detected')
+    e.scheduler.tick()
+    assert queries.calls[0][:2] == ('login', 'A')
+    if change == 'healed':
+        e.children[0].emit('stall_healed')
+    elif change == 'removed':
+        with e.store.transaction() as db:
+            db.execute('UPDATE targets SET enabled=0,control_revision=control_revision+1 WHERE id=?', (target,))
+    elif change == 'newer_observation':
+        observe_room(e.store, target, ResolvedRoom('A', RoomStatus.LIVE, room_id='room-A'), e.clock())
+    elif change == 'new_recovery':
+        # 同一时钟刻度也必须区分两轮恢复，不能用到期时间当作身份。
+        e.children[0].emit('stall_healed')
+        e.children[0].emit('stall_detected', reason='login_prompt_detected')
+    else:
+        e.clock.advance(121)
+    queries.calls[0][2].set_result(QueryResult(ResolvedRoom('A', RoomStatus.ENDED)))
+    e.scheduler.tick()
+    assert row(e, 'SELECT ended_count FROM targets WHERE id=?', target)['ended_count'] == 0
+
+
+def test_periodic_scan_does_not_supersede_login_check(system):
+    e = system
+    target, job = start_one(e)
+    e.scheduler.auto_scan = True
+    e.scheduler._next_scan = 0
+    e.network.rooms['A'] = ResolvedRoom('A', RoomStatus.ENDED)
+    e.children[0].emit('stall_detected', reason='login_prompt_detected')
+    e.scheduler.tick()
+    e.scheduler.tick()
+    assert row(e, 'SELECT ended_count FROM targets WHERE id=?', target)['ended_count'] == 1
+
+
+def test_login_recovery_keeps_checking_if_live_then_ends(system):
+    e = system
+    target, job = start_one(e)
+    e.children[0].emit('stall_detected', reason='login_prompt_detected')
+    e.scheduler.tick()
+    e.scheduler.tick()
+    assert e.children[0].alive and job['id'] in e.scheduler._login_checks
+    e.network.rooms['A'] = ResolvedRoom('A', RoomStatus.ENDED)
+    e.clock.advance(1.1)
+    e.scheduler.tick()
+    e.scheduler.tick()
+    assert e.children[0].alive
+    e.clock.advance(1.1)
+    pump(e, lambda: not e.children[0].alive)
+    assert row(e, 'SELECT stop_reason FROM jobs WHERE id=?', job['id'])['stop_reason'] == 'anchor_offline'
+
+
 def test_start_failures_retry_with_doubling_backoff_without_limit(system):
     e = system
     class BrokenChild(Child):

@@ -101,6 +101,11 @@ export interface Job {
   exit_code: number | null
   stop_reason: Reason | null
   error_reason: Reason | null
+  recovery_context: {
+    trigger: Reason | null
+    last_failure: Reason | null
+    outcome: 'recovering' | 'recovered' | 'failed' | 'cancelled'
+  } | null
   elapsed_sec: number | null
   fps: number | null
   room_identity_status: string | null

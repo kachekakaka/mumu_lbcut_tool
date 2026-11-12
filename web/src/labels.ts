@@ -83,7 +83,7 @@ const ALERT_TAG: Record<string, TagType> = {
 export const EVENT: Record<string, string> = {
   worker_started: 'Worker 启动', room_navigation: '进房导航', stall_detected: '发现卡顿', stall_healed: '卡顿恢复',
   overlay_recovery: '遮挡处理', login_blocked: '登录阻断', stream_ended: '直播流结束', worker_stopped: 'Worker 结束',
-  worker_failed: 'Worker 失败', segment_quality_warning: '切片质量标记',
+  worker_failed: 'Worker 失败', segment_quality_warning: '切片质量标记', login_status_checked: '登录后的开播状态复核',
 }
 
 export const COMMAND_STATUS: Record<string, string> = {
@@ -148,6 +148,7 @@ export const stopReasonLabel = (v: Reason | null | undefined) => reasonLabel(v)
 export const alertTypeLabel = (v: unknown) => pick(ALERT_TYPE, v)
 export const alertTypeType = (v: unknown) => tag(ALERT_TAG, v)
 export const eventLabel = (v: unknown) => pick(EVENT, v)
+export const recoveryOutcomeLabel = (v: unknown) => pick({ recovering: '恢复中', recovered: '已恢复', failed: '恢复失败', cancelled: '已取消' }, v)
 export const commandStatusLabel = (v: unknown) => pick(COMMAND_STATUS, v)
 export const commandStatusType = (v: unknown) => tag(COMMAND_TAG, v)
 export const commandKindLabel = (v: unknown) => pick(COMMAND_KIND, v)
@@ -186,6 +187,9 @@ export const WORKER_REASON: Record<string, string> = {
   file_write_stalled: '录制文件停止写入',
   process_exited: '录制进程退出',
   login_prompt_detected: '出现登录提示',
+  anchor_live: '主播仍在播',
+  anchor_ended_unconfirmed: '首次观测下播，等待确认',
+  observation_superseded: '观测已过期，重新核对',
   login_blocked: '登录阻断',
   auth_required: '需要登录',
   render_timeout: '页面加载超时',
