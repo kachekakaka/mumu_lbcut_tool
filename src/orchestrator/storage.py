@@ -14,6 +14,8 @@ from src.mvp.room_resolver import ResolvedRoom
 ACTIVE = ("pending", "starting", "running", "stopping", "needs_reconcile")
 NEEDS_FIX = "needs_fix: "          # 目标无效，直到显式 record 查询确认 LIVE 后解除
 RETRY_BASE_SEC, RETRY_MAX_SEC = 5, 300
+BOOT_RETRY_BASE_SEC, BOOT_RETRY_MAX_SEC = 30, 300
+SCHEMA_VERSION = 3
 # 这些停止原因已由目标状态决定后续（移除、确认下播、换场、主控正常退出），无需退避。
 SETTLED_STOPS = ("target_removed", "anchor_offline", "live_session_changed", "scheduler_shutdown")
 SCHEMA = """
@@ -32,7 +34,8 @@ CREATE TABLE IF NOT EXISTS targets (
 );
 CREATE TABLE IF NOT EXISTS instances (
  vmindex INTEGER PRIMARY KEY, name TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'idle',
- job_id TEXT, reason TEXT, updated_at REAL NOT NULL
+ enabled INTEGER NOT NULL DEFAULT 0, job_id TEXT, reason TEXT,
+ boot_attempts INTEGER NOT NULL DEFAULT 0, boot_retry_at REAL NOT NULL DEFAULT 0, updated_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS jobs (
  id TEXT PRIMARY KEY, target_id TEXT NOT NULL REFERENCES targets(id), session_key TEXT NOT NULL,
@@ -75,9 +78,18 @@ class ControlError(ValueError):
         self.code, self.status = code, status
 
 
+def _exponential_backoff(attempts: int, base: float, cap: float, max_exp: int) -> float:
+    return min(cap, base * 2 ** min(max(attempts - 1, 0), max_exp))
+
+
 def retry_delay(attempts: int) -> float:
     """失败退避：5 秒起按次翻倍，最长 5 分钟，不限次数。"""
-    return min(RETRY_MAX_SEC, RETRY_BASE_SEC * 2 ** min(max(attempts - 1, 0), 6))
+    return _exponential_backoff(attempts, RETRY_BASE_SEC, RETRY_MAX_SEC, 6)
+
+
+def boot_retry_delay(attempts: int) -> float:
+    """开机失败退避：30 秒起按次翻倍，最长 5 分钟，不限次数。"""
+    return _exponential_backoff(attempts, BOOT_RETRY_BASE_SEC, BOOT_RETRY_MAX_SEC, 4)
 
 
 def requested_total_duration(command_json: str | None) -> float:
@@ -105,13 +117,13 @@ class Store:
         self.db.execute("PRAGMA busy_timeout=5000")
         tables = {r[0] for r in self.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
-        if tables and version != 2:
+        if tables and version != SCHEMA_VERSION:
             self.db.close()
-            raise ValueError("数据库不是本调度器格式；拒绝覆盖或自动迁移")
+            raise ValueError("数据库不是当前调度器格式；拒绝覆盖或自动迁移，请使用新的独立数据目录")
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.executescript(SCHEMA)
-        self.db.execute("PRAGMA user_version=2")
+        self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
     @contextmanager
     def transaction(self):
@@ -229,34 +241,141 @@ class Store:
                     db.execute("""UPDATE targets SET trusted_status='ended',confirmed_at=?,suppressed_session=NULL,
                         record_session_key=NULL,attempts=0,retry_at=0,control_revision=control_revision+1 WHERE id=?""", (now, target_id))
 
-    def sync_instances(self, slots, allowed: set[int], observed_at: float):
-        """按一次扫描结果同步允许列表内的实例：在线且无任务为 idle，未启动或未发现为 offline。
+    def _instance_busy_or_reconcile(self, db, row, *, allow_booting: bool = False) -> bool:
+        if row["job_id"] or row["status"] == "reconcile":
+            return True
+        if not allow_booting and row["status"] == "booting":
+            return True
+        return bool(db.execute(
+            "SELECT 1 FROM jobs WHERE vmindex=? AND status IN ('pending','starting','running','stopping','needs_reconcile')",
+            (row["vmindex"],),
+        ).fetchone())
 
-        有任务占用、正在复位、或扫描开始后状态又被改写的实例保持不变，避免旧扫描结果覆盖新状态。
+    def sync_instances(self, slots, observed_at: float, preset: set[int] | None = None, *, clear_booting: bool = False):
+        """按一次扫描结果同步全部探测实例，保留既有的启用配置，并清理已失联的未启用旧记录。
+
+        传入 preset 时（仅启动时可选命令行预设），将预设列表启用并停用无占用的预设外实例；
+        有任务占用、正在开机（除非 clear_booting=True）、待对账、或扫描开始后状态又被改写的实例保持原状态。
         """
-        found = {slot.vmindex: slot for slot in slots if slot.vmindex in allowed}
+        found = {slot.vmindex: slot for slot in slots}
         with self.transaction() as db:
-            for index in sorted(allowed):
-                slot = found.get(index)
-                observed = getattr(slot.status, "value", slot.status) if slot else "offline"
+            if preset is not None:
+                for row in list(db.execute("SELECT * FROM instances")):
+                    index = row["vmindex"]
+                    if index in preset:
+                        db.execute("""UPDATE instances SET enabled=1,
+                            boot_attempts=CASE WHEN enabled=0 THEN 0 ELSE boot_attempts END,
+                            boot_retry_at=CASE WHEN enabled=0 THEN 0 ELSE boot_retry_at END
+                            WHERE vmindex=?""", (index,))
+                    elif not self._instance_busy_or_reconcile(db, row, allow_booting=clear_booting):
+                        db.execute("UPDATE instances SET enabled=0 WHERE vmindex=?", (index,))
+
+            for index in sorted(found):
+                slot = found[index]
+                observed = getattr(slot.status, "value", slot.status)
                 status = "idle" if observed == "idle" else "offline"
-                reason = "not_discovered" if slot is None else (None if status == "idle" else "android_not_started")
-                name = slot.name if slot else ""
+                reason = None if status == "idle" else "android_not_started"
+                name = slot.name or ""
                 existing = db.execute("SELECT * FROM instances WHERE vmindex=?", (index,)).fetchone()
                 if not existing:
-                    db.execute("INSERT INTO instances(vmindex,name,status,reason,updated_at) VALUES(?,?,?,?,?)",
-                               (index, name, status, reason, observed_at))
+                    db.execute(
+                        "INSERT INTO instances(vmindex,name,status,enabled,reason,updated_at) VALUES(?,?,?,?,?,?)",
+                        (index, name, status, 1 if (preset is not None and index in preset) else 0, reason, observed_at),
+                    )
                     continue
-                if existing["job_id"] or existing["status"] == "resetting" \
-                        or existing["updated_at"] > observed_at:
+                if existing["updated_at"] > observed_at or self._instance_busy_or_reconcile(db, existing, allow_booting=clear_booting):
                     continue
-                db.execute("UPDATE instances SET name=?,status=?,reason=?,updated_at=? WHERE vmindex=?",
-                           (name or existing["name"], status, reason, observed_at, index))
+                is_idle = status == "idle"
+                # 开机失败冷却期内保留 launch_failed 原因码，避免周期刷新抹掉提示。
+                keep_failed = not is_idle and existing["reason"] == "launch_failed" and existing["boot_attempts"] > 0
+                next_reason = "launch_failed" if keep_failed else reason
+                boot_attempts = 0 if is_idle else existing["boot_attempts"]
+                boot_retry_at = 0 if is_idle else existing["boot_retry_at"]
+                db.execute(
+                    "UPDATE instances SET name=?,status=?,reason=?,boot_attempts=?,boot_retry_at=?,updated_at=? WHERE vmindex=?",
+                    (name or existing["name"], status, next_reason, boot_attempts, boot_retry_at, observed_at, index),
+                )
 
-    def finish_reset(self, vmindex: int, ok: bool, now: float):
+            if preset is not None:
+                for index in sorted(preset):
+                    if index in found:
+                        continue
+                    if not db.execute("SELECT 1 FROM instances WHERE vmindex=?", (index,)).fetchone():
+                        db.execute(
+                            "INSERT INTO instances(vmindex,name,status,enabled,reason,updated_at) VALUES(?,?,?,1,?,?)",
+                            (index, "", "offline", "not_discovered", observed_at),
+                        )
+
+            for row in list(db.execute("SELECT * FROM instances")):
+                index = row["vmindex"]
+                if index in found or self._instance_busy_or_reconcile(db, row, allow_booting=clear_booting):
+                    continue
+                if not row["enabled"]:
+                    db.execute("DELETE FROM instances WHERE vmindex=?", (index,))
+                    continue
+                if row["updated_at"] <= observed_at:
+                    db.execute(
+                        "UPDATE instances SET status='offline',reason='not_discovered',updated_at=? WHERE vmindex=?",
+                        (observed_at, index),
+                    )
+
+    def claim_boot(self, now: float) -> int | None:
+        """存在可派发排队任务且无可用空闲槽位时，按顺序认领 1 台未开机已启用实例进入 booting。"""
         with self.transaction() as db:
-            db.execute("UPDATE instances SET status=?,reason=?,updated_at=? WHERE vmindex=? AND status='resetting' AND job_id IS NULL",
-                       ("idle" if ok else "offline", None if ok else "reset_failed", now, vmindex))
+            pending = db.execute(
+                "SELECT 1 FROM jobs j JOIN targets t ON t.id=j.target_id "
+                "WHERE j.status='pending' AND t.observed_status='live' AND t.retry_at<=? LIMIT 1",
+                (now,),
+            ).fetchone()
+            if not pending:
+                return None
+            if db.execute("SELECT 1 FROM instances WHERE enabled=1 AND status='idle' AND job_id IS NULL LIMIT 1").fetchone():
+                return None
+            if db.execute("SELECT 1 FROM instances WHERE status='booting' LIMIT 1").fetchone():
+                return None
+            slot = db.execute(
+                "SELECT vmindex FROM instances WHERE enabled=1 AND status='offline' AND job_id IS NULL "
+                "AND boot_retry_at<=? AND reason IN ('android_not_started','launch_failed') "
+                "ORDER BY boot_attempts ASC, vmindex ASC LIMIT 1",
+                (now,),
+            ).fetchone()
+            if not slot:
+                return None
+            vmindex = int(slot["vmindex"])
+            db.execute(
+                "UPDATE instances SET status='booting',reason='booting',updated_at=? "
+                "WHERE vmindex=? AND status='offline' AND job_id IS NULL",
+                (now, vmindex),
+            )
+            return vmindex
+
+    def finish_boot(self, vmindex: int, ok: bool, now: float, *, cancelled: bool = False):
+        """收尾一次按需开机：成功进入空闲并清零冷却；失败回落 offline 并叠加退避冷却。"""
+        with self.transaction() as db:
+            slot = db.execute(
+                "SELECT boot_attempts FROM instances WHERE vmindex=? AND status='booting' AND job_id IS NULL",
+                (vmindex,),
+            ).fetchone()
+            if not slot:
+                return
+            if cancelled and not ok:
+                db.execute("UPDATE instances SET status='offline',reason='boot_interrupted',updated_at=? WHERE vmindex=?",
+                           (now, vmindex))
+                return
+            if ok:
+                db.execute(
+                    "UPDATE instances SET status='idle',reason=NULL,boot_attempts=0,boot_retry_at=0,updated_at=? "
+                    "WHERE vmindex=? AND status='booting' AND job_id IS NULL",
+                    (now, vmindex),
+                )
+                return
+            attempts = int(slot["boot_attempts"]) + 1
+            retry_at = now + boot_retry_delay(attempts)
+            db.execute(
+                "UPDATE instances SET status='offline',reason='launch_failed',boot_attempts=?,boot_retry_at=?,updated_at=? "
+                "WHERE vmindex=? AND status='booting' AND job_id IS NULL",
+                (attempts, retry_at, now, vmindex),
+            )
 
     def create_pending(self, target_id: str, now: float) -> str | None:
         with self.transaction() as db:
@@ -276,7 +395,7 @@ class Store:
         with self.transaction() as db:
             job = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
             slot = db.execute("SELECT * FROM instances WHERE vmindex=?", (vmindex,)).fetchone()
-            if not job or job["status"] != "pending" or not slot or slot["status"] != "idle" or slot["job_id"]:
+            if not job or job["status"] != "pending" or not slot or not slot["enabled"] or slot["status"] != "idle" or slot["job_id"]:
                 return False
             db.execute("UPDATE instances SET status='busy',job_id=?,reason=NULL,updated_at=? WHERE vmindex=?", (job_id, now, vmindex))
             db.execute("UPDATE jobs SET status='starting',vmindex=? WHERE id=?", (vmindex, job_id))
@@ -377,7 +496,7 @@ class Store:
             db.execute("UPDATE jobs SET status=?,exit_code=?,error_reason=?,ended_at=?,collection_complete=? WHERE id=?",
                        (status, code, reason or None, ended_at or now, int(collection_complete and not incomplete), job_id))
             if job["vmindex"] is not None:
-                slot_status = "reconcile" if hold_instance else ("resetting" if code == 15 else "offline" if code == 20 else "idle")
+                slot_status = "reconcile" if hold_instance else ("offline" if code == 20 else "idle")
                 db.execute("UPDATE instances SET status=?,job_id=?,reason=?,updated_at=? WHERE vmindex=? AND (job_id IS NULL OR job_id=?)",
                            (slot_status, job_id if hold_instance else None, reason or None, now, job["vmindex"], job_id))
             stop = job["stop_reason"]
@@ -396,8 +515,28 @@ class Store:
             db.execute("UPDATE jobs SET status='stopping',error_reason='waiting_old_worker_exit' WHERE id=?", (job_id,))
             db.execute("UPDATE instances SET status='busy' WHERE job_id=?", (job_id,))
 
+    def _check_instance_control(self, db, vmindex: int, enabled: bool):
+        """校验实例是否存在，以及停用时是否处于占用、开机或待对账状态。"""
+        slot = db.execute("SELECT * FROM instances WHERE vmindex=?", (vmindex,)).fetchone()
+        if not slot:
+            raise ControlError("instance_not_found", "实例不存在", 404)
+        if enabled:
+            return slot
+        if slot["status"] == "reconcile" or db.execute(
+            "SELECT 1 FROM jobs WHERE vmindex=? AND status='needs_reconcile'", (vmindex,)
+        ).fetchone():
+            raise ControlError("reconcile_required", "实例关联待对账任务，请先对账后再停用")
+        if slot["status"] == "booting":
+            raise ControlError("instance_busy", "实例正在开机中，请稍后再停用")
+        if slot["job_id"] or slot["status"] == "busy" or db.execute(
+            "SELECT 1 FROM jobs WHERE vmindex=? AND status IN ('pending','starting','running','stopping')",
+            (vmindex,),
+        ).fetchone():
+            raise ControlError("instance_busy", "实例正在占用中，请先停止对应录播任务后再停用")
+        return slot
+
     def enqueue_command(self, kind: str, subject: str, now=None, *, payload=None, request_id=None) -> str:
-        if kind not in {"add", "record", "stop", "stop_target", "remove", "update", "reconcile"}:
+        if kind not in {"add", "record", "stop", "stop_target", "remove", "update", "reconcile", "instance"}:
             raise ValueError("未知控制命令")
         request_id = str(uuid.UUID(request_id)) if request_id else str(uuid.uuid4())
         payload = payload or {}
@@ -415,6 +554,8 @@ class Store:
                 raise ControlError("reconcile_required", "任务需对账，不向未知进程发送信号")
             elif kind == "stop_target" and self.row("SELECT session_key FROM targets WHERE id=?", (subject,))["session_key"] != payload.get("session_key"):
                 raise ControlError("session_changed", "主播场次已经变化，请刷新后重试")
+            elif kind == "instance":
+                self._check_instance_control(db, int(subject), bool(payload.get("enabled")))
             db.execute("INSERT INTO commands(id,request_id,kind,subject,payload_json,created_at) VALUES(?,?,?,?,?,?)",
                        (key, request_id, kind, subject, json.dumps(payload, ensure_ascii=False, sort_keys=True), time.time() if now is None else now))
         return key
@@ -426,6 +567,13 @@ class Store:
         elif kind in {"stop", "reconcile"} and subject:
             if not self.row("SELECT id FROM jobs WHERE id=?", (subject,)):
                 raise ControlError("job_not_found", "任务不存在", 404)
+        elif kind == "instance":
+            try:
+                vmindex = int(subject)
+            except (TypeError, ValueError) as exc:
+                raise ControlError("invalid_parameters", "实例编号非法", 422) from exc
+            if not self.row("SELECT vmindex FROM instances WHERE vmindex=?", (vmindex,)):
+                raise ControlError("instance_not_found", "实例不存在", 404)
 
     def complete_command(self, key, result=None, error_code=None, message=None, now=None):
         with self.transaction() as db:
@@ -505,4 +653,18 @@ class Store:
             for job in jobs:
                 db.execute("UPDATE jobs SET reconcile_requested=1 WHERE id=?", (job["id"],))
             return dict(job_ids=[j["id"] for j in jobs], outcome="reconcile_requested" if jobs else "not_required")
+        if kind == "instance":
+            vmindex = int(subject)
+            enabled = bool(payload["enabled"])
+            slot = self._check_instance_control(db, vmindex, enabled)
+            if not enabled and slot["reason"] == "not_discovered":
+                db.execute("DELETE FROM instances WHERE vmindex=?", (vmindex,))
+                return dict(vmindex=vmindex, enabled=False, cleaned=True)
+            if enabled:
+                reason = "android_not_started" if (slot["status"] == "offline" and slot["reason"] == "launch_failed") else slot["reason"]
+                db.execute("UPDATE instances SET enabled=1,boot_attempts=0,boot_retry_at=0,reason=?,updated_at=? WHERE vmindex=?",
+                           (reason, now, vmindex))
+            else:
+                db.execute("UPDATE instances SET enabled=0,updated_at=? WHERE vmindex=?", (now, vmindex))
+            return dict(vmindex=vmindex, enabled=enabled, cleaned=False)
         raise ValueError("未知同步命令")

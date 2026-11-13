@@ -1,4 +1,4 @@
-"""单机最小调度器：持久化核对、FIFO、异步扫描、在播期间退避重试、实例自动同步与复位、重启对账。"""
+"""单机最小调度器：持久化核对、FIFO、异步扫描、在播期间退避重试、实例同步与开机、重启对账。"""
 from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
@@ -91,7 +91,7 @@ def inspect_job_process(job: dict) -> str:
 
 
 class Scheduler:
-    def __init__(self, store: Store, output_dir: Path, instance_indices: list[int],
+    def __init__(self, store: Store, output_dir: Path, instance_indices: list[int] | None = None,
                  pool=None, query_executor=None, handle_factory=WorkerProcessHandle,
                  clock=time.time, process_probe=inspect_job_process,
                  scan_interval_sec: float = 30.0,
@@ -100,26 +100,29 @@ class Scheduler:
         from src.worker.room_locator import validate_navigation_timeout
         validate_navigation_timeout(navigation_timeout_sec)
         self.navigation_timeout = navigation_timeout_sec
-        if not instance_indices or any(i < 0 for i in instance_indices):
-            raise ValueError("必须明确配置允许使用的实例索引")
+        if instance_indices is not None and any(i < 0 for i in instance_indices):
+            raise ValueError("实例索引不能为负数")
         self.store, self.clock = store, clock
         self.output_dir = Path(output_dir).resolve()
-        self.allowed = set(instance_indices)
+        self.preset = set(instance_indices) if instance_indices is not None else None
         self.scan_interval = max(.1, scan_interval_sec)
         self.ended_interval = ended_interval_sec
         self.auto_scan, self.segment_duration = auto_scan, segment_duration_sec
         self.pool = pool or InstancePool()
         self.handle_factory, self.process_probe = handle_factory, process_probe
         self._lease = HostLease(store.path.with_suffix(".host.lock"))
-        self._queries = ThreadPoolExecutor(max_workers=2 * len(self.allowed) + 2, thread_name_prefix="scheduler-query")
-        self._stoppers = ThreadPoolExecutor(max_workers=len(self.allowed), thread_name_prefix="scheduler-stop")
+        pool_cap = max(8, len(self.preset or ()))
+        self._queries = ThreadPoolExecutor(max_workers=2 * pool_cap + 2, thread_name_prefix="scheduler-query")
+        self._stoppers = ThreadPoolExecutor(max_workers=pool_cap, thread_name_prefix="scheduler-stop")
         self._events: queue.Queue = queue.Queue(maxsize=8192)
         self._event_pending = None
         self._handles, self._closing, self._verifying = {}, {}, {}
         self._scan_requested = []
         self._next_scan = 0.0
         self._refresh_future, self._refresh_started = None, 0.0
-        self._resets = {}
+        self._force_refresh = False
+        self._boots = {}
+        self._boot_stop = threading.Event()
         self._waiting_exit = {}
         self._login_checks = {}
         self._next_waiting_probe = 0.0
@@ -130,7 +133,7 @@ class Scheduler:
             self.store.interrupt_commands(self.clock())
             self.room_queries = query_executor or QueryProcesses()
             self.observations = ObservationDispatcher(store, self.room_queries, clock)
-            self.store.sync_instances(self.pool.refresh(), self.allowed, self.clock())
+            self.store.sync_instances(self.pool.refresh(), self.clock(), preset=self.preset, clear_booting=True)
             self.reconcile()
         except BaseException:
             try:
@@ -179,6 +182,8 @@ class Scheduler:
             reason = reason or terminal.get("reason", "")
             hold = handle.is_alive() or handle.forced_stop or not complete
             self.store.finish_job(job_id, code, self.clock(), complete, reason, hold_instance=hold)
+            if code == 20:
+                self._force_refresh = True
             self._closing.pop(job_id)
             self._handles.pop(job_id)
         for job_id, handle in list(self._handles.items()):
@@ -327,32 +332,35 @@ class Scheduler:
             elif not self.room_queries.available("scan"):
                 break
 
+    def _collect_instance_futures(self, futures: dict, finish_fn, label: str):
+        for vmindex, future in list(futures.items()):
+            if not future.done():
+                continue
+            futures.pop(vmindex)
+            try:
+                ok = bool(future.result())
+            except Exception:
+                logger.exception("实例 %s %s异常", vmindex, label)
+                ok = False
+            finish_fn(vmindex, ok, self.clock())
+
     def _instances(self):
-        """收取实例刷新结果，并在后台复位登录强阻断后的实例。"""
+        """收取实例刷新和自动开机结果，按需刷新掉线实例状态。"""
         if self._refresh_future and self._refresh_future.done():
             try:
                 slots = self._refresh_future.result()
             except Exception:
                 logger.exception("实例查询失败，保留原状态")
             else:
-                self.store.sync_instances(slots, self.allowed, self._refresh_started)
+                self.store.sync_instances(slots, self._refresh_started)
             self._refresh_future = None
-        for vmindex, future in list(self._resets.items()):
-            if not future.done():
-                continue
-            self._resets.pop(vmindex)
-            try:
-                ok = bool(future.result())
-            except Exception:
-                logger.exception("实例 %s 复位抖音异常", vmindex)
-                ok = False
-            self.store.finish_reset(vmindex, ok, self.clock())
+        self._collect_instance_futures(self._boots, self.store.finish_boot, "自动开机")
         if self._shutdown:
             return
-        for slot in self.store.rows("SELECT vmindex FROM instances WHERE status='resetting' AND job_id IS NULL"):
-            index = slot["vmindex"]
-            if index in self.allowed and index not in self._resets:
-                self._resets[index] = self._queries.submit(self.pool.reset_app, index)
+        if self._force_refresh and self._refresh_future is None:
+            self._force_refresh = False
+            self._refresh_started = self.clock()
+            self._refresh_future = self._queries.submit(self.pool.refresh)
 
     def _reconcile_targets(self):
         now = self.clock()
@@ -397,13 +405,16 @@ class Scheduler:
             target = self.store.row("SELECT * FROM targets WHERE id=?", (job["target_id"],))
             if target["observed_status"] != "live" or now < target["retry_at"]:
                 continue
-            slots = self.store.rows("SELECT * FROM instances WHERE status='idle' AND job_id IS NULL ORDER BY vmindex")
-            slot = next((s for s in slots if s["vmindex"] in self.allowed), None)
+            slot = self.store.row("SELECT * FROM instances WHERE enabled=1 AND status='idle' AND job_id IS NULL ORDER BY vmindex")
             if not slot:
                 break
             if self.store.claim(job["id"], slot["vmindex"], now):
                 if self.observations.dispatch("verify", target, job["id"]):
                     self._verifying[job["id"]] = True
+        if not self._boots:
+            vmindex = self.store.claim_boot(now)
+            if vmindex is not None:
+                self._boots[vmindex] = self._queries.submit(self.pool.boot_instance, vmindex, self._boot_stop)
 
     def _launch(self, job: dict, target: dict, room: ResolvedRoom):
         job_id = job["id"]
@@ -522,6 +533,7 @@ class Scheduler:
         if self._closed:
             return
         self._shutdown = True
+        self._boot_stop.set()
         shutdown_errors = []
         query_cleanup = ThreadPoolExecutor(max_workers=1, thread_name_prefix="query-cleanup")
         query_closed = query_cleanup.submit(self.room_queries.close)
@@ -581,6 +593,19 @@ class Scheduler:
             except Exception as exc:
                 shutdown_errors.append(str(exc))
             query_cleanup.shutdown(wait=False)
+            # 开机命令有硬超时，重试等待可取消；在释放主控锁之前等其彻底停止发命令。
+            for vmindex, future in list(self._boots.items()):
+                future.cancel()
+                try:
+                    ok = False if future.cancelled() else bool(future.result())
+                except Exception:
+                    logger.exception("停服收取实例 %s 开机结果失败", vmindex)
+                    ok = False
+                try:
+                    self.store.finish_boot(vmindex, ok, self.clock(), cancelled=True)
+                except Exception as exc:
+                    shutdown_errors.append(str(exc))
+                self._boots.pop(vmindex)
             self._queries.shutdown(wait=False, cancel_futures=True)
             self._stoppers.shutdown(wait=False, cancel_futures=True)
             self._lease.close()

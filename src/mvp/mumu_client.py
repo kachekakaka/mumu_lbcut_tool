@@ -6,6 +6,7 @@ import os
 import subprocess
 import time
 import re
+import threading
 
 from src.mvp.config import get_mumu_manager_exe, get_adb_exe
 
@@ -13,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 LAUNCH_RETRY_WINDOW_SEC = 45
 LAUNCH_RETRY_INTERVAL_SEC = 3
+MANAGER_TIMEOUT_SEC = 10
 
 
 class MuMuClient:
@@ -26,22 +28,26 @@ class MuMuClient:
         if not self.adb_exe or not self.adb_exe.exists():
             raise FileNotFoundError(f"未找到 adb.exe: {self.adb_exe}")
 
-    def _run_manager(self, *args: str) -> str:
+    def _run_manager(self, *args: str, timeout: float = MANAGER_TIMEOUT_SEC, check: bool = False) -> str:
         """执行 MuMuManager 命令并返回 stdout。"""
         cmd = [str(self.manager_exe), *args]
-        res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
         if res.returncode != 0:
             logger.warning(f"MuMuManager 执行返回码 {res.returncode}: {res.stderr.strip() or res.stdout.strip()}")
+            if check:
+                raise RuntimeError(f"MuMuManager 查询失败 ({res.returncode}): {res.stderr.strip() or res.stdout.strip()}")
         return res.stdout.strip()
 
     def get_all_players(self) -> dict[str, dict]:
         """获取所有实例信息字典。"""
-        out = self._run_manager("info", "-v", "all")
+        out = self._run_manager("info", "-v", "all", check=True)
         try:
-            return json.loads(out)
-        except json.JSONDecodeError:
-            logger.error(f"解析 MuMuManager info 失败: {out}")
-            return {}
+            data = json.loads(out)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"解析 MuMuManager info 失败: {out}") from exc
+        if not isinstance(data, dict) or any(not isinstance(v, dict) for v in data.values()):
+            raise ValueError(f"MuMuManager info 不是实例集合: {out}")
+        return data
 
     def list_available_instances(self) -> list[dict]:
         """获取所有可用模拟器实例列表（供调度平台初始化实例池使用）。
@@ -63,8 +69,10 @@ class MuMuClient:
         for key, val in all_info.items():
             try:
                 idx = int(val.get("index", key))
-            except (ValueError, TypeError):
-                continue
+            except (ValueError, TypeError) as exc:
+                raise ValueError(f"MuMuManager 实例编号无效: {key}") from exc
+            if idx < 0:
+                raise ValueError(f"MuMuManager 实例编号不能为负数: {idx}")
             is_running = bool(val.get("is_android_started", False) or val.get("is_process_started", False))
             instances.append({
                 "vmindex": idx,
@@ -79,9 +87,9 @@ class MuMuClient:
         instances.sort(key=lambda x: x["vmindex"])
         return instances
 
-    def get_player_info(self, vmindex: int) -> dict:
+    def get_player_info(self, vmindex: int, *, timeout: float = MANAGER_TIMEOUT_SEC) -> dict:
         """获取单个实例信息字典。"""
-        out = self._run_manager("info", "-v", str(vmindex))
+        out = self._run_manager("info", "-v", str(vmindex), timeout=timeout, check=True)
         try:
             data = json.loads(out)
             # 有时返回以 str(vmindex) 为 key，有时直接是对象
@@ -92,14 +100,18 @@ class MuMuClient:
             logger.error(f"解析实例 {vmindex} 信息失败: {out}")
             return {}
 
-    def is_android_started(self, vmindex: int) -> bool:
+    def is_android_started(self, vmindex: int, *, timeout: float = MANAGER_TIMEOUT_SEC) -> bool:
         """检查 Android 系统是否已完全启动。"""
-        info = self.get_player_info(vmindex)
+        info = self.get_player_info(vmindex, timeout=timeout)
         return bool(info.get("is_android_started", False))
 
-    def ensure_main_process_running(self) -> bool:
+    def ensure_main_process_running(self, *, stop_event=None, timeout_sec: float = 15) -> bool:
         """确保 MuMu 主程序 (MuMuNxMain.exe) 处于运行状态。"""
         # 检查进程
+        stop_event = stop_event or threading.Event()
+        if stop_event.is_set():
+            return False
+        deadline = time.monotonic() + timeout_sec
         main_exe = self.manager_exe.parent / "MuMuNxMain.exe"
         if not main_exe.exists():
             return True
@@ -109,9 +121,12 @@ class MuMuClient:
             capture_output=True,
             encoding="utf-8",
             errors="replace",
+            timeout=min(MANAGER_TIMEOUT_SEC, timeout_sec),
         )
         stdout_text = res.stdout or ""
         if "MuMuNxMain.exe" not in stdout_text:
+            if stop_event.is_set() or time.monotonic() >= deadline:
+                return False
             logger.info("MuMu 主程序未启动，正在独立拉起主程序...")
             creationflags = 0
             if os.name == "nt":
@@ -122,39 +137,51 @@ class MuMuClient:
                 creationflags=creationflags,
                 close_fds=True,
             )
-            time.sleep(5)
-        return True
+            if stop_event.wait(min(5, max(0, deadline - time.monotonic()))):
+                return False
+        return not stop_event.is_set()
 
-    def launch_player(self, vmindex: int, timeout_sec: int = 60) -> bool:
-        """启动指定实例并等待其 Android 系统就绪。"""
-        self.ensure_main_process_running()
+    def launch_player(self, vmindex: int, timeout_sec: int = 60, *, stop_event=None) -> bool:
+        """有界启动：主程序准备 15 秒、受理重试 45 秒、Android 就绪默认 60 秒；停服不关机。"""
+        stop_event = stop_event or threading.Event()
+        deadline = time.monotonic() + 15 + LAUNCH_RETRY_WINDOW_SEC + timeout_sec
 
-        if self.is_android_started(vmindex):
-            logger.info(f"实例 {vmindex} 已经处于运行状态。")
-            return True
+        def remaining(until=deadline):
+            if stop_event.is_set():
+                raise InterruptedError("开机被停服中断")
+            budget = min(deadline, until) - time.monotonic()
+            if budget <= 0:
+                raise TimeoutError("开机超过截止时间")
+            return min(MANAGER_TIMEOUT_SEC, budget)
 
-        logger.info(f"正在启动 MuMu 实例 {vmindex}...")
-        # 主程序刚拉起时后台服务未就绪，launch 会返回 -503 mainnx connect failed；
-        # 在限定时间内重发，开机等待从命令被受理时起算。
-        retry_until = time.time() + LAUNCH_RETRY_WINDOW_SEC
-        while True:
-            errcode = self._manager_errcode(self._run_manager("control", "-v", str(vmindex), "launch"))
-            if errcode == 0 or time.time() >= retry_until:
-                break
-            logger.info(f"实例 {vmindex} 启动命令未被受理 (errcode={errcode})，{LAUNCH_RETRY_INTERVAL_SEC}s 后重试")
-            time.sleep(LAUNCH_RETRY_INTERVAL_SEC)
-            if self.is_android_started(vmindex):
+        def pause(seconds, until=deadline):
+            remaining(until)
+            if stop_event.wait(min(seconds, max(0, min(deadline, until) - time.monotonic()))):
+                raise InterruptedError("开机被停服中断")
+
+        try:
+            remaining()
+            if not self.ensure_main_process_running(stop_event=stop_event, timeout_sec=min(15, deadline-time.monotonic())):
+                return False
+            if self.is_android_started(vmindex, timeout=remaining()):
                 return True
-
-        start_time = time.time()
-        while time.time() - start_time < timeout_sec:
-            time.sleep(3)
-            if self.is_android_started(vmindex):
-                logger.info(f"实例 {vmindex} Android 系统启动成功 (耗时 {int(time.time() - start_time)}s)。")
-                return True
-
-        logger.error(f"实例 {vmindex} 启动超时 ({timeout_sec}s)。")
-        return False
+            logger.info("正在启动 MuMu 实例 %s...", vmindex)
+            retry_until = min(deadline, time.monotonic() + LAUNCH_RETRY_WINDOW_SEC)
+            while True:
+                output = self._run_manager("control", "-v", str(vmindex), "launch", timeout=remaining(retry_until))
+                if self._manager_errcode(output) == 0:
+                    break
+                pause(LAUNCH_RETRY_INTERVAL_SEC, retry_until)
+                if self.is_android_started(vmindex, timeout=remaining(retry_until)):
+                    return True
+            ready_until = min(deadline, time.monotonic() + timeout_sec)
+            while True:
+                pause(3, ready_until)
+                if self.is_android_started(vmindex, timeout=remaining(ready_until)):
+                    return True
+        except (InterruptedError, TimeoutError, subprocess.TimeoutExpired, OSError, ValueError, RuntimeError) as exc:
+            logger.warning("实例 %s 开机未完成: %s", vmindex, exc)
+            return False
 
     @staticmethod
     def _manager_errcode(output: str) -> int:

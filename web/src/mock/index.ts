@@ -2,6 +2,7 @@
 // 上传字段只用于检验上传界面的显示与隐藏，不代表后端契约。
 import { ApiError, type RequestOptions, type Response } from '../api/client'
 import type { Command, Instance, Job, Segment, Target } from '../api/types'
+import { disableInstanceReason, visibleOverviewInstances } from '../instances'
 
 const now = () => Date.now() / 1000
 const t0 = now()
@@ -44,11 +45,13 @@ const jobs: Job[] = [
 ]
 
 const instances: Instance[] = [
-  { vmindex: 0, name: 'MuMu-0', status: 'busy', job_id: 'job-a1', reason: null, updated_at: t0 - 3590, target_id: 't-alpha', nickname: '主播甲' },
-  { vmindex: 1, name: 'MuMu-1', status: 'idle', job_id: null, reason: null, updated_at: t0 - 600, target_id: null, nickname: null },
-  { vmindex: 2, name: 'MuMu-2', status: 'reconcile', job_id: 'job-r9', reason: null, updated_at: t0 - 300, target_id: 't-delta', nickname: '主播丁' },
-  { vmindex: 3, name: 'MuMu-3', status: 'offline', job_id: null, reason: { code: 'android_not_started', detail: null }, updated_at: t0 - 50, target_id: null, nickname: null },
-  { vmindex: 4, name: 'MuMu-4', status: 'offline', job_id: null, reason: { code: 'brand_new_reason', detail: null }, updated_at: t0 - 50, target_id: null, nickname: null },
+  { vmindex: 0, name: 'MuMu-0', status: 'busy', enabled: true, job_id: 'job-a1', reason: null, updated_at: t0 - 3590, target_id: 't-alpha', nickname: '主播甲' },
+  { vmindex: 1, name: 'MuMu-1', status: 'idle', enabled: true, job_id: null, reason: null, updated_at: t0 - 600, target_id: null, nickname: null },
+  { vmindex: 2, name: 'MuMu-2', status: 'reconcile', enabled: true, job_id: 'job-r9', reason: null, updated_at: t0 - 300, target_id: 't-delta', nickname: '主播丁' },
+  { vmindex: 3, name: 'MuMu-3', status: 'offline', enabled: true, job_id: null, reason: { code: 'android_not_started', detail: null }, updated_at: t0 - 50, target_id: null, nickname: null },
+  { vmindex: 4, name: 'MuMu-4', status: 'offline', enabled: false, job_id: null, reason: { code: 'brand_new_reason', detail: null }, updated_at: t0 - 50, target_id: null, nickname: null },
+  { vmindex: 5, name: 'MuMu-5', status: 'booting', enabled: true, job_id: null, reason: { code: 'booting', detail: null }, updated_at: t0 - 10, target_id: null, nickname: null },
+  { vmindex: 6, name: 'MuMu-6', status: 'offline', enabled: true, job_id: null, reason: { code: 'launch_failed', detail: null }, updated_at: t0 - 20, target_id: null, nickname: null },
 ]
 
 function segment(jobId: string, index: number, status: string, extra: Partial<Segment> = {}): Segment {
@@ -147,6 +150,19 @@ function execute(command: Command, body: Record<string, unknown>) {
       if (outcome === 'stop_requested') j.status = 'stopping'
       return ok({ job_id: j.id, outcome })
     }
+    case 'instance': {
+      const vmindex = Number(command.subject)
+      const inst = instances.find((x) => x.vmindex === vmindex)
+      if (!inst) return fail('instance_not_found', '实例不存在')
+      const next = Boolean(body.enabled)
+      const blocked = next ? '' : disableInstanceReason(inst)
+      if (blocked) {
+        return fail(inst.status === 'reconcile' ? 'reconcile_required' : 'instance_busy', blocked)
+      }
+      inst.enabled = next
+      inst.updated_at = now()
+      return ok({ vmindex, enabled: next, cleaned: false })
+    }
     default:
       return fail('internal_error', '模拟数据不支持该命令')
   }
@@ -200,13 +216,18 @@ function route(method: string, path: string, options: RequestOptions): Response<
     ].sort((a, b) => b.timestamp - a.timestamp)
     const jc = count(jobs)
     return { status: 200, data: {
-      instance_counts: { idle: 0, busy: 0, resetting: 0, offline: 0, reconcile: 0, ...count(instances) },
+      instance_counts: {
+        idle: 0, busy: 0, booting: 0, offline: 0, reconcile: 0,
+        ...count(visibleOverviewInstances(instances)),
+      },
       job_counts: jc, recording_count: jc.running ?? 0, pending_count: jc.pending ?? 0,
       today_finished_segments: segments.filter((s) => s.status === 'finished').length, statistics_timezone: 'Asia/Shanghai',
       generated_at: now(), alerts: page(alerts, q),
     } }
   }
-  if (method === 'GET' && path === '/api/instances') return { status: 200, data: page(instances.filter((i) => !q.status || i.status === q.status), q) }
+  if (method === 'GET' && path === '/api/instances') {
+    return { status: 200, data: page(instances.filter((i) => (!q.status || i.status === q.status) && (bool(q.enabled) === undefined || i.enabled === bool(q.enabled))), q) }
+  }
   if (method === 'GET' && path === '/api/targets') {
     const list = enabled.filter((t) =>
       (!q.q || (t.nickname ?? '').includes(q.q) || t.raw.includes(q.q))
@@ -259,6 +280,9 @@ function route(method: string, path: string, options: RequestOptions): Response<
     const id = decodeURIComponent(m[1])
     if (method === 'DELETE') return submit('remove', id, {}, options)
     if (method === 'PATCH') return submit('update', id, body, options)
+  }
+  if (method === 'PATCH' && (m = path.match(/^\/api\/instances\/(\d+)$/))) {
+    return submit('instance', m[1], body, options)
   }
   if (method === 'POST' && (m = path.match(/^\/api\/targets\/([^/]+)\/(record|stop)$/))) {
     return submit(m[2] === 'record' ? 'record' : 'stop_target', decodeURIComponent(m[1]), body, options)

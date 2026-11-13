@@ -29,7 +29,10 @@ docs/
 │  ├─ [20261111-调度控制台前端联调验证.md](证据/验证/20261111-调度控制台前端联调验证.md)
 │  ├─ [20261112-固定FFmpeg9与AAC音轨修复验证.md](证据/验证/20261112-固定FFmpeg9与AAC音轨修复验证.md)
 │  ├─ [20261112-六小时长稳测试验证.md](证据/验证/20261112-六小时长稳测试验证.md)
-│  └─ [20261112-登录提示状态复核与恢复原因验证.md](证据/验证/20261112-登录提示状态复核与恢复原因验证.md)
+│  ├─ [20261112-登录提示状态复核与恢复原因验证.md](证据/验证/20261112-登录提示状态复核与恢复原因验证.md)
+│  ├─ [20261112-实例控制与按需开机审查修正验证.md](证据/验证/20261112-实例控制与按需开机审查修正验证.md)
+│  ├─ [20261113-Worker收尾关闭抖音验证.md](证据/验证/20261113-Worker收尾关闭抖音验证.md)
+│  └─ [20261113-T8按需开机与T10冷启动再录实机验证.md](证据/验证/20261113-T8按需开机与T10冷启动再录实机验证.md)
 └─ adr/
    ├─ [0001-scrcpy-pipeline-for-audio-video-isolation.md](adr/0001-scrcpy-pipeline-for-audio-video-isolation.md)
    ├─ [0002-time-segmented-mp4-recording.md](adr/0002-time-segmented-mp4-recording.md)
@@ -46,7 +49,10 @@ docs/
    ├─ [0014-remove-restart-mode-and-dual-pipeline.md](adr/0014-remove-restart-mode-and-dual-pipeline.md)
    ├─ [0015-auto-retry-while-live-without-manual-unblock.md](adr/0015-auto-retry-while-live-without-manual-unblock.md)
    ├─ [0016-console-frontend-separate-build-and-private-network-access.md](adr/0016-console-frontend-separate-build-and-private-network-access.md)
-   └─ [0017-console-control-scope-and-session-intent.md](adr/0017-console-control-scope-and-session-intent.md)
+   ├─ [0017-console-control-scope-and-session-intent.md](adr/0017-console-control-scope-and-session-intent.md)
+   ├─ [0018-console-instance-selection-and-cleanup.md](adr/0018-console-instance-selection-and-cleanup.md)
+   ├─ [0019-scheduler-on-demand-instance-boot.md](adr/0019-scheduler-on-demand-instance-boot.md)
+   └─ [0020-worker-cleanup-force-stop-douyin.md](adr/0020-worker-cleanup-force-stop-douyin.md)
 
 archive/docs/                       仓库根目录下，按需
 ├─ 方案/
@@ -61,7 +67,10 @@ archive/docs/                       仓库根目录下，按需
 │  ├─ [20261109-冻结检测改用录像流与旧录制路径清理方案.md](../archive/docs/方案/20261109-冻结检测改用录像流与旧录制路径清理方案.md)
 │  ├─ [20261110-录制自动恢复与运行期误判修正方案.md](../archive/docs/方案/20261110-录制自动恢复与运行期误判修正方案.md)
 │  ├─ [控制台前端方案（余项转交）](../archive/docs/方案/20261111-调度控制台前端方案.md)
-│  └─ [控制台后端方案（余项转交）](../archive/docs/方案/20261111-调度控制台后端接口实施方案.md)
+│  ├─ [控制台后端方案（余项转交）](../archive/docs/方案/20261111-调度控制台后端接口实施方案.md)
+│  ├─ [20261112-控制台实例动态启用与旧记录清理实施方案.md](../archive/docs/方案/20261112-控制台实例动态启用与旧记录清理实施方案.md)
+│  ├─ [20261112-调度器按需自动开机实例实施方案.md](../archive/docs/方案/20261112-调度器按需自动开机实例实施方案.md)
+│  └─ [20261112-任务结束关闭模拟器抖音进程实施方案.md](../archive/docs/方案/20261112-任务结束关闭模拟器抖音进程实施方案.md)
 └─ adr/                             已失效或被替代的决定
    └─ [0009-overlapping-dual-pipeline-seamless-slicing.md](../archive/docs/adr/0009-overlapping-dual-pipeline-seamless-slicing.md)
 ```

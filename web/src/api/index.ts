@@ -24,6 +24,8 @@ export const api = {
   removeTarget: (targetId: string, requestId: string) => write('DELETE', `/api/targets/${id(targetId)}`, requestId),
   setAutoRecord: (targetId: string, autoRecord: boolean, requestId: string) =>
     write('PATCH', `/api/targets/${id(targetId)}`, requestId, { auto_record: autoRecord }),
+  setInstanceEnabled: (vmindex: number, enabled: boolean, requestId: string) =>
+    write('PATCH', `/api/instances/${vmindex}`, requestId, { enabled }),
   record: (targetId: string, requestId: string) => write('POST', `/api/targets/${id(targetId)}/record`, requestId, {}),
   stopTarget: (targetId: string, sessionKey: string, requestId: string) =>
     write('POST', `/api/targets/${id(targetId)}/stop`, requestId, { session_key: sessionKey }),

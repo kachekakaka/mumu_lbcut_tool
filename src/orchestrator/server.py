@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 class ServerConfig:
     data_dir: Path
     output_dir: Path
-    instances: list[int]
+    instances: list[int] | None = None
     host: str = "127.0.0.1"
     port: int = 8000
     scan_interval: float = 30.0
@@ -41,7 +41,7 @@ class ServerConfig:
         from src.worker.room_locator import validate_navigation_timeout
         import math
         validate_navigation_timeout(self.navigation_timeout)
-        if not self.instances or any(i < 0 for i in self.instances) or not 1 <= self.port <= 65535:
+        if (self.instances is not None and (not self.instances or any(i < 0 for i in self.instances))) or not 1 <= self.port <= 65535:
             raise ValueError("实例编号或端口非法")
         if not all(math.isfinite(v) for v in (self.scan_interval, self.navigation_timeout, self.max_runtime)) or self.scan_interval <= 0 or self.segment_duration <= 0 or self.max_runtime < 0:
             raise ValueError("时间参数非法")

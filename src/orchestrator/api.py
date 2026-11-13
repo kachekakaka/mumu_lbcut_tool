@@ -3,7 +3,7 @@ import logging
 from typing import Annotated, Generic, Literal, TypeVar
 from uuid import UUID
 
-from fastapi import APIRouter, Body, FastAPI, Header, Request
+from fastapi import APIRouter, Body, FastAPI, Header, Path, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, ValidationError, model_validator
@@ -33,6 +33,10 @@ class Update(StrictModel):
     auto_record: StrictBool
 
 
+class InstanceUpdate(StrictModel):
+    enabled: StrictBool
+
+
 class StopTarget(StrictModel):
     session_key: str = Field(min_length=1, max_length=2048, pattern=r"\S")
 
@@ -47,7 +51,8 @@ class Pagination(StrictModel):
 
 
 class Instances(Pagination):
-    status: Literal["idle", "busy", "resetting", "offline", "reconcile"] | None = None
+    status: Literal["idle", "busy", "booting", "offline", "reconcile"] | None = None
+    enabled: bool | None = None
 
 
 class Targets(Pagination):
@@ -105,6 +110,7 @@ class InstanceResponse(StrictModel):
     vmindex: int
     name: str
     status: str
+    enabled: bool
     job_id: str | None
     reason: ReasonResponse | None
     updated_at: float
@@ -249,7 +255,7 @@ def parameters(request, model):
     values = dict(request.query_params)
     if len(values) != len(request.query_params.multi_items()):
         raise ControlError("invalid_parameters", "不允许重复查询参数", 422)
-    for key in ("active", "auto_record", "has_notice", "has_quality_flags"):
+    for key in ("active", "auto_record", "enabled", "has_notice", "has_quality_flags"):
         if key in values and values[key] not in ("true", "false"):
             raise ControlError("invalid_parameters", "布尔查询参数只能使用 true 或 false", 422)
     try:
@@ -340,6 +346,11 @@ def install_api(app: FastAPI, runtime):
     def update(key: str, body: Update, request: Request, idempotency_key: str | None = Header(default=None)):
         parameters(request, Empty)
         return submit("update", key, body.model_dump(), idempotency_key)
+
+    @router.patch("/instances/{vmindex}")
+    def update_instance(vmindex: Annotated[int, Path(ge=0)], body: InstanceUpdate, request: Request, idempotency_key: str | None = Header(default=None)):
+        parameters(request, Empty)
+        return submit("instance", str(vmindex), body.model_dump(), idempotency_key)
 
     @router.delete("/targets/{key}")
     def remove(key: str, request: Request, body: Empty | None = Body(default=None), idempotency_key: str | None = Header(default=None)):

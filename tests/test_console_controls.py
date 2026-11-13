@@ -209,10 +209,11 @@ def test_target_stop_session_recheck_and_reconcile_intent(system):
     assert e.children[0].alive
 
 
-def test_v1_is_rejected_without_migration(tmp_path):
+@pytest.mark.parametrize('version', [1, 2])
+def test_old_schema_is_rejected_without_migration(tmp_path, version):
     path = tmp_path / 'old.sqlite3'
     db = sqlite3.connect(path)
-    db.executescript('CREATE TABLE old(value); INSERT INTO old VALUES(7); PRAGMA user_version=1;')
+    db.executescript(f'CREATE TABLE old(value); INSERT INTO old VALUES(7); PRAGMA user_version={version};')
     db.close()
     before = path.read_bytes()
     with pytest.raises(ValueError, match='拒绝覆盖'):
@@ -248,3 +249,33 @@ def test_batch_transaction_rolls_back_all_items_and_result(system, monkeypatch):
         e.scheduler.tick()
     assert not e.store.rows('SELECT * FROM targets')
     assert result(e, key)['status'] == 'pending'
+
+
+def test_instance_enable_command_unlocks_dispatch_and_rejects_race_busy(system):
+    e = system
+    with e.store.transaction() as db:
+        db.execute("INSERT INTO instances(vmindex,name,status,enabled,updated_at) VALUES(3,'VM3','idle',0,?)", (e.clock(),))
+    # 先用掉 1 和 2，让 3 保持未启用；再通过命令启用 3 观察第三个任务落到 3 上
+    targets = [e.store.add_target(raw, now=e.clock()) for raw in ('A', 'B', 'C')]
+    observe(e, dict.fromkeys(('A', 'B', 'C'), RoomStatus.LIVE))
+    pump(e, lambda: len(e.children) == 2)
+    pending_c = row(e, "SELECT * FROM jobs WHERE target_id=?", targets[2])
+    assert pending_c['status'] == 'pending'
+
+    enable_key = command(e, 'instance', '3', {'enabled': True})
+    assert result(e, enable_key)['status'] == 'succeeded'
+    pump(e, lambda: len(e.children) == 3)
+    assert row(e, "SELECT vmindex FROM jobs WHERE id=?", pending_c['id'])['vmindex'] == 3
+
+    # 并发竞态：提交停用命令时 3 刚释放为空闲，但调度执行命令前被新任务抢占 -> 命令失败返回 instance_busy
+    e.children[2].exit(0, 'stop_requested')
+    pump(e, lambda: row(e, 'SELECT status FROM instances WHERE vmindex=3')['status'] == 'idle')
+    target_d = e.store.add_target('D', now=e.clock())
+    observe(e, {'D': RoomStatus.LIVE})
+    job_d = e.store.create_pending(target_d, e.clock())
+    race_key = e.store.enqueue_command('instance', '3', payload={'enabled': False})
+    assert e.store.claim(job_d, 3, e.clock())
+    e.scheduler._commands()
+    res = result(e, race_key)
+    assert res['status'] == 'failed' and res['error_code'] == 'instance_busy'
+    assert row(e, 'SELECT enabled FROM instances WHERE vmindex=3')['enabled'] == 1

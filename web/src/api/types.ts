@@ -54,6 +54,7 @@ export interface Instance {
   vmindex: number
   name: string
   status: string
+  enabled: boolean
   job_id: string | null
   reason: Reason | null
   updated_at: number

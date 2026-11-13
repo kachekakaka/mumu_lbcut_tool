@@ -1,14 +1,19 @@
-"""实例池：按 Android 启动状态报告在线，登录强阻断后冷启动抖音。"""
-import subprocess
+"""实例池：按 Android 启动状态报告在线，按需开机。"""
 from types import SimpleNamespace
 
-from src.orchestrator.instance_pool import DOUYIN_PACKAGE, InstancePool
+from src.orchestrator.instance_pool import InstancePool
 from src.orchestrator.models import InstanceStatus
 
 
-def make_mumu(serial='127.0.0.1:16416'):
+def make_mumu(serial='127.0.0.1:16416', launch_ok=True):
+    calls = []
+    def launch_player(vmindex, *, stop_event=None):
+        calls.append(vmindex)
+        return launch_ok
     return SimpleNamespace(
         adb_exe='adb.exe',
+        launch_calls=calls,
+        launch_player=launch_player,
         list_available_instances=lambda: [
             {'vmindex': 0, 'name': 'lb1', 'android_started': True},
             {'vmindex': 1, 'name': 'lb2', 'android_started': False},
@@ -24,27 +29,21 @@ def test_refresh_reports_offline_when_android_not_started():
     assert not hasattr(InstancePool, 'unblock')
 
 
-def test_reset_app_force_stops_and_starts_home(monkeypatch):
-    calls = []
-    def run(cmd, **kw):
-        calls.append(cmd)
-        return subprocess.CompletedProcess(cmd, 0, 'Starting: Intent { cmp=... }', '')
-    monkeypatch.setattr(subprocess, 'run', run)
-    assert InstancePool(make_mumu()).reset_app(0)
-    assert [c[3:] for c in calls] == [
-        ['shell', 'am', 'force-stop', DOUYIN_PACKAGE],
-        ['shell', 'am', 'start', '-n', f'{DOUYIN_PACKAGE}/.main.MainActivity']]
-    assert all(c[:3] == ['adb.exe', '-s', '127.0.0.1:16416'] for c in calls)
-    # 只关停并重启抖音，不清数据。
-    assert not any('clear' in c for c in calls)
+def test_pool_does_not_own_app_cleanup():
+    assert not hasattr(InstancePool, 'reset_app')
+    assert not hasattr(InstanceStatus, 'RESETTING')
 
 
-def test_reset_app_fails_when_adb_unreachable_or_command_errors(monkeypatch):
-    assert not InstancePool(make_mumu(serial=None)).reset_app(0)
-    monkeypatch.setattr(subprocess, 'run', lambda cmd, **kw: subprocess.CompletedProcess(
-        cmd, 0, 'Error: Activity class does not exist.', ''))
-    assert not InstancePool(make_mumu()).reset_app(0)
-    def boom(cmd, **kw):
-        raise subprocess.TimeoutExpired(cmd, 20)
-    monkeypatch.setattr(subprocess, 'run', boom)
-    assert not InstancePool(make_mumu()).reset_app(0)
+def test_boot_instance_delegates_to_mumu_client_and_guards_errors():
+    assert InstanceStatus.BOOTING.value == 'booting'
+    mumu = make_mumu(launch_ok=True)
+    assert InstancePool(mumu).boot_instance(1) is True
+    assert mumu.launch_calls == [1]
+
+    mumu_fail = make_mumu(launch_ok=False)
+    assert InstancePool(mumu_fail).boot_instance(1) is False
+
+    def raise_err(vmindex, *, stop_event=None):
+        raise RuntimeError('launch exploded')
+    mumu_err = SimpleNamespace(launch_player=raise_err)
+    assert InstancePool(mumu_err).boot_instance(1) is False

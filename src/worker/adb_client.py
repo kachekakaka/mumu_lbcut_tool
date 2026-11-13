@@ -60,6 +60,8 @@ class AdbDeviceClient:
             return "tap"
         if args[:3] == ("shell", "input", "keyevent"):
             return "keyevent"
+        if args[:3] == ("shell", "am", "force-stop"):
+            return "force_stop"
         if args[:2] == ("shell", "am") and "start" in args:
             return "intent"
         return "other"
@@ -127,6 +129,12 @@ class AdbDeviceClient:
             raise
         finally:
             self._record_command(kind, (time.monotonic()-started)*1000.0, status)
+
+    def force_stop_package(self, package: str, timeout: float = 4.0) -> None:
+        """只关闭本设备上的指定应用；失败交给调用方记录，不重开首页。"""
+        result = self.run_adb("shell", "am", "force-stop", package, timeout=timeout)
+        if result.exit_code != 0 or "error" in (result.stdout + result.stderr).lower():
+            raise RuntimeError(f"force-stop 失败，exit_code={result.exit_code}; stdout={result.stdout}; stderr={result.stderr}")
 
     def is_device_ready(self, timeout: float = 3.0) -> bool:
         """检查目标设备状态是否为 'device'。"""

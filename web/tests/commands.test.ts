@@ -143,4 +143,24 @@ describe('命令追踪', () => {
     expect(d.text).toBe('已取消本场续录')
     expect(d.notes.join()).toContain('遗留进程仍需对账')
   })
+
+  it('实例启停命令与占用拒绝分别给出明确说明', async () => {
+    const { ops } = setup([
+      command('succeeded', { kind: 'instance', result: { vmindex: 2, enabled: true, cleaned: false } }),
+      command('succeeded', { kind: 'instance', result: { vmindex: 3, enabled: false, cleaned: true } }),
+    ])
+    const opOn = ops.start('instance', '2', '启用实例 #2', async () => ({ command_id: 'cmd-1', status: 'pending' }))
+    await settle()
+    expect(describeOperation(opOn)).toMatchObject({ level: 'success', text: '已启用实例参与录播' })
+
+    const opClean = ops.start('instance', '3', '停用实例 #3', async () => ({ command_id: 'cmd-2', status: 'pending' }))
+    await settle()
+    expect(describeOperation(opClean)).toMatchObject({ level: 'success', text: '已停用并清理失联实例记录' })
+
+    const opBusy = ops.start('instance', '2', '停用实例 #2', async () => {
+      throw new ApiError(409, 'instance_busy', '实例正在占用中，请先停止对应录播任务后再停用')
+    })
+    await settle()
+    expect(describeOperation(opBusy)).toMatchObject({ level: 'error', text: '未受理：实例正在占用中，请先停止对应录播任务后再停用' })
+  })
 })

@@ -9,7 +9,7 @@ class InstanceStatus(Enum):
     """模拟器实例在调度池中的状态。"""
     IDLE = "idle"            # Android 已启动且无任务，可承接任务
     BUSY = "busy"            # 正在录制任务中
-    RESETTING = "resetting"  # 登录强阻断后正在冷启动抖音，不分配任务
+    BOOTING = "booting"      # 调度器正在按需拉起模拟器，不分配任务
     OFFLINE = "offline"      # Android 未启动、未发现或 ADB 不通；重新在线后自动回到空闲
     RECONCILE = "reconcile"  # 旧任务进程归属未确认，实例保留到人工对账
 

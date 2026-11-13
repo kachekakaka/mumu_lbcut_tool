@@ -15,13 +15,16 @@ function tag(map: Record<string, TagType>, value: unknown): TagType {
 }
 
 export const INSTANCE_STATUS: Record<string, string> = {
-  idle: '空闲', busy: '录制中', resetting: '复位中', offline: '离线', reconcile: '待对账',
+  idle: '空闲', busy: '录制中', booting: '开机中', offline: '离线', reconcile: '待对账',
 }
 const INSTANCE_TAG: Record<string, TagType> = {
-  idle: 'success', busy: 'primary', resetting: 'warning', offline: 'info', reconcile: 'danger',
+  idle: 'success', busy: 'primary', booting: 'warning', offline: 'info', reconcile: 'danger',
 }
 export const INSTANCE_REASON: Record<string, string> = {
   android_not_started: '安卓系统未启动',
+  booting: '正在自动开机',
+  launch_failed: '自动开机失败（冷却重试中）',
+  boot_interrupted: '开机被停服中断，等待重新探测',
   not_discovered: '未发现该实例',
 }
 
@@ -97,7 +100,7 @@ const COMMAND_TAG: Record<string, TagType> = {
 
 export const COMMAND_KIND: Record<string, string> = {
   add: '新增主播', update: '自动录制开关', remove: '删除主播', record: '立即开录',
-  stop_target: '停止本场', stop: '平滑停止任务', reconcile: '对账',
+  stop_target: '停止本场', stop: '平滑停止任务', reconcile: '对账', instance: '实例录播开关',
 }
 
 export const ADD_OUTCOME: Record<string, string> = { created: '已新增', existing: '已存在（设置不变）', restored: '已恢复监控', error: '失败' }
@@ -123,6 +126,8 @@ export const ERROR_CODE: Record<string, string> = {
   service_unavailable: '服务未就绪或正在关闭',
   idempotency_conflict: '请求编号冲突',
   target_not_found: '主播不存在或已删除',
+  instance_not_found: '实例不存在',
+  instance_busy: '实例正在占用中，请先停止对应录播任务后再停用',
   job_not_found: '任务不存在',
   command_not_found: '命令不存在',
   invalid_target: '地址无效或不支持',

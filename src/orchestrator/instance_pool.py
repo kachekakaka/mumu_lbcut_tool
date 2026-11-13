@@ -1,21 +1,16 @@
-"""模拟器实例池：查询实例在线状态，登录强阻断后冷启动抖音。
+"""模拟器实例池：查询实例在线状态、按需拉起实例开机。
 
-实例的分配与占用只记录在调度数据库；本模块不持有占用状态，也不开关模拟器。
+实例的分配与占用只记录在调度数据库；本模块不持有占用状态，也不自动关闭模拟器。
 """
 import logging
-import os
-import subprocess
 
 from src.mvp.mumu_client import MuMuClient
 from src.orchestrator.models import InstanceSlot, InstanceStatus
 
 logger = logging.getLogger(__name__)
 
-DOUYIN_PACKAGE = "com.ss.android.ugc.aweme"
-
-
 class InstancePool:
-    """MuMu 实例查询与抖音复位。"""
+    """MuMu 实例查询与按需开机；应用收尾归 Worker 所有。"""
 
     def __init__(self, mumu_client: MuMuClient | None = None) -> None:
         self._mumu = mumu_client
@@ -36,24 +31,13 @@ class InstancePool:
                                       raw_info=inst.get("raw_info", {})))
         return slots
 
-    def reset_app(self, vmindex: int) -> bool:
-        """关闭并冷启动抖音首页；不清数据、不登录。ADB 不通或命令失败返回 False。"""
-        serial = self.mumu.connect_adb(vmindex, retries=2)
-        if not serial:
-            logger.warning("实例 %s 复位抖音失败：ADB 不通", vmindex)
-            return False
-        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-        adb = str(self.mumu.adb_exe)
+    def boot_instance(self, vmindex: int, stop_event=None) -> bool:
+        """按需启动指定 MuMu 实例并等待 Android 就绪；不自动关机。"""
         try:
-            for args in (["am", "force-stop", DOUYIN_PACKAGE],
-                         ["am", "start", "-n", f"{DOUYIN_PACKAGE}/.main.MainActivity"]):
-                result = subprocess.run([adb, "-s", serial, "shell", *args], capture_output=True, text=True,
-                                        encoding="utf-8", errors="replace", timeout=20, creationflags=flags)
-                if result.returncode != 0 or "Error" in result.stdout + result.stderr:
-                    logger.warning("实例 %s 复位抖音命令失败: %s", vmindex, (result.stderr or result.stdout).strip())
-                    return False
-        except (OSError, subprocess.SubprocessError) as exc:
-            logger.warning("实例 %s 复位抖音异常: %s", vmindex, exc)
+            ok = bool(self.mumu.launch_player(vmindex, stop_event=stop_event))
+        except Exception as exc:
+            logger.warning("实例 %s 自动开机异常: %s", vmindex, exc)
             return False
-        logger.info("实例 %s 已冷启动抖音", vmindex)
-        return True
+        if not ok:
+            logger.warning("实例 %s 自动开机失败", vmindex)
+        return ok

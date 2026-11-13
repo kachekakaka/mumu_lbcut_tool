@@ -19,7 +19,8 @@ from src.worker.events import (
     WorkerStoppedEvent, WorkerFailedEvent, RoomNavigationEvent,
 )
 from src.worker.state_machine import WorkerState, WorkerStateMachine, GenerationActionDispatcher
-from src.worker.navigator import WorkerNavigator
+from src.worker.navigator import WorkerNavigator, DOUYIN_PACKAGE
+from src.worker.adb_client import AdbDeviceClient
 from src.worker.resolver import clean_room_target
 from src.worker.naming_lock import WorkerInstanceLock, LockAcquisitionError
 from src.worker.identity_verifier import IdentityStatus
@@ -106,6 +107,7 @@ class WorkerController:
         self._pipeline = None
         self._watchdog: StallWatchdog | None = None
         self._navigator: WorkerNavigator | None = None
+        self._cleanup_device: AdbDeviceClient | None = None
         self.state_machine = WorkerStateMachine(initial_state=WorkerState.PREFLIGHT)
         self.action_dispatcher = GenerationActionDispatcher()
 
@@ -203,6 +205,7 @@ class WorkerController:
             if not serial:
                 logger.error("建立 ADB 连接失败！")
                 return EXIT_DEVICE_UNAVAILABLE
+            self._cleanup_device = AdbDeviceClient(serial, adb_exe=adb_exe)
 
             # 录播底层调优：拦截 Windows 声卡外放静音 + 禁用后台动态降频 + 灵活窗口模式 (foreground/bottom/offscreen/hidden)
             try:
@@ -312,20 +315,43 @@ class WorkerController:
         return EXIT_NAVIGATION_FAILED
 
     def _cleanup(self, instance_lock):
-        """采集进程完全停止后才归还实例锁；切片终态由采集会话负责。"""
+        """依次停止资源、尝试关闭抖音、归还实例锁；不让关闭错误覆盖采集终态。"""
         if self._resources_stopped:
             return
-        if self._watchdog:
-            self._watchdog.stop()
-        if self.state_machine.state != WorkerState.STOPPED:
-            self.state_machine.transition_to(WorkerState.STOPPING)
+        original_error = sys.exc_info()[1]
+        errors = []
+
+        def cleanup_step(label, action):
+            try:
+                action()
+            except Exception as exc:
+                errors.append(exc)
+                logger.exception("Worker 收尾失败（%s）", label)
+
         try:
-            # 即使启动期间抛错，也不能遗留自己创建的录制进程。
+            if self._watchdog:
+                cleanup_step("停止看门狗", self._watchdog.stop)
+            if self.state_machine.state != WorkerState.STOPPED:
+                cleanup_step("进入停止状态", lambda: self.state_machine.transition_to(WorkerState.STOPPING))
             if self._pipeline:
-                self._pipeline.teardown()
+                cleanup_step("停止采集管线", self._pipeline.teardown)
         finally:
-            self._resources_stopped = True
-            if instance_lock:
-                instance_lock.release()
-            if self.state_machine.state == WorkerState.STOPPING:
-                self.state_machine.transition_to(WorkerState.STOPPED)
+            try:
+                if self._cleanup_device:
+                    try:
+                        self._cleanup_device.force_stop_package(DOUYIN_PACKAGE)
+                    except Exception as exc:
+                        # 关闭抖音失败允许复用实例；保留原任务退出码及完整错误详情。
+                        logger.warning("实例 %s 关闭抖音失败，serial=%s: %s; stdout=%s; stderr=%s",
+                                       self.config.vmindex, self._cleanup_device.current_serial, exc,
+                                       getattr(exc, "stdout", ""), getattr(exc, "stderr", ""))
+            finally:
+                self._resources_stopped = True
+                try:
+                    if instance_lock:
+                        cleanup_step("释放实例锁", instance_lock.release)
+                finally:
+                    if self.state_machine.state == WorkerState.STOPPING:
+                        cleanup_step("结束停止状态", lambda: self.state_machine.transition_to(WorkerState.STOPPED))
+        if errors and original_error is None:
+            raise errors[0]

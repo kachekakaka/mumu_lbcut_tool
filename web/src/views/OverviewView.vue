@@ -5,6 +5,7 @@ import { api } from '../api'
 import type { Alert, Instance, Overview } from '../api/types'
 import { fmtClock, fmtTime, shortId } from '../format'
 import { alertTypeLabel, alertTypeType, instanceReasonLabel, instanceStatusLabel, instanceStatusType, reasonLabel } from '../labels'
+import { disabledInstanceCount, visibleOverviewInstances } from '../instances'
 import { usePageLoader } from '../poller'
 import { PAGE_SIZES, usePager } from '../pager'
 
@@ -24,6 +25,8 @@ usePageLoader(async () => {
 })
 
 const counts = computed(() => overview.value?.instance_counts ?? {})
+const visibleInstances = computed(() => visibleOverviewInstances(instances.value))
+const disabledCount = computed(() => disabledInstanceCount(instances.value))
 
 function objectName(a: Alert): string {
   const name = a.nickname || a.target_raw || (a.target_id ? `主播 ${shortId(a.target_id)}` : '')
@@ -59,6 +62,7 @@ function open(a: Alert) {
       <el-card shadow="never">
         <div class="metric-label">空闲 / 离线实例</div>
         <div class="metric">{{ counts.idle ?? '—' }} / {{ counts.offline ?? '—' }}</div>
+        <div v-if="counts.booting" class="warn-text">开机中 {{ counts.booting }}</div>
         <div v-if="counts.reconcile" class="warn-text">待对账 {{ counts.reconcile }}</div>
       </el-card>
       <el-card shadow="never">
@@ -68,10 +72,16 @@ function open(a: Alert) {
       </el-card>
     </div>
 
-    <h3>实例</h3>
+    <div class="section-head">
+      <h3>实例</h3>
+      <span v-if="disabledCount" class="muted">
+        另有 {{ disabledCount }} 个本机实例未启用 ·
+        <router-link to="/instances">前往实例页设置</router-link>
+      </span>
+    </div>
     <div class="instance-strip">
       <router-link
-        v-for="i in instances"
+        v-for="i in visibleInstances"
         :key="i.vmindex"
         class="instance-card"
         :to="i.job_id ? { path: '/jobs', query: { job: i.job_id } } : '/instances'"
@@ -80,7 +90,12 @@ function open(a: Alert) {
         <el-tag :type="instanceStatusType(i.status)" size="small">{{ instanceStatusLabel(i.status) }}</el-tag>
         <div class="muted">{{ i.nickname || (i.reason ? instanceReasonLabel(i.reason) : '—') }}</div>
       </router-link>
-      <span v-if="!instances.length" class="muted">暂无实例</span>
+      <span v-if="!visibleInstances.length" class="muted">
+        <template v-if="disabledCount">
+          暂无已启用实例 · <router-link to="/instances">去实例页启用</router-link>
+        </template>
+        <template v-else>暂无实例</template>
+      </span>
     </div>
 
     <h3>告警（{{ total }}）</h3>

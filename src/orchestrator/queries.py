@@ -135,9 +135,15 @@ class Queries:
                 condition("(suppressed OR needs_fix_reason IS NOT NULL OR is_retrying)=?", filters["has_notice"])
         elif kind == "instances":
             sql = "SELECT i.*,j.target_id,t.nickname FROM instances i LEFT JOIN jobs j ON j.id=i.job_id LEFT JOIN targets t ON t.id=j.target_id"
-            order, convert = "vmindex", lambda r: dict(fields(r, "vmindex,name,status,job_id,updated_at,target_id,nickname"), reason=reason_object(r["reason"]))
+            def instance_object(r):
+                data = dict(fields(r, "vmindex,name,status,enabled,job_id,updated_at,target_id,nickname"), reason=reason_object(r["reason"]))
+                data["enabled"] = bool(data["enabled"])
+                return data
+            order, convert = "vmindex", instance_object
             if filters.get("status"):
                 condition("i.status=?", filters["status"])
+            if filters.get("enabled") is not None:
+                condition("i.enabled=?", int(filters["enabled"]))
         elif kind == "jobs":
             sql, order, convert = JOB_SQL, "j.created_at DESC,j.id DESC", job_object
             conditions.append("j.status " + ("IN " if filters.get("active", True) else "NOT IN ") + ACTIVE_SQL)
@@ -207,9 +213,10 @@ class Queries:
         now = self.clock()
         midnight = datetime.fromtimestamp(now, timezone(timedelta(hours=8))).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
         with self.store.read_snapshot() as db:
-            instances = {state: 0 for state in ("idle", "busy", "resetting", "offline", "reconcile")}
+            instances = {state: 0 for state in ("idle", "busy", "booting", "offline", "reconcile")}
             jobs = {state: 0 for state in (*ACTIVE, "finished", "finished_with_warnings", "failed", "cancelled")}
-            instances.update({r[0]: r[1] for r in db.execute("SELECT status,count(*) FROM instances GROUP BY status")})
+            instances.update({r[0]: r[1] for r in db.execute(
+                "SELECT status,count(*) FROM instances WHERE enabled=1 OR status='reconcile' GROUP BY status")})
             jobs.update({r[0]: r[1] for r in db.execute("SELECT status,count(*) FROM jobs GROUP BY status")})
             today = db.execute("SELECT count(*) FROM segments WHERE status='finished' AND ended_at>=? AND ended_at<?", (midnight, midnight + 86400)).fetchone()[0]
             # 告警先形成全部匹配项再统一分页，时间只取持久记录。

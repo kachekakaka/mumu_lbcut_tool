@@ -1,15 +1,21 @@
 import { describe, expect, it } from 'vitest'
 import {
-  exitCodeLabel, identityLabel, instanceReasonLabel, instanceStatusLabel, instanceStatusType, jobStatusLabel, qualityFlagLabel,
-  reasonLabel, segmentStatusLabel, stopReasonLabel, trustedStatusLabel,
+  commandKindLabel, errorCodeLabel, exitCodeLabel, identityLabel, instanceReasonLabel, instanceStatusLabel,
+  instanceStatusType, jobStatusLabel, qualityFlagLabel, reasonLabel, segmentStatusLabel, stopReasonLabel,
+  trustedStatusLabel,
 } from '../src/labels'
 const r = (code: string, detail: string | null = null) => ({ code, detail })
 
 describe('中文映射', () => {
   it('已知状态与原因显示中文', () => {
     expect(instanceStatusLabel('idle')).toBe('空闲')
+    expect(instanceStatusLabel('booting')).toBe('开机中')
+    expect(instanceStatusType('booting')).toBe('warning')
     expect(instanceStatusLabel('reconcile')).toBe('待对账')
     expect(instanceReasonLabel(r('android_not_started'))).toBe('安卓系统未启动')
+    expect(instanceReasonLabel(r('booting'))).toBe('正在自动开机')
+    expect(instanceReasonLabel(r('launch_failed'))).toContain('开机失败')
+    expect(instanceReasonLabel(r('boot_interrupted'))).toContain('停服中断')
     expect(instanceReasonLabel(r('not_discovered'))).toBe('未发现该实例')
     expect(jobStatusLabel('finished_with_warnings')).toBe('完成但有警告')
     expect(jobStatusLabel('needs_reconcile')).toBe('待对账')
@@ -57,5 +63,11 @@ describe('中文映射', () => {
     expect(identityLabel('UNCONFIRMED')).toBe('未确认')
     expect(identityLabel('something')).toBe('something')
     expect(identityLabel(null)).toBe('—')
+  })
+
+  it('实例控制命令和错误码映射中文', () => {
+    expect(commandKindLabel('instance')).toBe('实例录播开关')
+    expect(errorCodeLabel('instance_not_found')).toBe('实例不存在')
+    expect(errorCodeLabel('instance_busy')).toContain('占用中')
   })
 })

@@ -281,3 +281,78 @@ def test_recording_time_uses_first_segment_and_event_reason_is_structured(api):
 def test_reason_projection_preserves_details(raw, expected):
     from src.orchestrator.reasons import reason_object
     assert reason_object(raw) == expected
+
+
+def test_optional_instances_cli_and_overview_counts_only_enabled(api, tmp_path):
+    from src.orchestrator.server import ServerConfig
+    parsed = cli.build_parser().parse_args(['run', '--output-dir', str(tmp_path / 'out')])
+    assert parsed.instances is None
+    assert ServerConfig(tmp_path / 'data', tmp_path / 'out').instances is None
+
+    client, store, runtime, config = api
+    with store.transaction() as db:
+        db.execute("INSERT INTO instances(vmindex,name,status,enabled,updated_at) VALUES(2,'VM2','idle',0,1)")
+        db.execute("INSERT INTO instances(vmindex,name,status,enabled,updated_at) VALUES(3,'VM3','idle',1,1)")
+        db.execute("INSERT INTO instances(vmindex,name,status,enabled,updated_at) VALUES(4,'VM4','reconcile',0,1)")
+    counts = client.get('/api/overview').json()['instance_counts']
+    assert counts['idle'] == 1 and counts['reconcile'] == 1
+
+
+def test_instance_enable_filter_and_patch_contract(api):
+    client, store, runtime, config = api
+    with store.transaction() as db:
+        db.execute("INSERT INTO instances(vmindex,name,status,enabled,updated_at) VALUES(2,'VM2','idle',0,1)")
+        db.execute("INSERT INTO instances(vmindex,name,status,enabled,reason,updated_at) VALUES(3,'VM3','offline',1,'not_discovered',1)")
+
+    assert client.get('/api/instances?enabled=bad').status_code == 422
+    assert [i['vmindex'] for i in client.get('/api/instances?enabled=false').json()['items']] == [2]
+    assert [i['vmindex'] for i in client.get('/api/instances?enabled=true').json()['items']] == [3]
+
+    assert submit(client, 'PATCH', 'instances/999', {'enabled': True}).status_code == 404
+    assert submit(client, 'PATCH', 'instances/-1', {'enabled': True}).status_code == 422
+    assert submit(client, 'PATCH', 'instances/2', {'enabled': 'true'}).status_code == 422
+
+    rid = str(uuid.uuid4())
+    resp = submit(client, 'PATCH', 'instances/2', {'enabled': True}, rid)
+    assert resp.status_code == 202
+    key = resp.json()['command_id']
+    apply(store, key)
+    assert submit(client, 'PATCH', 'instances/2', {'enabled': True}, rid).status_code == 200
+    assert submit(client, 'PATCH', 'instances/2', {'enabled': False}, rid).status_code == 409
+    assert client.get('/api/instances?enabled=true').json()['total'] == 2
+
+    # 占用、开机、待对账时禁止停用
+    target, job = seed(store)
+    with store.transaction() as db:
+        db.execute("UPDATE instances SET status='busy',job_id=? WHERE vmindex=2", (job,))
+    r_busy = submit(client, 'PATCH', 'instances/2', {'enabled': False})
+    assert r_busy.status_code == 409 and r_busy.json()['code'] == 'instance_busy'
+
+    assert client.get('/api/instances?status=resetting').status_code == 422
+    assert 'resetting' not in client.get('/api/overview').json()['instance_counts']
+
+    with store.transaction() as db:
+        db.execute("UPDATE instances SET status='booting',job_id=NULL,reason='booting',boot_attempts=2,boot_retry_at=999 WHERE vmindex=2")
+    r_boot = submit(client, 'PATCH', 'instances/2', {'enabled': False})
+    assert r_boot.status_code == 409 and r_boot.json()['code'] == 'instance_busy'
+    assert [i['vmindex'] for i in client.get('/api/instances?status=booting').json()['items']] == [2]
+    assert client.get('/api/overview').json()['instance_counts']['booting'] == 1
+
+    # 离线且带冷却记录的实例在启用时应清零开机冷却
+    with store.transaction() as db:
+        db.execute("UPDATE instances SET status='offline',enabled=0,reason='launch_failed',boot_attempts=3,boot_retry_at=999 WHERE vmindex=2")
+    re_enable = submit(client, 'PATCH', 'instances/2', {'enabled': True}).json()['command_id']
+    apply(store, re_enable)
+    row2 = store.row('SELECT * FROM instances WHERE vmindex=2')
+    assert (row2['enabled'], row2['boot_attempts'], row2['boot_retry_at'], row2['reason']) == (1, 0, 0, 'android_not_started')
+
+    with store.transaction() as db:
+        db.execute("UPDATE jobs SET status='needs_reconcile',vmindex=2 WHERE id=?", (job,))
+        db.execute("UPDATE instances SET status='reconcile',job_id=? WHERE vmindex=2", (job,))
+    r_rec = submit(client, 'PATCH', 'instances/2', {'enabled': False})
+    assert r_rec.status_code == 409 and r_rec.json()['code'] == 'reconcile_required'
+
+    # 停用已失联旧实例会直接清理该未发现旧记录
+    clean_key = submit(client, 'PATCH', 'instances/3', {'enabled': False}).json()['command_id']
+    apply(store, clean_key)
+    assert [i['vmindex'] for i in client.get('/api/instances').json()['items']] == [2]

@@ -87,13 +87,8 @@ def system(tmp_path):
     mumu = SimpleNamespace(list_available_instances=lambda: [
         dict(vmindex=i, name=f'VM{i}', android_started=started) for i, started in sorted(vms.items())])
     pool = InstancePool(mumu)
-    resets = []
     env = SimpleNamespace(clock=clock, network=network, store=store, children=[], tmp=tmp_path, pool=pool,
-                          vms=vms, resets=resets, reset_ok=True, child_options={})
-    def reset_app(vmindex):
-        resets.append(vmindex)
-        return env.reset_ok
-    pool.reset_app = reset_app
+                          vms=vms, child_options={})
     def factory(**kw):
         c = Child(**kw, **env.child_options)
         env.children.append(c)
@@ -412,22 +407,22 @@ def test_invalid_target_needs_fix_until_record(system):
     assert row(e, 'SELECT note FROM targets WHERE id=?', target)['note'] == 'needs_fix: target_invalid'
 
 
-@pytest.mark.parametrize('reset_ok', [True, False])
-def test_login_blocked_resets_instance_then_retries(system, reset_ok):
+def test_login_blocked_releases_instance_and_retries_after_backoff(system):
     e = system
-    e.reset_ok = reset_ok
     e.child_options = dict(record=False)
     target, job = start_one(e)
     vm = job['vmindex']
     e.children[0].exit(15, 'login_blocked')
-    pump(e, lambda: e.resets == [vm] and row(e, 'SELECT status FROM instances WHERE vmindex=?', vm)['status'] != 'resetting')
+    pump(e, lambda: job_status(e, job['id']) == 'failed')
     slot = row(e, 'SELECT * FROM instances WHERE vmindex=?', vm)
-    assert (slot['status'], slot['reason']) == (('idle', None) if reset_ok else ('offline', 'reset_failed'))
+    assert (slot['status'], slot['reason'], slot['job_id']) == ('idle', 'login_blocked', None)
+    e.scheduler.tick()
+    assert len(e.children) == 1
     assert row(e, 'SELECT suppressed_session FROM targets WHERE id=?', target)['suppressed_session'] is None
     e.clock.advance(5)
     observe(e, {'A': RoomStatus.LIVE})
     pump(e, lambda: len(e.children) == 2)
-    assert e.children[1].spec.vmindex == (vm if reset_ok else 3 - vm)
+    assert e.children[1].spec.vmindex == vm
 
 
 def test_device_offline_moves_job_to_other_instance(system):
@@ -607,3 +602,376 @@ def test_quality_warnings_for_one_segment_are_all_kept(tmp_path):
                                'segment_index': 3, 'flag': 'low_frame_rate'}, 2.0)
     risks = json.loads(store.row("SELECT risk_json FROM segments WHERE job_id='job' AND segment_index=3")['risk_json'])
     assert [r['flag'] for r in risks] == ['overlay_live_panel_window', 'low_frame_rate', 'visual_check_unavailable']
+
+
+def test_dynamic_instance_discovery_defaults_disabled_and_cleans_removed_ghost(tmp_path):
+    clock, network = Clock(), Network()
+    store = Store(tmp_path / 'state' / 'orchestrator.sqlite3')
+    vms = {2: True, 3: False}
+    mumu = SimpleNamespace(list_available_instances=lambda: [
+        dict(vmindex=i, name=f'VM{i}', android_started=started) for i, started in sorted(vms.items())])
+    pool = InstancePool(mumu)
+    children = []
+    scheduler = Scheduler(
+        store, tmp_path / 'recordings', None, pool=pool,
+        query_executor=ImmediateQueries(network),
+        handle_factory=lambda **kw: children.append(Child(**kw)) or children[-1],
+        clock=clock, ended_interval_sec=1, auto_scan=True, process_probe=lambda job: 'absent',
+    )
+    try:
+        rows = {r['vmindex']: r for r in store.rows('SELECT * FROM instances ORDER BY vmindex')}
+        assert set(rows) == {2, 3}
+        assert (rows[2]['status'], rows[2]['enabled']) == ('idle', 0)
+        assert (rows[3]['status'], rows[3]['reason'], rows[3]['enabled']) == ('offline', 'android_not_started', 0)
+
+        # 未启用任何实例时不派发录制任务
+        target = store.add_target('A', now=clock())
+        network.rooms['A'] = ResolvedRoom('A', RoomStatus.LIVE, room_id='room-A')
+        observe_room(store, target, network.rooms['A'], clock())
+        scheduler.tick()
+        assert not children
+
+        # 未启用实例在宿主机消失后应随刷新自动删除
+        vms.pop(3)
+        clock.advance(31)
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and any(r['vmindex'] == 3 for r in store.rows('SELECT vmindex FROM instances')):
+            scheduler.tick()
+            time.sleep(.005)
+        assert [r['vmindex'] for r in store.rows('SELECT vmindex FROM instances')] == [2]
+
+        # 手动启用 2 后重开无预设调度器仍保留启用状态，且开始派发
+        scheduler.close()
+        with store.transaction() as db:
+            db.execute("UPDATE instances SET enabled=1 WHERE vmindex=2")
+        scheduler = Scheduler(
+            store, tmp_path / 'recordings', None, pool=pool,
+            query_executor=ImmediateQueries(network),
+            handle_factory=lambda **kw: children.append(Child(**kw)) or children[-1],
+            clock=clock, ended_interval_sec=1, auto_scan=False, process_probe=lambda job: 'absent',
+        )
+        assert store.row('SELECT enabled FROM instances WHERE vmindex=2')['enabled'] == 1
+        observe_room(store, target, network.rooms['A'], clock())
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and not children:
+            scheduler.tick()
+            time.sleep(.005)
+        assert len(children) == 1 and children[0].spec.vmindex == 2
+    finally:
+        scheduler.close()
+        store.close()
+
+
+def make_boot_env(tmp_path, vms, preset=(1, 2), auto_scan=False):
+    import threading
+    clock, network = Clock(), Network()
+    store = Store(tmp_path / 'state' / 'orchestrator.sqlite3')
+    shutdowns = []
+    boot_calls = []
+    boot_gate = {}
+    boot_results = {}
+    mumu = SimpleNamespace(
+        list_available_instances=lambda: [
+            dict(vmindex=i, name=f'VM{i}', android_started=started) for i, started in sorted(vms.items())
+        ],
+        shutdown_player=lambda vmindex: shutdowns.append(vmindex) or True,
+    )
+    pool = InstancePool(mumu)
+
+    def boot_instance(vmindex, stop_event=None):
+        boot_calls.append(vmindex)
+        gate = boot_gate.get(vmindex)
+        if gate is not None:
+            gate.wait(timeout=2)
+        ok = boot_results.get(vmindex, True)
+        if ok:
+            vms[vmindex] = True
+        return ok
+
+    pool.boot_instance = boot_instance
+    children = []
+    env = SimpleNamespace(
+        clock=clock, network=network, store=store, pool=pool, vms=vms,
+        children=children, shutdowns=shutdowns, boot_calls=boot_calls,
+        boot_gate=boot_gate, boot_results=boot_results, threading=threading,
+    )
+    env.scheduler = Scheduler(
+        store, tmp_path / 'recordings', list(preset) if preset is not None else None,
+        pool=pool, query_executor=ImmediateQueries(network),
+        handle_factory=lambda **kw: children.append(Child(**kw)) or children[-1],
+        clock=clock, ended_interval_sec=1, auto_scan=auto_scan, process_probe=lambda job: 'absent',
+    )
+    return env
+
+
+def test_on_demand_boot_starts_offline_enabled_and_keeps_idle_after_finish(tmp_path):
+    e = make_boot_env(tmp_path, {1: False, 2: False}, preset=[1, 2])
+    try:
+        # 无排队任务时不触发自动开机
+        e.scheduler.tick()
+        assert e.boot_calls == []
+        assert row(e, 'SELECT status FROM instances WHERE vmindex=1')['status'] == 'offline'
+
+        # 门控 1 号开机过程，验证开机期间状态、refresh 保护与任务保留 pending
+        gate1 = e.threading.Event()
+        e.boot_gate[1] = gate1
+        target_a = e.store.add_target('A', now=e.clock())
+        observe(e, {'A': RoomStatus.LIVE})
+        pump(e, lambda: row(e, 'SELECT status FROM instances WHERE vmindex=1')['status'] == 'booting')
+        assert e.boot_calls == [1]
+        assert row(e, 'SELECT status FROM instances WHERE vmindex=2')['status'] == 'offline'
+        assert row(e, 'SELECT attempts FROM targets WHERE id=?', target_a)['attempts'] == 0
+        assert row(e, 'SELECT status FROM jobs WHERE target_id=?', target_a)['status'] == 'pending'
+
+        # 即使运行期定期刷新仍看到旧状态，也不应覆盖 booting
+        e.store.sync_instances(e.pool.refresh(), e.clock())
+        assert row(e, 'SELECT status FROM instances WHERE vmindex=1')['status'] == 'booting'
+
+        # 开机完成后立即接单录制
+        gate1.set()
+        pump(e, lambda: len(e.children) == 1 and row(e, 'SELECT status FROM jobs WHERE target_id=?', target_a)['status'] == 'running')
+        assert e.children[0].spec.vmindex == 1
+
+        # 下播后不自动关机，实例留在 idle 且下一场直接复用 1 号，不额外开机 2 号
+        observe(e, {'A': RoomStatus.ENDED})
+        observe(e, {'A': RoomStatus.ENDED})
+        pump(e, lambda: row(e, 'SELECT status FROM instances WHERE vmindex=1')['status'] == 'idle')
+        assert e.shutdowns == []
+
+        target_b = e.store.add_target('B', now=e.clock())
+        observe(e, {'B': RoomStatus.LIVE})
+        pump(e, lambda: len(e.children) == 2)
+        assert e.children[1].spec.vmindex == 1
+        assert e.boot_calls == [1]
+    finally:
+        for ev in e.boot_gate.values():
+            ev.set()
+        e.scheduler.close()
+        e.store.close()
+
+
+def test_boot_serial_cap_skips_disabled_and_not_discovered(tmp_path):
+    e = make_boot_env(tmp_path, {1: False, 2: False, 3: False}, preset=[1, 2])
+    try:
+        # 增加一条已启用但宿主机已不存在的旧记录，绝不能被拉起
+        with e.store.transaction() as db:
+            db.execute("INSERT INTO instances(vmindex,name,status,enabled,reason,updated_at) VALUES(9,'VM9','offline',1,'not_discovered',1)")
+        gate1 = e.threading.Event()
+        gate2 = e.threading.Event()
+        e.boot_gate[1] = gate1
+        e.boot_gate[2] = gate2
+
+        for raw in ('A', 'B', 'C'):
+            e.store.add_target(raw, now=e.clock())
+        observe(e, {'A': RoomStatus.LIVE, 'B': RoomStatus.LIVE, 'C': RoomStatus.LIVE})
+
+        # 多任务同时排队时严格串行，一次只允许 1 台处于 booting
+        pump(e, lambda: row(e, 'SELECT status FROM instances WHERE vmindex=1')['status'] == 'booting')
+        for _ in range(5):
+            e.scheduler.tick()
+        assert len([r for r in e.store.rows('SELECT * FROM instances') if r['status'] == 'booting']) == 1
+        assert e.boot_calls == [1]
+
+        # 1 号就绪派走 A 后，才继续拉起 2 号
+        gate1.set()
+        pump(e, lambda: len(e.children) == 1 and row(e, 'SELECT status FROM instances WHERE vmindex=2')['status'] == 'booting')
+        assert e.boot_calls == [1, 2]
+
+        gate2.set()
+        pump(e, lambda: len(e.children) == 2)
+        # 3 号未启用、9 号 not_discovered，两者都不得开机
+        assert e.boot_calls == [1, 2]
+        assert row(e, 'SELECT status FROM instances WHERE vmindex=3')['status'] == 'offline'
+        assert row(e, 'SELECT status FROM instances WHERE vmindex=9')['status'] == 'offline'
+    finally:
+        for ev in e.boot_gate.values():
+            ev.set()
+        e.scheduler.close()
+        e.store.close()
+
+
+def test_boot_failure_backoff_rotates_healthy_instance_and_clears_on_manual_boot(tmp_path):
+    e = make_boot_env(tmp_path, {1: False, 2: False}, preset=[1, 2])
+    try:
+        e.boot_results[1] = False
+        e.boot_results[2] = True
+        target_a = e.store.add_target('A', now=e.clock())
+        observe(e, {'A': RoomStatus.LIVE})
+
+        # 1 号开机失败 -> 进冷却 30s、任务不扣 attempts，下一轮立即轮转 2 号开机成功
+        pump(e, lambda: len(e.children) == 1)
+        assert e.children[0].spec.vmindex == 2
+        assert e.boot_calls == [1, 2]
+        vm1 = row(e, 'SELECT * FROM instances WHERE vmindex=1')
+        assert (vm1['status'], vm1['reason'], vm1['boot_attempts']) == ('offline', 'launch_failed', 1)
+        assert vm1['boot_retry_at'] == pytest.approx(e.clock() + 30)
+        assert row(e, 'SELECT attempts FROM targets WHERE id=?', target_a)['attempts'] == 0
+
+        # 冷却期内定期刷新应保留 launch_failed 原因码，且不重试 1 号
+        e.store.sync_instances(e.pool.refresh(), e.clock())
+        assert row(e, 'SELECT reason FROM instances WHERE vmindex=1')['reason'] == 'launch_failed'
+        target_b = e.store.add_target('B', now=e.clock())
+        observe(e, {'B': RoomStatus.LIVE})
+        e.scheduler.tick()
+        assert e.boot_calls == [1, 2]
+        e.clock.advance(31)
+        pump(e, lambda: e.boot_calls == [1, 2, 1] and row(e, 'SELECT boot_attempts FROM instances WHERE vmindex=1')['boot_attempts'] == 2)
+        vm1 = row(e, 'SELECT * FROM instances WHERE vmindex=1')
+        assert vm1['boot_retry_at'] == pytest.approx(e.clock() + 60)
+
+        # 手动在 MuMu 开启 1 号后，刷新探测到在线即清零冷却并直接派单
+        e.vms[1] = True
+        e.store.sync_instances(e.pool.refresh(), e.clock())
+        vm1 = row(e, 'SELECT * FROM instances WHERE vmindex=1')
+        assert (vm1['status'], vm1['boot_attempts'], vm1['boot_retry_at']) == ('idle', 0, 0)
+        pump(e, lambda: len(e.children) == 2)
+        assert e.children[1].spec.vmindex == 1
+    finally:
+        e.scheduler.close()
+        e.store.close()
+
+
+def test_booting_survives_pending_cancel_and_recovers_stale_booting_on_restart(tmp_path):
+    e = make_boot_env(tmp_path, {1: False}, preset=[1])
+    try:
+        gate1 = e.threading.Event()
+        e.boot_gate[1] = gate1
+        target_a = e.store.add_target('A', now=e.clock())
+        observe(e, {'A': RoomStatus.LIVE})
+        pump(e, lambda: row(e, 'SELECT status FROM instances WHERE vmindex=1')['status'] == 'booting')
+
+        # 开机途中任务被手动取消，已启动的开机流程继续完成到 idle 且不关机
+        job_id = row(e, 'SELECT id FROM jobs WHERE target_id=?', target_a)['id']
+        e.store.enqueue_command('stop', job_id)
+        pump(e, lambda: row(e, 'SELECT status FROM jobs WHERE id=?', job_id)['status'] == 'cancelled')
+        gate1.set()
+        pump(e, lambda: row(e, 'SELECT status FROM instances WHERE vmindex=1')['status'] == 'idle')
+        assert e.shutdowns == [] and e.children == []
+
+        # 模拟服务异常关闭遗留 booting 状态，新调度器初始化时应自动纠偏回真实探测状态
+        e.scheduler.close()
+        e.vms[1] = False
+        with e.store.transaction() as db:
+            db.execute("UPDATE instances SET status='booting',reason='booting' WHERE vmindex=1")
+        e.scheduler = Scheduler(
+            e.store, tmp_path / 'recordings', [1], pool=e.pool,
+            query_executor=ImmediateQueries(e.network),
+            handle_factory=lambda **kw: e.children.append(Child(**kw)) or e.children[-1],
+            clock=e.clock, ended_interval_sec=1, auto_scan=False, process_probe=lambda job: 'absent',
+        )
+        vm1 = row(e, 'SELECT * FROM instances WHERE vmindex=1')
+        assert (vm1['status'], vm1['reason']) == ('offline', 'android_not_started')
+    finally:
+        for ev in e.boot_gate.values():
+            ev.set()
+        e.scheduler.close()
+        e.store.close()
+
+
+def test_exit_20_refreshes_and_reboots_crashed_enabled_instance(tmp_path):
+    e = make_boot_env(tmp_path, {1: True}, preset=[1])
+    try:
+        target_a = e.store.add_target('A', now=e.clock())
+        observe(e, {'A': RoomStatus.LIVE})
+        pump(e, lambda: len(e.children) == 1)
+
+        # 模拟模拟器崩溃导致 Worker 以退出码 20 结束，宿主机实例掉线
+        e.vms[1] = False
+        e.children[0].exit(20, 'device_unavailable')
+        pump(e, lambda: row(e, 'SELECT status FROM jobs WHERE target_id=?', target_a)['status'] == 'failed')
+
+        # 调度器应主动刷新查清为 android_not_started，并在重试时间到来后自动拉起续录
+        pump(e, lambda: row(e, 'SELECT reason FROM instances WHERE vmindex=1')['reason'] == 'android_not_started')
+        e.clock.advance(10)
+        observe(e, {'A': RoomStatus.LIVE})
+        pump(e, lambda: len(e.children) == 2 and e.boot_calls == [1])
+    finally:
+        e.scheduler.close()
+        e.store.close()
+
+
+def test_restart_with_same_preset_keeps_boot_backoff(tmp_path):
+    e = make_boot_env(tmp_path, {1: False}, preset=[1])
+    try:
+        e.boot_results[1] = False
+        e.store.add_target('A', now=e.clock())
+        observe(e, {'A': RoomStatus.LIVE})
+        pump(e, lambda: row(e, 'SELECT boot_attempts FROM instances WHERE vmindex=1')['boot_attempts'] == 1)
+        before = row(e, 'SELECT boot_attempts,boot_retry_at FROM instances WHERE vmindex=1')
+        e.scheduler.close()
+        e.scheduler = Scheduler(e.store, tmp_path / 'recordings', [1], pool=e.pool,
+                                query_executor=ImmediateQueries(e.network), clock=e.clock, auto_scan=False)
+        assert row(e, 'SELECT boot_attempts,boot_retry_at FROM instances WHERE vmindex=1') == before
+        e.scheduler.tick()
+        assert e.boot_calls == [1]
+        e.clock.advance(31)
+        pump(e, lambda: row(e, 'SELECT boot_attempts FROM instances WHERE vmindex=1')['boot_attempts'] == 2)
+        assert e.boot_calls == [1, 1]
+    finally:
+        e.scheduler.close()
+        e.store.close()
+
+
+def test_failed_instance_snapshot_keeps_enabled_and_disabled_rows(system, monkeypatch, caplog):
+    from src.mvp.mumu_client import MuMuClient
+    e = system
+    with e.store.transaction() as db:
+        db.execute('UPDATE instances SET enabled=0 WHERE vmindex=2')
+    before = e.store.rows('SELECT * FROM instances ORDER BY vmindex')
+    mumu = MuMuClient.__new__(MuMuClient)
+    monkeypatch.setattr(mumu, '_run_manager', lambda *args, **kwargs: 'mainnx connect failed')
+    e.pool._mumu = mumu
+    e.scheduler._force_refresh = True
+    e.scheduler.tick()
+    pump(e, lambda: e.scheduler._refresh_future is None)
+    assert e.store.rows('SELECT * FROM instances ORDER BY vmindex') == before
+    assert '实例查询失败，保留原状态' in caplog.text
+
+
+def test_close_waits_for_boot_before_releasing_host_lease(tmp_path):
+    from src.orchestrator.scheduler import HostLease
+    e = make_boot_env(tmp_path, {1: False}, preset=[1])
+    entered, cancelled, finish, closed = [e.threading.Event() for _ in range(4)]
+    errors = []
+    def boot(vmindex, stop_event):
+        entered.set()
+        if stop_event.wait(3):
+            cancelled.set()
+        finish.wait(3)  # 模拟正在执行的单次有界外部命令退出。
+        return False
+    e.pool.boot_instance = boot
+    def close():
+        try:
+            e.scheduler.close()
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            closed.set()
+    closer = e.threading.Thread(target=close)
+    try:
+        e.store.add_target('A', now=e.clock())
+        observe(e, {'A': RoomStatus.LIVE})
+        e.scheduler.tick()
+        assert entered.wait(1)
+        closer.start()
+        assert cancelled.wait(1)
+        assert not closed.is_set()
+        with pytest.raises(RuntimeError, match='已经有调度器'):
+            HostLease(e.store.path.with_suffix('.host.lock'))
+        finish.set()
+        assert closed.wait(2)
+        assert not errors
+        assert not e.scheduler._boots
+        vm = row(e, 'SELECT status,reason,boot_attempts FROM instances WHERE vmindex=1')
+        assert vm == dict(status='offline', reason='boot_interrupted', boot_attempts=0)
+        lease = HostLease(e.store.path.with_suffix('.host.lock'))
+        lease.close()
+        e.scheduler = Scheduler(e.store, tmp_path / 'recordings', [1], pool=e.pool,
+                                query_executor=ImmediateQueries(e.network), clock=e.clock, auto_scan=False)
+        assert row(e, 'SELECT reason FROM instances WHERE vmindex=1')['reason'] == 'android_not_started'
+    finally:
+        finish.set()
+        if closer.ident is not None:
+            closer.join(4)
+        e.scheduler.close()
+        e.store.close()

@@ -38,6 +38,17 @@ describe('接口客户端', () => {
     expect(url).toBe('/api/targets/t%2F1/stop')
     expect((init.headers as Record<string, string>)['Idempotency-Key']).toBe('req-1')
     expect(init.body).toBe(JSON.stringify({ session_key: 'session-1' }))
+
+    await api.setInstanceEnabled(2, true, 'req-2')
+    const [iUrl, iInit] = fetchMock.mock.calls[1] as unknown as [string, RequestInit]
+    expect(iUrl).toBe('/api/instances/2')
+    expect(iInit.method).toBe('PATCH')
+    expect((iInit.headers as Record<string, string>)['Idempotency-Key']).toBe('req-2')
+    expect(iInit.body).toBe(JSON.stringify({ enabled: true }))
+
+    await api.instances({ status: 'booting', enabled: true })
+    const [qUrl] = fetchMock.mock.calls[2] as unknown as [string, RequestInit]
+    expect(qUrl).toBe('/api/instances?status=booting&enabled=true')
   })
 
   it('非安全上下文没有 randomUUID 时仍生成 UUID v4', () => {

@@ -77,6 +77,15 @@ def build_worker(monkeypatch, tmp_path, valid_media, *, total=4, segment=2,
     clock = FakeClock()
     pipelines = []
     launched = []
+    adb_calls = []
+    adb_exe = tmp_path / 'synthetic-adb.exe'
+    adb_exe.write_bytes(b'synthetic-command-boundary')
+    def adb_command(cmd, **kwargs):
+        from src.worker.executor import CommandResult
+        adb_calls.append(dict(cmd=cmd, options=kwargs, pipelines_stopped=all(p.stopped for p in pipelines),
+                              events=[json.loads(line) for line in stream.getvalue().splitlines()]))
+        return CommandResult(exit_code=0, stdout='', stderr='', duration=0)
+    monkeypatch.setattr('src.worker.adb_client.run_command', adb_command)
 
     class CapturePipe:
         """每 segment 秒产生一个分段文件；停止或退出后全部分段视为封口。"""
@@ -178,7 +187,7 @@ def build_worker(monkeypatch, tmp_path, valid_media, *, total=4, segment=2,
     monkeypatch.setattr(cm, "WorkerNavigator", Navigator)
     media_tools = cm.DependencyManager().get_media_tools()
     monkeypatch.setattr(cm, "DependencyManager", lambda: SimpleNamespace(
-        ensure_scrcpy=lambda: Path("scrcpy.exe"), get_adb_path=lambda: Path("adb.exe"),
+        ensure_scrcpy=lambda: Path("scrcpy.exe"), get_adb_path=lambda: adb_exe,
         get_media_tools=lambda: media_tools))
     monkeypatch.setattr(cm, "MuMuClient", lambda **kw: SimpleNamespace(
         launch_player=lambda index: True, connect_adb=lambda index: "synthetic-device",
@@ -204,7 +213,8 @@ def build_worker(monkeypatch, tmp_path, valid_media, *, total=4, segment=2,
         segment_duration_sec=segment, heartbeat_interval_sec=1)
     controller = WorkerController(config, WorkerEventEmitter(stream))
     return SimpleNamespace(controller=controller, clock=clock, stream=stream, launched=launched,
-        pipelines=pipelines, events=lambda: [json.loads(line) for line in stream.getvalue().splitlines()])
+        pipelines=pipelines, adb_calls=adb_calls, adb_exe=adb_exe,
+        events=lambda: [json.loads(line) for line in stream.getvalue().splitlines()])
 
 
 def assert_paired(events):

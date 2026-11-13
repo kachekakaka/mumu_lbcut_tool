@@ -207,6 +207,9 @@ function describeSuccess(kind: string, result: Record<string, any> | null): Desc
       return { level: 'success', text: '已停止监控', notes: ['正在录制的任务会平滑停止，录像保留'] }
     case 'update':
       return { level: 'success', text: result?.auto_record ? '自动录制已开启' : '自动录制已关闭', notes }
+    case 'instance':
+      if (result?.cleaned) return { level: 'success', text: '已停用并清理失联实例记录', notes }
+      return { level: 'success', text: result?.enabled ? '已启用实例参与录播' : '已停用实例', notes }
     default:
       return { level: 'success', text: `${commandKindLabel(kind)}已执行`, notes }
   }

@@ -44,7 +44,7 @@ def build_parser():
     run.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     run.add_argument("--host", default="127.0.0.1")
     run.add_argument("--port", type=int, default=8000)
-    run.add_argument("--instances", required=True, help="明确允许使用的实例，例如 2,3")
+    run.add_argument("--instances", default=None, help="可选初始启用的实例，例如 2,3；不传则保留数据库配置")
     run.add_argument("--output-dir", type=Path, required=True)
     run.add_argument("--navigation-timeout", type=float, default=300.0,
                      help="传给Worker的定位总时限（60～900秒），默认300秒")
@@ -63,7 +63,8 @@ def main(argv=None) -> int:
     try:
         if args.command == "run":
             from src.orchestrator.server import ServerConfig, run_server
-            config = ServerConfig(args.data_dir.resolve(), args.output_dir.resolve(), [int(v) for v in args.instances.split(",")],
+            instances = ([int(v) for v in args.instances.split(",")] if args.instances.strip() else []) if args.instances is not None else None
+            config = ServerConfig(args.data_dir.resolve(), args.output_dir.resolve(), instances,
                 host=args.host, port=args.port, scan_interval=args.scan_interval, segment_duration=args.segment_duration,
                 navigation_timeout=args.navigation_timeout, max_runtime=args.max_runtime)
             return run_server(config)
