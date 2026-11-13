@@ -65,7 +65,9 @@ describe('SegmentTable 桌面定位交互', () => {
 
     const wrapper = await renderTable([sampleSegment()])
     const buttons = wrapper.findAll('button')
+    const copyBtn = buttons.find((b) => b.text().includes('复制'))
     const openBtn = buttons.find((b) => b.text().includes('打开目录'))
+    expect(copyBtn).toBeDefined()
     expect(openBtn).toBeDefined()
 
     await openBtn!.trigger('click')
