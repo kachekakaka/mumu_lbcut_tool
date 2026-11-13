@@ -214,6 +214,7 @@ class ContinuousPipeline:
             env=dict(os.environ,ADB=str(self.adb_exe))
             env['PATH']=str(self.adb_exe.parent)+os.pathsep+env.get('PATH','')
             self.command=cmd
+            self.capture_launch_at=time.time()
             if self.producer_factory:
                 self._proc=self.producer_factory(self.bridge.name,self.directory)
             else:
@@ -230,6 +231,7 @@ class ContinuousPipeline:
                     raise RuntimeError('连续采集启动失败: '+self.failure_details())
                 fragments=self.fragments()
                 if any(f.path.exists() and f.path.stat().st_size>1024 for f in fragments):
+                    self.first_media_observed_at=time.time()
                     return
                 time.sleep(.05)
             raise TimeoutError('持续采集未在预算内产生可见媒体进度')

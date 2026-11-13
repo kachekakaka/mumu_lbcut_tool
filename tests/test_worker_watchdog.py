@@ -148,3 +148,21 @@ def test_new_watchdog_restarts_freeze_timing_from_its_creation():
     pipe.get_current_file_size_mb.return_value = 11
     dog.check_once(21.)
     assert dog.snapshot().video_frozen_sec == 1
+
+
+def test_first_thread_sample_precedes_interval_wait():
+    import threading
+    dog,pipe,nav,actions=build_dog()
+    dog.check_interval_sec=60
+    sampled=threading.Event()
+    check=dog.check_once
+    def sample():
+        check()
+        sampled.set()
+    dog.check_once=sample
+    dog.start()
+    try:
+        assert sampled.wait(1), '首轮采样不能等待常规轮询间隔'
+    finally:
+        dog.stop()
+    nav.get_current_focus_activity.assert_called_once()

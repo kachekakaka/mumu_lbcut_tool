@@ -96,6 +96,8 @@ def build_worker(monkeypatch, tmp_path, valid_media, *, total=4, segment=2,
             self.ended_at = None
             self.stopped = False
             self.epoch = len(pipelines) + 1
+            self.directory=self.output_dir / f'capture_{self.epoch}'
+            self.directory.mkdir()
             self.start_count = self.stop_count = 0
             self.rows = {}
             self.alive = False
@@ -108,6 +110,13 @@ def build_worker(monkeypatch, tmp_path, valid_media, *, total=4, segment=2,
             self.start_count += 1
             self.alive = True
             self.begin = clock.monotonic()
+            self.capture_launch_at=clock.time()
+            try:
+                if self.wait_hook and not self.wait_hook():raise InterruptedError('启动取消')
+            except BaseException:
+                self.stop()
+                raise
+            self.first_media_observed_at=clock.time()
         def span(self):
             end = self.ended_at if self.ended_at is not None else clock.monotonic()
             return min(end - self.begin, self.limit) if self.limit else end - self.begin
@@ -135,7 +144,7 @@ def build_worker(monkeypatch, tmp_path, valid_media, *, total=4, segment=2,
                 for off in range(n):
                     idx = self.base + off
                     if idx not in self.rows:
-                        path = self.output_dir / f'raw_cont_{idx}.mp4'
+                        path = self.directory / f'raw_cont_{idx}.mp4'
                         if idx in broken_segments:
                             path.write_bytes(b'bad media')
                         else:
@@ -214,6 +223,7 @@ def build_worker(monkeypatch, tmp_path, valid_media, *, total=4, segment=2,
     controller = WorkerController(config, WorkerEventEmitter(stream))
     return SimpleNamespace(controller=controller, clock=clock, stream=stream, launched=launched,
         pipelines=pipelines, adb_calls=adb_calls, adb_exe=adb_exe,
+        pipeline_type=CapturePipe, navigator_type=Navigator,
         events=lambda: [json.loads(line) for line in stream.getvalue().splitlines()])
 
 

@@ -30,6 +30,7 @@ describe('中文映射', () => {
     expect(reasonLabel(r('old_worker_did_not_exit'))).toBe('旧 Worker 未退出')
     expect(reasonLabel(r('capture_restart_failed', 'adb timeout'))).toBe('采集重启失败：adb timeout')
     expect(reasonLabel(r('worker_exception', 'boom: detail'))).toBe('Worker 异常：boom: detail')
+    expect(reasonLabel(r('startup_gate_exhausted', 'login_prompt_detected'))).toBe('开录准备复核次数用尽：login_prompt_detected')
   })
 
   it('未知值原样显示，空值显示破折号', () => {

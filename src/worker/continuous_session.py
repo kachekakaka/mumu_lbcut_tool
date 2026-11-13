@@ -32,6 +32,27 @@ class CaptureSessionEvent(BaseWorkerEvent):
     muxer_pid: int=0
     generation_id: int=0
     reason: str=''
+    capture_launch_at: float=0.0
+    first_media_observed_at: float=0.0
+    surface_verified_at: float=0.0
+
+
+@dataclass
+class CaptureStartupEvent(BaseWorkerEvent):
+    event: str='capture_startup'
+    action: str=''
+    phase: str=''
+    attempt: int=0
+    reason: str=''
+    focus_activity: str=''
+    detail: str=''
+    directory: str=''
+    capture_launch_at: float=0.0
+    first_media_observed_at: float=0.0
+
+
+class StartupSurfaceChanged(RuntimeError):
+    """准备阶段页面失效，必须停止临时采集后重新导航。"""
 
 
 @dataclass
@@ -86,6 +107,9 @@ class ContinuousSession:
         self.static_relocated=False
         self.media_done=0.0
         self.limit_reached=False
+        self.epoch_accepted=False
+        self.startup_attempt=0
+        self.startup_reason=''
 
     def _adb_device_online(self):
         try:
@@ -108,6 +132,76 @@ class ContinuousSession:
         return max(0.0,total-self.media_done) if total else None
 
     def start_epoch(self):
+        """启动期间持续复核页面；最多三轮准备，不消耗运行期恢复次数。"""
+        c=self.c
+        for attempt in range(1,4):
+            self.startup_attempt=attempt
+            self.startup_reason=''
+            self.epoch_accepted=False
+            self.epoch_ended=True
+            self.pipe=None
+            try:
+                self._check_startup_surface('before_capture')
+                self._start_prepared_epoch()
+                return True
+            except StartupSurfaceChanged as exc:
+                self.startup_reason=str(exc)
+                self.end_epoch()
+                if c.stop_requested:return False
+                if not self.device_online():
+                    self.device_lost();return False
+                if attempt==3:
+                    c._failure_reason='startup_gate_exhausted: '+str(exc)
+                    c._fatal_error=True
+                    c.request_stop()
+                    return False
+                landing=c._locate_target_room()
+                if c.stop_requested:return False
+                if not landing.success:
+                    c._exit_code=c._landing_exit_code(landing.reason)
+                    c._fatal_error=True
+                    c.request_stop()
+                    return False
+        return False
+
+    def _check_startup_surface(self, phase):
+        c=self.c
+        if not c._pipeline_wait_tick():
+            raise InterruptedError('开录准备期间收到停止请求')
+        detail=''
+        try:
+            observation=c._navigator.inspect_live_surface(timeout_sec=1.0)
+        except Exception as exc:
+            observation={}
+            detail=str(exc)
+        activity=observation.get('activity','') or ''
+        if 'login' in activity.lower():reason='login_prompt_detected'
+        elif not activity or not observation.get('ui_available'):reason='surface_probe_unavailable'
+        elif 'LivePlayActivity' not in activity:reason='startup_left_live_page'
+        elif observation.get('overlay'):reason='startup_overlay_detected'
+        else:reason=''
+        self.surface_verified_at=time.time()
+        c.emitter.emit(CaptureStartupEvent(action='rejected' if reason else 'checked',phase=phase,
+            attempt=self.startup_attempt,reason=reason,focus_activity=activity,detail=detail))
+        if c.stop_requested:raise InterruptedError('开录准备期间收到停止请求')
+        if reason:
+            log.warning('开录准备门禁拒绝: phase=%s attempt=%s activity=%s reason=%s detail=%s',
+                        phase,self.startup_attempt,activity,reason,detail)
+            raise StartupSurfaceChanged(reason)
+
+    def _startup_wait_tick(self):
+        try:
+            if not self.c._pipeline_wait_tick():return False
+            if self.clock()>=self.next_startup_probe:
+                self._check_startup_surface('capture_starting')
+                self.next_startup_probe=self.clock()+.5
+            return True
+        except BaseException:
+            # Pipeline.start 的异常收尾也调用 wait_hook；禁止收尾中重复探针抛错。
+            self.pipe.wait_hook=self.c._pipeline_wait_tick
+            raise
+
+    def _start_prepared_epoch(self):
         c=self.c
         if c.stop_requested:raise InterruptedError('停止后禁止启动采集')
         self.epoch+=1
@@ -124,11 +218,18 @@ class ContinuousSession:
             segment_duration_sec=c.config.segment_duration_sec,
             start_index=start_index,total_duration_sec=self.remaining_duration() or 0)
         c._pipeline=self.pipe
-        self.pipe.wait_hook=c._pipeline_wait_tick
+        self.next_startup_probe=self.clock()
+        self.pipe.wait_hook=self._startup_wait_tick
         self.pipe.start()
+        self.pipe.wait_hook=c._pipeline_wait_tick
+        self._check_startup_surface('before_recording')
+        self.epoch_accepted=True
         c.state_machine.transition_to(WorkerState.RECORDING)
         c.emitter.emit(CaptureSessionEvent(action='started',capture_pid=self.pipe._proc.pid,
-            muxer_pid=self.pipe._mux.pid,generation_id=c.current_generation_id))
+            muxer_pid=self.pipe._mux.pid,generation_id=c.current_generation_id,
+            capture_launch_at=getattr(self.pipe,'capture_launch_at',0.0),
+            first_media_observed_at=getattr(self.pipe,'first_media_observed_at',0.0),
+            surface_verified_at=self.surface_verified_at))
         self.sync()
         c._watchdog=self.watchdog_factory(pipeline=self.pipe,navigator=c._navigator,
             room_id=c.target_room_id,stall_threshold_sec=c.config.stall_timeout_sec,
@@ -199,7 +300,17 @@ class ContinuousSession:
         c=self.c
         if c._watchdog:c._watchdog.stop()
         if not self.pipe or self.epoch_ended:return
+        self.pipe.wait_hook=c._pipeline_wait_tick
         ok=self.pipe.stop()
+        if not self.epoch_accepted:
+            self.epoch_ended=True
+            c.emitter.emit(CaptureStartupEvent(action='discarded',phase='cleanup',attempt=self.startup_attempt,
+                reason=self.startup_reason or c._failure_reason or ('cancelled' if c.stop_requested else 'startup_failed'),
+                directory=str(self.pipe.directory),
+                capture_launch_at=getattr(self.pipe,'capture_launch_at',0.0),
+                first_media_observed_at=getattr(self.pipe,'first_media_observed_at',0.0)))
+            if not ok:raise RuntimeError('准备阶段采集收尾失败: '+self.pipe.failure_details())
+            return
         self.media_done+=self.pipe.media_time() or 0.0
         reason=interrupted or ('' if ok else 'capture_or_muxer_exit_failed')
         self.sync(ending=True,final=final and not reason,interrupted=reason)
@@ -234,7 +345,7 @@ class ContinuousSession:
                 c._failure_reason=landing.reason;c._fatal_error=True;c.request_stop();return False
         self.bad_pages=0
         try:
-            self.start_epoch()
+            if not self.start_epoch():return False
         except InterruptedError:
             return False
         except Exception as exc:
@@ -372,7 +483,7 @@ class ContinuousSession:
     def run(self):
         c=self.c
         try:
-            self.start_epoch()
+            if not self.start_epoch():return 0 if c.stop_requested and not c._fatal_error else (c._exit_code or 30)
             self.started=self.clock()
             while not c.stop_requested and not self.limit_reached:
                 self.sync()

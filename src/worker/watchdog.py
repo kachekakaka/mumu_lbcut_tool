@@ -172,6 +172,8 @@ class StallWatchdog:
                 return  # 旧采样不可污染新切片。
             # 登录强结论使用实际 Activity；原生面板交由只读表面探针识别后返回关闭。
             self._visual_stall_count = self._visual_stall_count + 1 if "login" in act.lower() else 0
+            if self._visual_stall_count:
+                logger.info('登录提示采样: activity=%s generation=%s observed_at=%.6f',act,gen,time.time())
             self._sample_view(view, now)
 
         frozen = now - self._frozen_since if self._frozen_since is not None else 0.0
@@ -203,7 +205,7 @@ class StallWatchdog:
 
     def _run_loop(self):
         failures = 0
-        while not self._stop.wait(self.check_interval_sec):
+        while not self._stop.is_set():
             try:
                 self.check_once()
                 failures = 0
@@ -213,3 +215,4 @@ class StallWatchdog:
                 if failures >= 3:
                     self._post(ActionType.FATAL_STOP, self.generation_provider(), "watchdog_probe_failed")
                     return
+            if self._stop.wait(self.check_interval_sec):return

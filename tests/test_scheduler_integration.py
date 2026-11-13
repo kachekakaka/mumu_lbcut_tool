@@ -213,14 +213,16 @@ def job_status(env, job_id):
     return row(env, 'SELECT status FROM jobs WHERE id=?', job_id)['status']
 
 
-def test_login_checks_end_without_waiting_for_periodic_scan(system):
+@pytest.mark.parametrize('notice', ['stall_detected','capture_startup'])
+def test_login_checks_end_without_waiting_for_periodic_scan(system,notice):
     e = system
     target, job = start_one(e)
     e.scheduler.auto_scan = True
     e.scheduler._next_scan = e.clock() + 600
     e.network.resolved.clear()
     e.network.rooms['A'] = ResolvedRoom('A', RoomStatus.ENDED)
-    e.children[0].emit('stall_detected', reason='login_prompt_detected', action='relocate_target')
+    e.children[0].emit(notice, reason='login_prompt_detected',
+                       action='rejected' if notice=='capture_startup' else 'relocate_target')
     e.scheduler.tick()
     e.scheduler.tick()
     assert e.network.resolved == ['A']
@@ -252,7 +254,7 @@ def test_login_live_or_unknown_does_not_mean_offline(system, status):
     assert e.children[0].alive
 
 
-@pytest.mark.parametrize('change', ['healed', 'removed', 'newer_observation', 'expired', 'new_recovery'])
+@pytest.mark.parametrize('change', ['healed', 'capture_started', 'removed', 'newer_observation', 'expired', 'new_recovery'])
 def test_login_late_result_cannot_override_current_state(system, change):
     from console_helpers import DeferredQueries
     from src.orchestrator.room_query_process import QueryResult
@@ -265,6 +267,8 @@ def test_login_late_result_cannot_override_current_state(system, change):
     assert queries.calls[0][:2] == ('login', 'A')
     if change == 'healed':
         e.children[0].emit('stall_healed')
+    elif change == 'capture_started':
+        e.children[0].emit('capture_session',action='started')
     elif change == 'removed':
         with e.store.transaction() as db:
             db.execute('UPDATE targets SET enabled=0,control_revision=control_revision+1 WHERE id=?', (target,))

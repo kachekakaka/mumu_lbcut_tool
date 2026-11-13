@@ -155,10 +155,13 @@ class Scheduler:
             job_id, event = self._event_pending
             # 数据库失败时保留当前事件，不静默丢弃；主循环异常会停止本主控创建的 Worker。
             self.store.record_event(job_id, event, self.clock())
-            if event.get("event") == "stall_detected" and event.get("reason") in LOGIN_REASONS:
+            login_notice = (event.get("event") == "stall_detected" or
+                            (event.get("event") == "capture_startup" and event.get("action") == "rejected"))
+            if login_notice and event.get("reason") in LOGIN_REASONS:
                 # 同一次恢复重复通知不延长窗口，也不产生无界查询队列。
                 self._login_checks.setdefault(job_id, (self.clock(), self.clock() + LOGIN_CHECK_WINDOW_SEC, uuid.uuid4().hex))
-            elif event.get("event") in ("stall_healed", "worker_stopped"):
+            elif (event.get("event") in ("stall_healed", "worker_stopped") or
+                  (event.get("event") == "capture_session" and event.get("action") == "started")):
                 self._login_checks.pop(job_id, None)
             self._event_pending = None
 
