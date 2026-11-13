@@ -356,3 +356,66 @@ def test_instance_enable_filter_and_patch_contract(api):
     clean_key = submit(client, 'PATCH', 'instances/3', {'enabled': False}).json()['command_id']
     apply(store, clean_key)
     assert [i['vmindex'] for i in client.get('/api/instances').json()['items']] == [2]
+
+
+def test_open_segment_folder_contract(api, monkeypatch):
+    client, store, runtime, config = api
+    target, job = seed(store)
+
+    launched = []
+    from src.orchestrator import desktop
+    monkeypatch.setattr(desktop, 'run_file_manager', lambda cmd: launched.append(cmd))
+
+    # 1. 切片不存在
+    assert client.post(f'/api/segments/{job}/0/open-folder').status_code == 404
+
+    # 2. 切片存在但未落盘 (file_path 为 None)
+    with store.transaction() as db:
+        db.execute("INSERT INTO segments(job_id, segment_index, created_at, updated_at) VALUES(?, 0, 10, 10)", (job,))
+    r_not_ready = client.post(f'/api/segments/{job}/0/open-folder')
+    assert r_not_ready.status_code == 404
+    assert r_not_ready.json()['code'] == 'segment_file_not_ready'
+
+    # 3. 正常高亮定位 (文件存在且在 output_dir 内)
+    job_folder = config.output_dir / job
+    job_folder.mkdir(parents=True, exist_ok=True)
+    seg_file = job_folder / 'seg_000.mp4'
+    seg_file.write_bytes(b'video-data')
+    with store.transaction() as db:
+        db.execute("UPDATE segments SET file_path=? WHERE job_id=? AND segment_index=0", (str(seg_file), job))
+
+    r_ok = client.post(f'/api/segments/{job}/0/open-folder')
+    assert r_ok.status_code == 200
+    data = r_ok.json()
+    assert data['status'] == 'succeeded' and data['revealed'] is True
+    assert data['file_path'] == str(seg_file.resolve())
+    assert data['folder_path'] == str(job_folder.resolve())
+    assert len(launched) == 1
+    assert launched[0] == ['explorer.exe', f'/select,{seg_file.resolve()}']
+
+    # 4. 文件不存在但父目录存在 (优雅降级)
+    seg_file.unlink()
+    launched.clear()
+    r_degrade = client.post(f'/api/segments/{job}/0/open-folder')
+    assert r_degrade.status_code == 200
+    assert r_degrade.json()['revealed'] is False
+    assert len(launched) == 1
+    assert launched[0] == ['explorer.exe', str(job_folder.resolve())]
+
+    # 5. 父目录也不存在
+    job_folder.rmdir()
+    r_no_dir = client.post(f'/api/segments/{job}/0/open-folder')
+    assert r_no_dir.status_code == 404
+    assert r_no_dir.json()['code'] == 'folder_not_found'
+
+    # 6. 路径越界 (不在 output_dir 白名单)
+    outside_dir = config.data_dir / 'outside'
+    outside_dir.mkdir(parents=True, exist_ok=True)
+    outside_file = outside_dir / 'escape.mp4'
+    outside_file.write_bytes(b'bad')
+    with store.transaction() as db:
+        db.execute("UPDATE segments SET file_path=? WHERE job_id=? AND segment_index=0", (str(outside_file), job))
+    r_forbidden = client.post(f'/api/segments/{job}/0/open-folder')
+    assert r_forbidden.status_code == 403
+    assert r_forbidden.json()['code'] == 'path_forbidden'
+

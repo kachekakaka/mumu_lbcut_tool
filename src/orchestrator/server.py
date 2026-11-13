@@ -134,6 +134,8 @@ class Runtime:
 
 def create_app(config, runtime=None):
     runtime = runtime or Runtime(config)
+    if not hasattr(runtime, "config"):
+        runtime.config = config
 
     @asynccontextmanager
     async def lifespan(app):

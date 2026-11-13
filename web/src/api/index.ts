@@ -1,5 +1,5 @@
 import { request, type Query } from './client'
-import type { Command, Instance, Job, JobDetail, JobLog, Overview, Page, Receipt, Segment, SystemInfo, Target } from './types'
+import type { Command, Instance, Job, JobDetail, JobLog, OpenFolderResponse, Overview, Page, Receipt, Segment, SystemInfo, Target } from './types'
 
 const get = <T>(path: string, query?: Query) => request<T>('GET', path, { query }).then((r) => r.data)
 const id = (value: string) => encodeURIComponent(value)
@@ -30,4 +30,6 @@ export const api = {
   stopTarget: (targetId: string, sessionKey: string, requestId: string) =>
     write('POST', `/api/targets/${id(targetId)}/stop`, requestId, { session_key: sessionKey }),
   stopJob: (jobId: string, requestId: string) => write('POST', `/api/jobs/${id(jobId)}/stop`, requestId, {}),
+  openSegmentFolder: (jobId: string, segmentIndex: number) =>
+    request<OpenFolderResponse>('POST', `/api/segments/${id(jobId)}/${segmentIndex}/open-folder`, { timeoutMs: 10000 }).then((r) => r.data),
 }

@@ -191,3 +191,10 @@ export interface Command {
   started_at: number | null
   finished_at: number | null
 }
+
+export interface OpenFolderResponse {
+  status: 'succeeded'
+  file_path: string
+  folder_path: string
+  revealed: boolean
+}

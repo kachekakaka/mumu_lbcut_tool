@@ -1,4 +1,7 @@
 <script setup lang="ts">
+import { ref } from 'vue'
+import { ElMessage } from 'element-plus'
+import { api } from '../api'
 import type { Segment } from '../api/types'
 import { fmtDuration, fmtSize, fmtTime, shortId } from '../format'
 import { reasonLabel, segmentStatusLabel, segmentStatusType } from '../labels'
@@ -13,6 +16,31 @@ const props = withDefaults(
 
 const rowClass = ({ row }: { row: Segment }) =>
   props.focusJob && row.job_id === props.focusJob && row.segment_index === props.focusIndex ? 'focus-row' : ''
+
+const openingKey = ref<string | null>(null)
+
+async function handleOpenFolder(row: Segment) {
+  const key = `${row.job_id}:${row.segment_index}`
+  if (openingKey.value) return
+  openingKey.value = key
+  try {
+    await api.openSegmentFolder(row.job_id, row.segment_index)
+    const isLocal = typeof window !== 'undefined' && ['localhost', '127.0.0.1', '::1'].includes(window.location.hostname)
+    if (isLocal) {
+      ElMessage.success('已打开所在目录')
+    } else {
+      ElMessage.success('已在录制机桌面打开所在目录')
+    }
+  } catch (err: any) {
+    ElMessage.error(err?.message || '打开目录失败')
+  } finally {
+    setTimeout(() => {
+      if (openingKey.value === key) {
+        openingKey.value = null
+      }
+    }, 1500)
+  }
+}
 </script>
 
 <template>
@@ -52,8 +80,30 @@ const rowClass = ({ row }: { row: Segment }) =>
     <el-table-column v-if="uploadEnabled" label="上传状态" min-width="100">
       <template #default="{ row }"><UploadStatus :upload="row.upload" /></template>
     </el-table-column>
-    <el-table-column label="文件路径" min-width="260">
-      <template #default="{ row }"><CopyText :text="row.file_path" /></template>
+    <el-table-column label="文件路径" min-width="320">
+      <template #default="{ row }">
+        <span class="segment-file-actions">
+          <CopyText :text="row.file_path" />
+          <el-button
+            v-if="row.file_path"
+            link
+            type="primary"
+            size="small"
+            :loading="openingKey === `${row.job_id}:${row.segment_index}`"
+            @click.stop="handleOpenFolder(row)"
+          >
+            打开目录
+          </el-button>
+        </span>
+      </template>
     </el-table-column>
   </el-table>
 </template>
+
+<style scoped>
+.segment-file-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+</style>

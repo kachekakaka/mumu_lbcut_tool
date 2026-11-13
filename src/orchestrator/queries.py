@@ -171,6 +171,13 @@ class Queries:
                 raise ControlError("command_not_found", "命令不存在", 404)
             return command_object(row)
 
+    def segment(self, job_id, segment_index):
+        with self.store.read_snapshot() as db:
+            row = db.execute(SEGMENT_SQL + " WHERE s.job_id=? AND s.segment_index=?", (job_id, segment_index)).fetchone()
+            if not row:
+                raise ControlError("segment_not_found", "切片记录不存在", 404)
+            return segment_object(row)
+
     def job(self, key):
         with self.store.read_snapshot() as db:
             row = db.execute(JOB_SQL + " WHERE j.id=?", (key,)).fetchone()

@@ -1,5 +1,6 @@
 """HTTP 薄接口：严格输入、统一错误、只提交持久命令。"""
 import logging
+from pathlib import Path as FilePath
 from typing import Annotated, Generic, Literal, TypeVar
 from uuid import UUID
 
@@ -9,6 +10,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, ValidationError, model_validator
 from starlette.exceptions import HTTPException
 
+from src.orchestrator.desktop import reveal_in_file_manager
 from src.orchestrator.storage import ControlError
 from src.orchestrator.queries import Queries
 
@@ -236,6 +238,13 @@ class LogResponse(StrictModel):
     reason: str | None
 
 
+class OpenFolderResponse(StrictModel):
+    status: Literal["succeeded"]
+    file_path: str
+    folder_path: str
+    revealed: bool
+
+
 T = TypeVar("T")
 
 
@@ -376,5 +385,26 @@ def install_api(app: FastAPI, runtime):
     def reconcile(body: Reconcile, request: Request, idempotency_key: str | None = Header(default=None)):
         parameters(request, Empty)
         return submit("reconcile", body.job_id or "", body.model_dump(), idempotency_key)
+
+    @router.post("/segments/{job_id}/{segment_index}/open-folder", response_model=OpenFolderResponse)
+    def open_segment_folder(job_id: str, segment_index: Annotated[int, Path(ge=0)], request: Request, body: Empty | None = Body(default=None)):
+        parameters(request, Empty)
+        seg = query().segment(job_id, segment_index)
+        file_path_raw = seg.get("file_path")
+        if not file_path_raw:
+            raise ControlError("segment_file_not_ready", "切片文件尚未落盘", 404)
+        output_root = runtime.config.output_dir.resolve()
+        file_path = FilePath(file_path_raw).resolve()
+        if not file_path.is_relative_to(output_root):
+            raise ControlError("path_forbidden", "切片路径不在录像输出目录内", 403)
+        if file_path.is_file():
+            revealed = True
+            reveal_in_file_manager(file_path, is_file=True)
+        elif file_path.parent.is_dir():
+            revealed = False
+            reveal_in_file_manager(file_path.parent, is_file=False)
+        else:
+            raise ControlError("folder_not_found", "切片所在目录不存在", 404)
+        return OpenFolderResponse(status="succeeded", file_path=str(file_path), folder_path=str(file_path.parent), revealed=revealed)
 
     app.include_router(router)

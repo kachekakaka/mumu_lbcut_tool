@@ -14,7 +14,8 @@ docs/
 ├─ [待办.md](待办.md)
 ├─ [控制台接口契约.md](控制台接口契约.md)
 ├─ 方案/
-│  └─ [20261105-录播调度平台架构与功能实施方案.md](方案/20261105-录播调度平台架构与功能实施方案.md)
+│  ├─ [20261105-录播调度平台架构与功能实施方案.md](方案/20261105-录播调度平台架构与功能实施方案.md)
+│  └─ [20261113-控制台切片所在目录定位实施方案.md](方案/20261113-控制台切片所在目录定位实施方案.md)
 ├─ 证据/验证/
 │  ├─ [20261020-MVP技术可行性验证.md](证据/验证/20261020-MVP技术可行性验证.md)
 │  ├─ [20261031-录播Worker技术验证.md](证据/验证/20261031-录播Worker技术验证.md)
@@ -53,7 +54,8 @@ docs/
    ├─ [0017-console-control-scope-and-session-intent.md](adr/0017-console-control-scope-and-session-intent.md)
    ├─ [0018-console-instance-selection-and-cleanup.md](adr/0018-console-instance-selection-and-cleanup.md)
    ├─ [0019-scheduler-on-demand-instance-boot.md](adr/0019-scheduler-on-demand-instance-boot.md)
-   └─ [0020-worker-cleanup-force-stop-douyin.md](adr/0020-worker-cleanup-force-stop-douyin.md)
+   ├─ [0020-worker-cleanup-force-stop-douyin.md](adr/0020-worker-cleanup-force-stop-douyin.md)
+   └─ [0021-console-desktop-reveal-for-segments.md](adr/0021-console-desktop-reveal-for-segments.md)
 
 archive/docs/                       仓库根目录下，按需
 ├─ 方案/
