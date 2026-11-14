@@ -143,7 +143,7 @@ class ContinuousPipeline:
                  ffmpeg_exe, max_size=1280, bit_rate='4M', max_fps=None,
                  start_index=1, producer_factory=None, total_duration_sec=0):
         self.serial, self.output_dir = serial, Path(output_dir).resolve()
-        self.scrcpy_exe, self.adb_exe = Path(scrcpy_exe), Path(adb_exe)
+        self.scrcpy_exe, self.adb_exe = Path(scrcpy_exe).resolve(), Path(adb_exe).resolve()
         self.ffmpeg_exe = str(ffmpeg_exe)
         if segment_duration_sec <= 0 or start_index < 1:
             raise ValueError('分段时长和起始序号必须为正数')
@@ -213,13 +213,17 @@ class ContinuousPipeline:
             if self.max_fps:cmd.append('--max-fps='+str(self.max_fps))
             env=dict(os.environ,ADB=str(self.adb_exe))
             env['PATH']=str(self.adb_exe.parent)+os.pathsep+env.get('PATH','')
+            server_path = self.scrcpy_exe.parent / 'scrcpy-server'
+            if server_path.exists() and 'SCRCPY_SERVER_PATH' not in env:
+                env['SCRCPY_SERVER_PATH'] = str(server_path)
             self.command=cmd
             self.capture_launch_at=time.time()
             if self.producer_factory:
                 self._proc=self.producer_factory(self.bridge.name,self.directory)
             else:
                 self._proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
-                    text=True,encoding='utf8',errors='replace',env=env,creationflags=flags)
+                    text=True,encoding='utf8',errors='replace',env=env,creationflags=flags,
+                    cwd=str(self.adb_exe.parent))
             self._capture_drainer=PipelineLogDrainer(self._proc,on_log_line=self._log_capture_line)
             self._capture_drainer.start()
             self.started_at=time.monotonic()

@@ -17,19 +17,20 @@ class AppLauncher:
 
     def __init__(self, serial: str, adb_exe: Path | None = None):
         self.serial = serial
-        self.adb_exe = adb_exe or get_adb_exe()
-        if not self.adb_exe or not self.adb_exe.exists():
-            raise FileNotFoundError(f"未找到 adb.exe: {self.adb_exe}")
+        adb = adb_exe or get_adb_exe()
+        if not adb or not Path(adb).exists():
+            raise FileNotFoundError(f"未找到 adb.exe: {adb}")
+        self.adb_exe = Path(adb).resolve()
 
     def _adb(self, *args: str) -> str:
         """执行 ADB 命令，若遇到设备离线或断开则自动重连。"""
         cmd = [str(self.adb_exe), "-s", self.serial, *args]
-        res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=self.adb_exe.parent)
         output = res.stdout.strip() or res.stderr.strip()
         if "not found" in output or "offline" in output:
             # 自动执行 connect 并重试一次
-            subprocess.run([str(self.adb_exe), "connect", self.serial], capture_output=True, text=True)
-            res2 = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+            subprocess.run([str(self.adb_exe), "connect", self.serial], capture_output=True, text=True, cwd=self.adb_exe.parent)
+            res2 = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=self.adb_exe.parent)
             output = res2.stdout.strip()
         return output
 
@@ -81,13 +82,15 @@ class AppLauncher:
 
     def capture_screenshot(self, save_path: Path) -> bool:
         """截取当前模拟器屏幕画面并拉取到本地保存（用于状态验证与证据归档）。"""
-        save_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path = Path(save_path).resolve()
+        target_path.parent.mkdir(parents=True, exist_ok=True)
         remote_path = "/sdcard/screen_probe.png"
         self._adb("shell", "screencap", "-p", remote_path)
         res = subprocess.run(
-            [str(self.adb_exe), "-s", self.serial, "pull", remote_path, str(save_path)],
+            [str(self.adb_exe), "-s", self.serial, "pull", remote_path, str(target_path)],
             capture_output=True,
-            text=True
+            text=True,
+            cwd=self.adb_exe.parent,
         )
         self._adb("shell", "rm", "-f", remote_path)
-        return save_path.exists()
+        return target_path.exists()

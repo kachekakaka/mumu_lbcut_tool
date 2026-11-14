@@ -26,9 +26,10 @@ class StreamRecorder:
         max_size: int = 1280,
     ):
         self.serial = serial
-        self.output_path = output_path
-        self.scrcpy_exe = scrcpy_exe or (SCRCPY_DIR / "scrcpy.exe")
-        self.adb_exe = adb_exe or get_adb_exe()
+        self.output_path = Path(output_path).resolve()
+        self.scrcpy_exe = Path(scrcpy_exe or (SCRCPY_DIR / "scrcpy.exe")).resolve()
+        adb = adb_exe or get_adb_exe()
+        self.adb_exe = Path(adb).resolve() if adb else None
         self.max_fps = max_fps
         self.bit_rate = bit_rate
         self.max_size = max_size
@@ -77,10 +78,16 @@ class StreamRecorder:
         ]
 
         env = os.environ.copy()
+        cwd = None
         if self.adb_exe and self.adb_exe.exists():
             env["ADB"] = str(self.adb_exe)
             # 把 adb 所在目录加到 PATH 最前
             env["PATH"] = str(self.adb_exe.parent) + os.path.pathsep + env.get("PATH", "")
+            cwd = str(self.adb_exe.parent)
+
+        server_path = self.scrcpy_exe.parent / "scrcpy-server"
+        if server_path.exists() and "SCRCPY_SERVER_PATH" not in env:
+            env["SCRCPY_SERVER_PATH"] = str(server_path)
 
         logger.info(f"启动录制管线: {' '.join(cmd)}")
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
@@ -88,6 +95,7 @@ class StreamRecorder:
         self._proc = subprocess.Popen(
             cmd,
             env=env,
+            cwd=cwd,
             creationflags=creationflags,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

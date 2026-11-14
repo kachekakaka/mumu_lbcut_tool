@@ -24,9 +24,10 @@ class WorkerNavigator:
 
     def __init__(self, serial: str, adb_exe: Path | None = None):
         self.serial = serial
-        self.adb_exe = adb_exe or get_adb_exe()
-        if not self.adb_exe or not self.adb_exe.exists():
-            raise FileNotFoundError(f"未找到 adb.exe: {self.adb_exe}")
+        adb = adb_exe or get_adb_exe()
+        if not adb or not Path(adb).exists():
+            raise FileNotFoundError(f"未找到 adb.exe: {adb}")
+        self.adb_exe = Path(adb).resolve()
         self.adb_client = AdbDeviceClient(serial=self.serial, adb_exe=self.adb_exe)
         self.target_kind = "auto"
         self.target_web_rid = None
@@ -139,17 +140,19 @@ class WorkerNavigator:
 
     def capture_screenshot(self, save_path: Path) -> bool:
         """截屏用于心跳差分或证据归档。"""
-        save_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path = Path(save_path).resolve()
+        target_path.parent.mkdir(parents=True, exist_ok=True)
         remote_path = "/sdcard/wp_probe.png"
         self._adb("shell", "screencap", "-p", remote_path)
         subprocess.run(
-            [str(self.adb_exe), "-s", self.serial, "pull", remote_path, str(save_path)],
+            [str(self.adb_exe), "-s", self.serial, "pull", remote_path, str(target_path)],
             capture_output=True,
             text=True,
             timeout=5.0,
+            cwd=self.adb_exe.parent,
         )
         self._adb("shell", "rm", "-f", remote_path)
-        return save_path.exists()
+        return target_path.exists()
 
     def _record_probe_timing(self, name: str, elapsed_ms: float, status: str) -> None:
         lock = getattr(self, "_probe_metrics_lock", None)
@@ -205,7 +208,7 @@ class WorkerNavigator:
                 budget = min(budget, self._operation_deadline - time.monotonic())
                 if budget < 1.0:
                     return None
-            res = subprocess.run(cmd, capture_output=True, timeout=budget)
+            res = subprocess.run(cmd, capture_output=True, timeout=budget, cwd=self.adb_exe.parent)
             if res.returncode == 0 and len(res.stdout) > 0:
                 img = Image.open(io.BytesIO(res.stdout)).convert("RGB")
                 status = "ok"

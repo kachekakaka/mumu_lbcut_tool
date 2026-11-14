@@ -32,9 +32,10 @@ class AdbDeviceClient:
         if not serial or not serial.strip():
             raise ValueError("ADB serial 不能为空")
         self.serial = serial.strip()
-        self.adb_exe = adb_exe or get_adb_exe()
-        if not self.adb_exe or not self.adb_exe.exists():
-            raise FileNotFoundError(f"未找到 adb.exe: {self.adb_exe}")
+        adb = adb_exe or get_adb_exe()
+        if not adb or not Path(adb).exists():
+            raise FileNotFoundError(f"未找到 adb.exe: {adb}")
+        self.adb_exe = Path(adb).resolve()
         self._metrics_lock = threading.Lock()
         self._command_metrics = {}
         self._slow_commands = []
@@ -120,7 +121,7 @@ class AdbDeviceClient:
         started = time.monotonic()
         status = "ok"
         try:
-            result = run_command(cmd, timeout=timeout, check=check)
+            result = run_command(cmd, timeout=timeout, check=check, cwd=self.adb_exe.parent)
             if result.exit_code != 0:
                 status = "error"
             return result
@@ -151,7 +152,7 @@ class AdbDeviceClient:
         if timeout < 1.0:
             return False
         try:
-            res = run_command(cmd, timeout=timeout)
+            res = run_command(cmd, timeout=timeout, cwd=self.adb_exe.parent)
             logger.debug(f"ADB connect {self.serial}: {res.stdout.strip()}")
         except Exception as e:
             logger.warning(f"ADB connect 异常: {e}")

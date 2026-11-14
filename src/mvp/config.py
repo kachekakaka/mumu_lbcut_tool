@@ -10,20 +10,20 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 DEV_DIR = REPO_ROOT.parent / "mumu_lbcut_tool_dev"
 TMP_DIR = DEV_DIR / "mumu_lbcut_tool_tmp"
 TOOLS_DIR = DEV_DIR / "tools"
-SCRCPY_DIR = TOOLS_DIR / "scrcpy"
+SCRCPY_DIR = (TOOLS_DIR / "scrcpy").resolve()
 FFMPEG_BUILD = "9.0.2-full_build-www.gyan.dev"
-FFMPEG_DIR = TOOLS_DIR / "ffmpeg-9.0.2-full_build"
+FFMPEG_DIR = (TOOLS_DIR / "ffmpeg-9.0.2-full_build").resolve()
 
 # 测试产物目录
-MVP_OUTPUT_DIR = TMP_DIR / "20261020-mvp"
+MVP_OUTPUT_DIR = (TMP_DIR / "20261020-mvp").resolve()
 
 
 def get_mumu_install_path() -> Path | None:
-    """自动获取或探测 MuMu 模拟器安装路径。"""
+    """自动获取或探测 MuMu 模拟器安装路径，保证返回绝对路径。"""
     # 1. 优先读取环境变量
     env_path = os.environ.get("MUMU_HOME")
     if env_path and Path(env_path).exists():
-        return Path(env_path)
+        return Path(env_path).resolve()
 
     # 2. 查询 Windows 注册表
     reg_keys = [
@@ -42,7 +42,7 @@ def get_mumu_install_path() -> Path | None:
                                 if "mumu" in str(display_name).lower():
                                     install_loc, _ = winreg.QueryValueEx(app_key, "InstallLocation")
                                     if install_loc and Path(install_loc).exists():
-                                        return Path(install_loc)
+                                        return Path(install_loc).resolve()
                         except OSError:
                             continue
             except OSError:
@@ -56,27 +56,27 @@ def get_mumu_install_path() -> Path | None:
     ]
     for path in common_paths:
         if path.exists():
-            return path
+            return path.resolve()
 
     return None
 
 
 def get_mumu_manager_exe() -> Path | None:
-    """获取 MuMuManager.exe 路径。"""
+    """获取 MuMuManager.exe 绝对路径。"""
     mumu_dir = get_mumu_install_path()
     if not mumu_dir:
         return None
     candidate = mumu_dir / "nx_main" / "MuMuManager.exe"
     if candidate.exists():
-        return candidate
+        return candidate.resolve()
     return None
 
 
 def get_adb_exe() -> Path | None:
-    """优先获取 MuMu 自带的 adb.exe，避免版本冲突。"""
+    """优先获取 MuMu 自带的 adb.exe 绝对路径，避免版本冲突。"""
     mumu_dir = get_mumu_install_path()
     if mumu_dir:
         candidate = mumu_dir / "nx_main" / "adb.exe"
         if candidate.exists():
-            return candidate
+            return candidate.resolve()
     return None

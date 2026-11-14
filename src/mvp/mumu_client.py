@@ -21,17 +21,27 @@ class MuMuClient:
     """封装 MuMuManager.exe 的生命周期与控制接口。"""
 
     def __init__(self, manager_exe: Path | None = None, adb_exe: Path | None = None):
-        self.manager_exe = manager_exe or get_mumu_manager_exe()
-        self.adb_exe = adb_exe or get_adb_exe()
-        if not self.manager_exe or not self.manager_exe.exists():
-            raise FileNotFoundError(f"未找到 MuMuManager.exe: {self.manager_exe}")
-        if not self.adb_exe or not self.adb_exe.exists():
-            raise FileNotFoundError(f"未找到 adb.exe: {self.adb_exe}")
+        manager = manager_exe or get_mumu_manager_exe()
+        adb = adb_exe or get_adb_exe()
+        if not manager or not Path(manager).exists():
+            raise FileNotFoundError(f"未找到 MuMuManager.exe: {manager}")
+        if not adb or not Path(adb).exists():
+            raise FileNotFoundError(f"未找到 adb.exe: {adb}")
+        self.manager_exe = Path(manager).resolve()
+        self.adb_exe = Path(adb).resolve()
 
     def _run_manager(self, *args: str, timeout: float = MANAGER_TIMEOUT_SEC, check: bool = False) -> str:
         """执行 MuMuManager 命令并返回 stdout。"""
         cmd = [str(self.manager_exe), *args]
-        res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
+        res = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            cwd=self.manager_exe.parent,
+        )
         if res.returncode != 0:
             logger.warning(f"MuMuManager 执行返回码 {res.returncode}: {res.stderr.strip() or res.stdout.strip()}")
             if check:
@@ -112,7 +122,7 @@ class MuMuClient:
         if stop_event.is_set():
             return False
         deadline = time.monotonic() + timeout_sec
-        main_exe = self.manager_exe.parent / "MuMuNxMain.exe"
+        main_exe = (self.manager_exe.parent / "MuMuNxMain.exe").resolve()
         if not main_exe.exists():
             return True
 
@@ -428,10 +438,10 @@ class MuMuClient:
             self._run_manager("adb", "-v", str(vmindex), "-c", "connect")
 
             # 显式执行 adb connect
-            subprocess.run([str(self.adb_exe), "connect", serial], capture_output=True, text=True)
+            subprocess.run([str(self.adb_exe), "connect", serial], capture_output=True, text=True, cwd=self.adb_exe.parent)
 
             # 检查 devices
-            res = subprocess.run([str(self.adb_exe), "devices"], capture_output=True, text=True)
+            res = subprocess.run([str(self.adb_exe), "devices"], capture_output=True, text=True, cwd=self.adb_exe.parent)
             lines = [line.strip() for line in res.stdout.strip().splitlines() if line.strip()]
 
             for line in lines[1:]:

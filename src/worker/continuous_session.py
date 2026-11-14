@@ -78,7 +78,9 @@ class ContinuousSession:
                  pipeline_factory=ContinuousPipeline, watchdog_factory=StallWatchdog,
                  clock=time.monotonic, sleeper=time.sleep, device_probe=None):
         self.c=controller
-        self.serial,self.scrcpy,self.adb=serial,scrcpy_exe,adb_exe
+        self.serial=serial
+        self.scrcpy=Path(scrcpy_exe).resolve() if scrcpy_exe else None
+        self.adb=Path(adb_exe).resolve() if adb_exe else None
         self.media_tools=media_tools
         self.pipeline_factory,self.watchdog_factory=pipeline_factory,watchdog_factory
         self.clock,self.sleep=clock,sleeper
@@ -113,8 +115,10 @@ class ContinuousSession:
 
     def _adb_device_online(self):
         try:
+            cwd = self.adb.parent if self.adb else None
             result=subprocess.run([str(self.adb),'-s',self.serial,'get-state'],capture_output=True,text=True,
-                timeout=5,creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0)
+                timeout=5,creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0,
+                cwd=cwd)
         except (OSError,subprocess.SubprocessError):
             return False
         return result.returncode==0 and result.stdout.strip()=='device'
