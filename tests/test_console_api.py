@@ -364,6 +364,7 @@ def test_open_segment_folder_contract(api, monkeypatch):
 
     launched = []
     from src.orchestrator import desktop
+    monkeypatch.setattr(desktop.platform, 'system', lambda: 'Windows')
     monkeypatch.setattr(desktop, 'run_file_manager', lambda cmd: launched.append(cmd))
 
     # 1. 切片不存在
@@ -419,3 +420,28 @@ def test_open_segment_folder_contract(api, monkeypatch):
     assert r_forbidden.status_code == 403
     assert r_forbidden.json()['code'] == 'path_forbidden'
 
+
+@pytest.mark.parametrize('file_exists', [True, False])
+def test_open_segment_folder_launch_failure(api, monkeypatch, caplog, file_exists):
+    client, store, runtime, config = api
+    _, job = seed(store)
+    folder = config.output_dir / job
+    folder.mkdir(parents=True)
+    segment = folder / '切片 001.mp4'
+    if file_exists:
+        segment.write_bytes(b'video-data')
+    with store.transaction() as db:
+        db.execute('INSERT INTO segments(job_id, segment_index, file_path, created_at, updated_at) VALUES(?, 0, ?, 10, 10)',
+                   (job, str(segment)))
+
+    def fail_launch(*args, **kwargs):
+        raise OSError('模拟资源管理器启动失败')
+
+    # 在实际子进程边界注入失败，防止桌面辅助层再次吞掉异常。
+    from src.orchestrator import desktop
+    monkeypatch.setattr(desktop.subprocess, 'Popen', fail_launch)
+    response = client.post(f'/api/segments/{job}/0/open-folder')
+    assert response.status_code == 500
+    assert response.json()['code'] == 'desktop_open_failed'
+    assert 'status' not in response.json() and 'revealed' not in response.json()
+    assert '模拟资源管理器启动失败' in caplog.text

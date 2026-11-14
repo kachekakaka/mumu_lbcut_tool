@@ -6,6 +6,7 @@ import type { Segment } from '../api/types'
 import { copyText } from '../clipboard'
 import { fmtDuration, fmtSize, fmtTime, shortId } from '../format'
 import { reasonLabel, segmentStatusLabel, segmentStatusType } from '../labels'
+import { connection } from '../poller'
 import QualityFlags from './QualityFlags.vue'
 import UploadStatus from './UploadStatus.vue'
 
@@ -29,15 +30,15 @@ async function copyPath(text: string) {
 
 async function handleOpenFolder(row: Segment) {
   const key = `${row.job_id}:${row.segment_index}`
-  if (openingKey.value) return
+  if (connection.ok !== true || openingKey.value) return
   openingKey.value = key
   try {
     await api.openSegmentFolder(row.job_id, row.segment_index)
     const isLocal = typeof window !== 'undefined' && ['localhost', '127.0.0.1', '::1'].includes(window.location.hostname)
     if (isLocal) {
-      ElMessage.success('已打开所在目录')
+      ElMessage.success('已发送打开目录请求，请在本机桌面确认')
     } else {
-      ElMessage.success('已在录制机桌面打开所在目录')
+      ElMessage.success('已向录制机发送打开目录请求，请在录制机桌面确认')
     }
   } catch (err: any) {
     ElMessage.error(err?.message || '打开目录失败')
@@ -99,6 +100,7 @@ async function handleOpenFolder(row: Segment) {
               type="primary"
               size="small"
               :loading="openingKey === `${row.job_id}:${row.segment_index}`"
+              :disabled="connection.ok !== true || openingKey !== null"
               @click.stop="handleOpenFolder(row)"
             >
               打开目录

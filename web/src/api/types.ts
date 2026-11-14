@@ -193,8 +193,10 @@ export interface Command {
 }
 
 export interface OpenFolderResponse {
+  /** 仅表示文件管理器启动请求已发出，不保证桌面已展示。 */
   status: 'succeeded'
   file_path: string
   folder_path: string
+  /** true 为文件定位请求，false 为父目录打开请求；不是桌面选中回执。 */
   revealed: boolean
 }

@@ -239,6 +239,7 @@ class LogResponse(StrictModel):
 
 
 class OpenFolderResponse(StrictModel):
+    """启动请求回执，不代表文件管理器已在桌面展示或选中文件。"""
     status: Literal["succeeded"]
     file_path: str
     folder_path: str
@@ -399,12 +400,15 @@ def install_api(app: FastAPI, runtime):
             raise ControlError("path_forbidden", "切片路径不在录像输出目录内", 403)
         if file_path.is_file():
             revealed = True
-            reveal_in_file_manager(file_path, is_file=True)
         elif file_path.parent.is_dir():
             revealed = False
-            reveal_in_file_manager(file_path.parent, is_file=False)
         else:
             raise ControlError("folder_not_found", "切片所在目录不存在", 404)
+        try:
+            reveal_in_file_manager(file_path if revealed else file_path.parent, is_file=revealed)
+        except OSError as exc:
+            logger.warning("拉起宿主机文件管理器失败: %s", exc, exc_info=True)
+            raise ControlError("desktop_open_failed", "无法启动录制机文件管理器，请查看服务日志", 500) from exc
         return OpenFolderResponse(status="succeeded", file_path=str(file_path), folder_path=str(file_path.parent), revealed=revealed)
 
     app.include_router(router)
