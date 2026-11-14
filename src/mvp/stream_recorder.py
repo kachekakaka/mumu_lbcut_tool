@@ -51,6 +51,14 @@ class StreamRecorder:
         if not self.scrcpy_exe.exists():
             raise FileNotFoundError(f"未找到 scrcpy.exe: {self.scrcpy_exe}")
 
+        if os.name == "nt":
+            if not self.adb_exe:
+                raise FileNotFoundError("未配置 adb.exe 路径")
+            if not self.adb_exe.exists():
+                raise FileNotFoundError(f"未找到 adb.exe: {self.adb_exe}")
+            if self.adb_exe.is_dir():
+                raise RuntimeError(f"无效的 adb.exe 路径 (不能为目录): {self.adb_exe}")
+
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         if self.output_path.exists():
             try:
@@ -84,6 +92,9 @@ class StreamRecorder:
             # 把 adb 所在目录加到 PATH 最前
             env["PATH"] = str(self.adb_exe.parent) + os.path.pathsep + env.get("PATH", "")
             cwd = str(self.adb_exe.parent)
+
+        if os.name == "nt" and cwd is None:
+            raise RuntimeError("Windows 下禁止以空工作目录启动 scrcpy，以防继承调用方工作目录")
 
         server_path = self.scrcpy_exe.parent / "scrcpy-server"
         if server_path.exists() and "SCRCPY_SERVER_PATH" not in env:

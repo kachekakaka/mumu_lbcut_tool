@@ -400,6 +400,40 @@ def test_stream_recorder_scrcpy_cwd_and_output_path(fake_mumu_env, tmp_path):
     assert os.getcwd() == orig_cwd
 
 
+def test_stream_recorder_adb_missing_or_invalid_on_windows(fake_mumu_env, tmp_path):
+    """验证 Windows 下 StreamRecorder 在 ADB 路径缺失或无效时明确报错，不启动 scrcpy 也不继承 CWD。"""
+    orig_cwd = os.getcwd()
+    scrcpy_exe = fake_mumu_env["sandbox"] / "tools" / "scrcpy" / "scrcpy.exe"
+    scrcpy_exe.parent.mkdir(parents=True, exist_ok=True)
+    scrcpy_exe.write_text("fake scrcpy", encoding="utf-8")
+    rel_out = tmp_path / "out.mp4"
+
+    with patch("os.name", "nt"), patch("subprocess.Popen") as mock_popen:
+        # 1. adb_exe 为 None (且 get_adb_exe 返回 None)
+        with patch("src.mvp.stream_recorder.get_adb_exe", return_value=None):
+            rec_none = StreamRecorder(serial="127.0.0.1:16384", output_path=rel_out, scrcpy_exe=scrcpy_exe, adb_exe=None)
+            with pytest.raises(FileNotFoundError, match="未配置 adb.exe 路径"):
+                rec_none.start()
+
+        # 2. adb_exe 路径不存在
+        nonexistent_adb = tmp_path / "nonexistent" / "adb.exe"
+        rec_missing = StreamRecorder(serial="127.0.0.1:16384", output_path=rel_out, scrcpy_exe=scrcpy_exe, adb_exe=nonexistent_adb)
+        with pytest.raises(FileNotFoundError, match="未找到 adb.exe"):
+            rec_missing.start()
+
+        # 3. adb_exe 为目录 (无效路径)
+        dir_adb = tmp_path / "fake_adb_dir"
+        dir_adb.mkdir(parents=True, exist_ok=True)
+        rec_invalid = StreamRecorder(serial="127.0.0.1:16384", output_path=rel_out, scrcpy_exe=scrcpy_exe, adb_exe=dir_adb)
+        with pytest.raises(RuntimeError, match="无效的 adb.exe 路径"):
+            rec_invalid.start()
+
+        # 确保上述异常情况下，subprocess.Popen 均未被触发，scrcpy 从未启动
+        assert mock_popen.call_count == 0
+
+    assert os.getcwd() == orig_cwd
+
+
 def test_desktop_file_manager_windows_system_dir():
     """验证 Windows 分支 Explorer 传入系统目录 cwd 且相对路径被规范为绝对路径。"""
     orig_cwd = os.getcwd()
