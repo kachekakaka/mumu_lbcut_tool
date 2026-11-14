@@ -422,7 +422,8 @@ def test_open_segment_folder_contract(api, monkeypatch):
 
 
 @pytest.mark.parametrize('file_exists', [True, False])
-def test_open_segment_folder_launch_failure(api, monkeypatch, caplog, file_exists):
+@pytest.mark.parametrize('exception_type', [OSError, RuntimeError, ValueError])
+def test_open_segment_folder_launch_failure(api, monkeypatch, caplog, file_exists, exception_type):
     client, store, runtime, config = api
     _, job = seed(store)
     folder = config.output_dir / job
@@ -435,7 +436,7 @@ def test_open_segment_folder_launch_failure(api, monkeypatch, caplog, file_exist
                    (job, str(segment)))
 
     def fail_launch(*args, **kwargs):
-        raise OSError('模拟资源管理器启动失败')
+        raise exception_type('模拟资源管理器启动失败')
 
     # 在实际子进程边界注入失败，防止桌面辅助层再次吞掉异常。
     from src.orchestrator import desktop
@@ -445,3 +446,5 @@ def test_open_segment_folder_launch_failure(api, monkeypatch, caplog, file_exist
     assert response.json()['code'] == 'desktop_open_failed'
     assert 'status' not in response.json() and 'revealed' not in response.json()
     assert '模拟资源管理器启动失败' in caplog.text
+    assert '模拟资源管理器启动失败' not in response.text
+    assert any(record.exc_info and record.exc_info[0] is exception_type for record in caplog.records)

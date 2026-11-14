@@ -406,7 +406,8 @@ def install_api(app: FastAPI, runtime):
             raise ControlError("folder_not_found", "切片所在目录不存在", 404)
         try:
             reveal_in_file_manager(file_path if revealed else file_path.parent, is_file=revealed)
-        except OSError as exc:
+        except Exception as exc:
+            # 只转换桌面启动调用的异常；查询、路径校验及进程退出信号不在此边界内。
             logger.warning("拉起宿主机文件管理器失败: %s", exc, exc_info=True)
             raise ControlError("desktop_open_failed", "无法启动录制机文件管理器，请查看服务日志", 500) from exc
         return OpenFolderResponse(status="succeeded", file_path=str(file_path), folder_path=str(file_path.parent), revealed=revealed)
