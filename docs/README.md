@@ -2,87 +2,14 @@
 
 本文件维护文档职责、方案创建与归档流程。项目文件存放见 [根 README](../README.md)，协作与授权边界见 [AGENTS.md](../AGENTS.md)。
 
-## 目录结构
+## 文档导航
 
-下面的路径均相对仓库根目录。本目录已有实施方案、ADR、运行说明和验证摘要；文档存在本身不代表功能已经实机验收。创建正文后，将下表对应位置改为实际可访问的链接，不为占位创建空文件。
+- 现行需求、设计、接口和未完成事项从下方[职责表](#文档职责与入口)进入；运行和测试入口见[根 README](../README.md)。
+- [活动方案](方案/)记录待审阅、实施或验证的专项；[归档方案](../archive/docs/方案/)保留已退出活动管理的方案。
+- [验证记录](证据/验证/)按任务保存历史证据；未验事项以[待办](待办.md)为准。
+- [有效 ADR](adr/)记录仍适用的决定；[归档 ADR](../archive/docs/adr/)保存失效或被替代的决定。
 
-```text
-docs/
-├─ README.md
-├─ [需求说明.md](需求说明.md)
-├─ 设计说明.md                      按需
-├─ [待办.md](待办.md)
-├─ [控制台接口契约.md](控制台接口契约.md)
-├─ 方案/
-│  ├─ [20261105-录播调度平台架构与功能实施方案.md](方案/20261105-录播调度平台架构与功能实施方案.md)
-│  ├─ [20261113-控制台切片所在目录定位实施方案.md](方案/20261113-控制台切片所在目录定位实施方案.md)
-│  └─ [20261114-模拟器与ADB常驻进程工作目录隔离实施方案.md](方案/20261114-模拟器与ADB常驻进程工作目录隔离实施方案.md)
-├─ 证据/验证/
-│  ├─ [20261020-MVP技术可行性验证.md](证据/验证/20261020-MVP技术可行性验证.md)
-│  ├─ [20261031-录播Worker技术验证.md](证据/验证/20261031-录播Worker技术验证.md)
-│  ├─ [20261101-开录前置门禁与视觉看门狗技术验证.md](证据/验证/20261101-开录前置门禁与视觉看门狗技术验证.md)
-│  ├─ [20261108-截图容错修复与15分钟实机验证.md](证据/验证/20261108-截图容错修复与15分钟实机验证.md)
-│  ├─ [20261108-运行期遮挡探针改用窗口状态验证.md](证据/验证/20261108-运行期遮挡探针改用窗口状态验证.md)
-│  ├─ [20261109-冻结检测改用录像流实机验证.md](证据/验证/20261109-冻结检测改用录像流实机验证.md)
-│  ├─ [20261111-录制自动恢复台式机实机验证.md](证据/验证/20261111-录制自动恢复台式机实机验证.md)
-│  ├─ [20261111-稳定渲染默认与Worker日志落盘验证.md](证据/验证/20261111-稳定渲染默认与Worker日志落盘验证.md)
-│  ├─ [20261111-冷启动重试与导航取证修正验证.md](证据/验证/20261111-冷启动重试与导航取证修正验证.md)
-│  ├─ [20261111-调度控制台后端接口验证.md](证据/验证/20261111-调度控制台后端接口验证.md)
-│  ├─ [20261111-调度控制台前端联调验证.md](证据/验证/20261111-调度控制台前端联调验证.md)
-│  ├─ [20261112-固定FFmpeg9与AAC音轨修复验证.md](证据/验证/20261112-固定FFmpeg9与AAC音轨修复验证.md)
-│  ├─ [20261112-六小时长稳测试验证.md](证据/验证/20261112-六小时长稳测试验证.md)
-│  ├─ [20261112-登录提示状态复核与恢复原因验证.md](证据/验证/20261112-登录提示状态复核与恢复原因验证.md)
-│  ├─ [20261112-实例控制与按需开机审查修正验证.md](证据/验证/20261112-实例控制与按需开机审查修正验证.md)
-│  ├─ [20261113-Worker收尾关闭抖音验证.md](证据/验证/20261113-Worker收尾关闭抖音验证.md)
-│  ├─ [20261113-T8按需开机与T10冷启动再录实机验证.md](证据/验证/20261113-T8按需开机与T10冷启动再录实机验证.md)
-│  ├─ [20261113-开录准备窗口复核与登录提示修复验证.md](证据/验证/20261113-开录准备窗口复核与登录提示修复验证.md)
-│  └─ [20261114-切片桌面定位审查修正验证.md](证据/验证/20261114-切片桌面定位审查修正验证.md)
-└─ adr/
-   ├─ [0001-scrcpy-pipeline-for-audio-video-isolation.md](adr/0001-scrcpy-pipeline-for-audio-video-isolation.md)
-   ├─ [0002-time-segmented-mp4-recording.md](adr/0002-time-segmented-mp4-recording.md)
-   ├─ [0003-hybrid-room-status-verification.md](adr/0003-hybrid-room-status-verification.md)
-   ├─ [0004-decoupling-worker-from-orchestrator.md](adr/0004-decoupling-worker-from-orchestrator.md)
-   ├─ [0005-ndjson-event-stream-contract.md](adr/0005-ndjson-event-stream-contract.md)
-   ├─ [0006-stall-watchdog-and-av-sync.md](adr/0006-stall-watchdog-and-av-sync.md)
-   ├─ [0007-preflight-content-gate-and-visual-watchdog.md](adr/0007-preflight-content-gate-and-visual-watchdog.md)
-   ├─ [0008-single-writer-pipeline-action-queue.md](adr/0008-single-writer-pipeline-action-queue.md)
-   ├─ [0010-orchestrator-architecture-and-delivery-contract.md](adr/0010-orchestrator-architecture-and-delivery-contract.md)
-   ├─ [0011-worker-responsibility-purification-and-offline-decoupling.md](adr/0011-worker-responsibility-purification-and-offline-decoupling.md)
-   ├─ [0012-continuous-capture-segment-muxer.md](adr/0012-continuous-capture-segment-muxer.md)
-   ├─ [0013-freeze-detection-from-captured-stream.md](adr/0013-freeze-detection-from-captured-stream.md)
-   ├─ [0014-remove-restart-mode-and-dual-pipeline.md](adr/0014-remove-restart-mode-and-dual-pipeline.md)
-   ├─ [0015-auto-retry-while-live-without-manual-unblock.md](adr/0015-auto-retry-while-live-without-manual-unblock.md)
-   ├─ [0016-console-frontend-separate-build-and-private-network-access.md](adr/0016-console-frontend-separate-build-and-private-network-access.md)
-   ├─ [0017-console-control-scope-and-session-intent.md](adr/0017-console-control-scope-and-session-intent.md)
-   ├─ [0018-console-instance-selection-and-cleanup.md](adr/0018-console-instance-selection-and-cleanup.md)
-   ├─ [0019-scheduler-on-demand-instance-boot.md](adr/0019-scheduler-on-demand-instance-boot.md)
-   ├─ [0020-worker-cleanup-force-stop-douyin.md](adr/0020-worker-cleanup-force-stop-douyin.md)
-   └─ [0021-console-desktop-reveal-for-segments.md](adr/0021-console-desktop-reveal-for-segments.md)
-
-archive/docs/                       仓库根目录下，按需
-├─ 方案/
-│  ├─ [20261020-MVP技术可行性验证方案.md](../archive/docs/方案/20261020-MVP技术可行性验证方案.md)
-│  ├─ [20261031-录播Worker规格与实施方案.md](../archive/docs/方案/20261031-录播Worker规格与实施方案.md)
-│  ├─ [20261101-开录前置门禁与视觉看门狗实施方案.md](../archive/docs/方案/20261101-开录前置门禁与视觉看门狗实施方案.md)
-│  ├─ [20261101-未登录弹窗阻断治理与门禁加固方案.md](../archive/docs/方案/20261101-未登录弹窗阻断治理与门禁加固方案.md)
-│  ├─ [20261102-Worker稳定性加固与异常治理综合方案.md](../archive/docs/方案/20261102-Worker稳定性加固与异常治理综合方案.md)
-│  ├─ [20261105-录播Worker真机准入与自适应唤起加固方案.md](../archive/docs/方案/20261105-录播Worker真机准入与自适应唤起加固方案.md)
-│  ├─ [20261105-录播Worker职责纯化与停机封口协同实施方案.md](../archive/docs/方案/20261105-录播Worker职责纯化与停机封口协同实施方案.md)
-│  ├─ [20261105-调度平台核心SDK与控制接口实施方案.md](../archive/docs/方案/20261105-调度平台核心SDK与控制接口实施方案.md)
-│  ├─ [20261109-冻结检测改用录像流与旧录制路径清理方案.md](../archive/docs/方案/20261109-冻结检测改用录像流与旧录制路径清理方案.md)
-│  ├─ [20261110-录制自动恢复与运行期误判修正方案.md](../archive/docs/方案/20261110-录制自动恢复与运行期误判修正方案.md)
-│  ├─ [控制台前端方案（余项转交）](../archive/docs/方案/20261111-调度控制台前端方案.md)
-│  ├─ [控制台后端方案（余项转交）](../archive/docs/方案/20261111-调度控制台后端接口实施方案.md)
-│  ├─ [20261112-控制台实例动态启用与旧记录清理实施方案.md](../archive/docs/方案/20261112-控制台实例动态启用与旧记录清理实施方案.md)
-│  ├─ [20261112-调度器按需自动开机实例实施方案.md](../archive/docs/方案/20261112-调度器按需自动开机实例实施方案.md)
-│  └─ [20261112-任务结束关闭模拟器抖音进程实施方案.md](../archive/docs/方案/20261112-任务结束关闭模拟器抖音进程实施方案.md)
-└─ adr/                             已失效或被替代的决定
-   └─ [0009-overlapping-dual-pipeline-seamless-slicing.md](../archive/docs/adr/0009-overlapping-dual-pipeline-seamless-slicing.md)
-```
-
-当前专项验证：[持续采集与遮挡恢复](证据/验证/20261106-持续采集与遮挡恢复验证.md)；前期结果：[目标直播定位与实录验证](证据/验证/20261106-目标直播定位与实录验证.md)。
-
-领域词汇表已位于仓库根目录 [CONTEXT.md](../CONTEXT.md)，不在本目录另建重复术语正文。
+文档存在不代表功能已验收；按任务读取，不为占位创建空文件。
 
 ## 文档职责与入口
 
@@ -90,7 +17,7 @@ archive/docs/                       仓库根目录下，按需
 | --- | --- | --- |
 | [docs/需求说明.md](需求说明.md) | 已确认的目标、行为、边界和验收要求；明确标记尚未实现的部分 | 需求需要持久维护时 |
 | [docs/控制台接口契约.md](控制台接口契约.md) | 当前 HTTP 参数、字段、控制语义与原因对象的唯一正文 | 接口已实施并从专项方案移交时 |
-| `docs/设计说明.md` | 当前架构、模块职责、数据与接口约束，以及代码和测试入口 | 技术设计确定后 |
+| [docs/设计说明.md](设计说明.md) | 当前架构、模块职责、数据与接口约束，以及代码和测试入口 | 技术设计确定后 |
 | [docs/待办.md](待办.md) | 未完工作、已知缺陷、未验证事项及对应依据 | 出现需跨任务跟踪的事项时 |
 | [CONTEXT.md](../CONTEXT.md) | 已有领域词汇表：易混概念及业务术语，不重复实现参数；不另建重复术语正文 | 已有，按概念变化维护 |
 | [docs/方案/](方案) | 待审阅、待实施、实施中、待验证或暂停的专项方案 | 用户要求或同意编写方案时 |
@@ -156,11 +83,11 @@ ADR 的有效性与方案是否完成分开判断：仍适用的决定留在 `do
 - [控制台后端验证](证据/验证/20261111-调度控制台后端接口验证.md)
 - [最小调度闭环与回归验证](证据/验证/20261105-最小调度闭环与回归验证.md)
 
-当前实机补验：[MuMu 渲染诊断与直播遮挡恢复验收](证据/验证/20261106-MuMu渲染诊断与直播遮挡恢复验收.md)。
+早期实机补验：[MuMu 渲染诊断与直播遮挡恢复验收](证据/验证/20261106-MuMu渲染诊断与直播遮挡恢复验收.md)。
 
-当前开录专项：[开录预算与慢页面容错验证](证据/验证/20261106-开录预算与慢页面容错验证.md)。
+早期开录验证：[开录预算与慢页面容错验证](证据/验证/20261106-开录预算与慢页面容错验证.md)。
 
 
 ## 项目续作交接
 
-- [20261107 项目续作交接](交接/20261107-项目续作交接.md)：记录当前工作区、设备状态、已查明的历史故障证据、最新短测结果及后续操作顺序。
+- [20261107 项目续作交接](交接/20261107-项目续作交接.md)：记录当时的工作区、设备状态、故障证据和后续操作顺序；当前状态以现行文档及待办为准。
