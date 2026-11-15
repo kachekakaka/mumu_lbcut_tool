@@ -73,7 +73,7 @@ _Avoid_: 门禁登录失败, 开录假死
 _Avoid_: 打开房间失败, 门禁拦截
 
 **Worker Lifecycle State Machine (Worker 生命周期状态机)**:
-控制 Worker 生命周期演进的有向状态模型：PREFLIGHT 可进入 RECORDING、STOPPING 或 STOPPED；RECORDING 与 RECOVERING 可相互切换，也可进入 STOPPING 或 STOPPED；STOPPING 进入 STOPPED，后者为终态。
+描述单个 Worker 的准备（PREFLIGHT）、录制（RECORDING）、恢复（RECOVERING）、收尾（STOPPING）和停止终态（STOPPED）。收尾阶段与停止终态相区分；迁移约束见 [ADR 0008](docs/adr/0008-single-writer-pipeline-action-queue.md)，代码允许集合与该决定的差异由[待办 K16](docs/待办.md#已知缺陷与未验证事项)跟踪。
 _Avoid_: 任务状态, 控制循环
 
 **Segment Generation ID (切片代际 ID)**:
