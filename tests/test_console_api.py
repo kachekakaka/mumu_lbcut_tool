@@ -283,6 +283,19 @@ def test_reason_projection_preserves_details(raw, expected):
     assert reason_object(raw) == expected
 
 
+@pytest.mark.parametrize('host,valid', [
+    ('127.0.0.1', True), ('192.168.1.10', True), ('0.0.0.0', True),
+    ('::', False), ('8.8.8.8', False), ('224.0.0.1', False),
+])
+def test_server_host_validation(tmp_path, host, valid):
+    config = ServerConfig(tmp_path / 'data', tmp_path / 'out', host=host)
+    if valid:
+        config.validate()
+    else:
+        with pytest.raises(ValueError):
+            config.validate()
+
+
 def test_optional_instances_cli_and_overview_counts_only_enabled(api, tmp_path):
     from src.orchestrator.server import ServerConfig
     parsed = cli.build_parser().parse_args(['run', '--output-dir', str(tmp_path / 'out')])

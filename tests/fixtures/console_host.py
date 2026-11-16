@@ -17,6 +17,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('root', type=Path)
 parser.add_argument('port', type=int)
 parser.add_argument('--mode', default='normal')
+parser.add_argument('--host', default='127.0.0.1')
 args = parser.parse_args()
 args.root.mkdir(parents=True, exist_ok=True)
 sentinel = None
@@ -54,7 +55,7 @@ if args.mode == 'blocked':
     import psutil
     (args.root / 'worker.json').write_text(json.dumps(dict(pid=sentinel.pid, born=psutil.Process(sentinel.pid).create_time())), encoding='utf-8')
 try:
-    raise SystemExit(run_server(ServerConfig(args.root / 'state', args.root / 'out', [1001], port=args.port), Host))
+    raise SystemExit(run_server(ServerConfig(args.root / 'state', args.root / 'out', [1001], host=args.host, port=args.port), Host))
 finally:
     if sentinel and sentinel.poll() is None:
         sentinel.terminate()

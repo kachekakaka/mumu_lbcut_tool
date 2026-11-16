@@ -47,8 +47,8 @@ class ServerConfig:
             raise ValueError("时间参数非法")
         address = ipaddress.ip_address(self.host)
         private = address.is_private or (address.version == 4 and address in ipaddress.ip_network("100.64.0.0/10"))
-        if address.is_unspecified or address.is_multicast or not private:
-            raise ValueError("请显式绑定本机或组网地址，不监听公网或所有网卡")
+        if str(address) != "0.0.0.0" and (address.is_unspecified or address.is_multicast or not private):
+            raise ValueError("请绑定本机、组网地址或 0.0.0.0")
 
 
 class Runtime:

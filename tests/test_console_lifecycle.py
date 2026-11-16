@@ -24,13 +24,13 @@ def port():
         return sock.getsockname()[1]
 
 
-def spawn(root, number, mode='normal', new_console=False):
+def spawn(root, number, mode='normal', new_console=False, host='127.0.0.1'):
     root.mkdir(parents=True, exist_ok=True)
     log = (root / f'host-{number}.log').open('wb')
     startup = subprocess.STARTUPINFO()
     startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     startup.wShowWindow = 0
-    proc = subprocess.Popen([sys.executable, str(HOST), str(root), str(number), '--mode', mode],
+    proc = subprocess.Popen([sys.executable, str(HOST), str(root), str(number), '--mode', mode, '--host', host],
         stdout=log, stderr=subprocess.STDOUT, creationflags=subprocess.CREATE_NEW_CONSOLE if new_console else subprocess.CREATE_NEW_PROCESS_GROUP,
         startupinfo=startup, env=dict(os.environ, PYTHONIOENCODING='utf-8'))
     log.close()
@@ -67,6 +67,26 @@ def test_port_conflict_does_not_create_database(tmp_path):
         child = spawn(tmp_path, sock.getsockname()[1])
         assert child.wait(15) != 0
         assert not (tmp_path / 'state' / 'orchestrator.sqlite3').exists()
+
+
+def test_wildcard_host_serves_loopback_and_local_interface(tmp_path):
+    addresses = {item[4][0] for item in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)}
+    addresses = sorted(address for address in addresses if not address.startswith('127.'))
+    if not addresses:
+        pytest.skip('没有可用于验证的非回环 IPv4 地址')
+    number = port()
+    child = spawn(tmp_path, number, host='0.0.0.0')
+    try:
+        ready(child, number)
+        session = requests.Session()
+        session.trust_env = False
+        for address in ('127.0.0.1', addresses[0]):
+            response = session.get(f'http://{address}:{number}/api/system', timeout=3)
+            assert response.status_code == 200
+            assert response.json()['scheduler_running']
+    finally:
+        stop(child)
+    assert child.returncode == 0
 
 
 def test_second_host_does_not_interrupt_commands(tmp_path):
