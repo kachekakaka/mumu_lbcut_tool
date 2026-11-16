@@ -183,7 +183,7 @@ def build_worker(monkeypatch, tmp_path, valid_media, *, total=4, segment=2,
         def wait_live_page(self, **kwargs):
             return gate
         def observe_live_room(self, **kwargs):
-            return RoomEvidence(anchor_uid=uid, nickname='synthetic anchor', source='synthetic-device-observation')
+            return RoomEvidence(room_id='7704666294802123554', anchor_uid=uid, nickname='synthetic anchor', source='synthetic-device-observation')
         def wait_live_picture(self, **kwargs):
             return gate
         def get_current_focus_activity(self):
@@ -193,6 +193,8 @@ def build_worker(monkeypatch, tmp_path, valid_media, *, total=4, segment=2,
                     'ui_available': True, 'observed_at': time.time()}
 
     monkeypatch.setattr(cm, "time", clock)
+    import src.worker.room_locator as locator
+    monkeypatch.setattr(locator, 'time', clock)
     monkeypatch.setattr(cm, "WorkerNavigator", Navigator)
     media_tools = cm.DependencyManager().get_media_tools()
     monkeypatch.setattr(cm, "DependencyManager", lambda: SimpleNamespace(

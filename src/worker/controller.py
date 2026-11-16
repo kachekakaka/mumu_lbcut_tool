@@ -24,7 +24,7 @@ from src.worker.adb_client import AdbDeviceClient
 from src.worker.resolver import clean_room_target
 from src.worker.naming_lock import WorkerInstanceLock, LockAcquisitionError
 from src.worker.identity_verifier import IdentityStatus
-from src.worker.room_locator import locate_target, validate_navigation_timeout
+from src.worker.room_locator import locate_target, validate_navigation_timeout, validate_expected_identity
 from src.worker.watchdog import StallWatchdog
 
 logger = logging.getLogger(__name__)
@@ -76,6 +76,8 @@ class WorkerController:
 
     def __init__(self, config: WorkerConfig, emitter: WorkerEventEmitter | None = None):
         validate_navigation_timeout(config.navigation_timeout_sec)
+        validate_expected_identity(config.target, config.target_kind, config.expected_anchor_uid,
+                                   config.allow_unconfirmed_identity)
         self.config = config
         self.emitter = emitter or WorkerEventEmitter(stream=sys.stdout, fallback_path=config.event_log_path)
         self.emitter.on_stream_lost = lambda: self.request_stop("event_stream_lost")
@@ -261,6 +263,9 @@ class WorkerController:
         return not self.stop_requested
 
     def _locate_target_room(self):
+        self.identity_status = IdentityStatus.UNCONFIRMED
+        self.emitter.set_context(room_identity_status='unconfirmed',
+                                 room_evidence_source='unavailable', room_evidence_at=0.0)
         navigation_started = time.monotonic()
         current_phase = ''
         if self._navigator and callable(getattr(type(self._navigator), "reset_metrics", None)):
@@ -296,7 +301,7 @@ class WorkerController:
                                      room_evidence_at=evidence.observed_at if evidence else 0.0)
             report(attempt=result.attempts, action='target_ready', reason=result.reason, evidence=evidence)
         else:
-            self._failure_reason = result.reason
+            self._failure_reason = '' if result.reason == 'cancelled' and self.stop_requested else result.reason
             report(attempt=result.attempts, action='navigation_exhausted', reason=result.reason,
                    evidence=result.evidence)
         return result
@@ -308,7 +313,7 @@ class WorkerController:
             return EXIT_LOGIN_BLOCKED
         if reason == 'device_unavailable':
             return EXIT_DEVICE_UNAVAILABLE
-        if reason in ('id_mismatch', 'room_evidence_unavailable'):
+        if reason in ('id_mismatch', 'room_evidence_unavailable', 'identity_unstable', 'identity_conflict_unresolved'):
             return EXIT_ROOM_MISMATCH
         if reason in ('render_timeout', 'picture_probe_unavailable', 'overlay_not_recovered', 'page_probe_unavailable'):
             return EXIT_PREFLIGHT_STALL

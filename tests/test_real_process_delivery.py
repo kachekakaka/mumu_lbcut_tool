@@ -121,7 +121,7 @@ def test_two_real_children_fifo_and_cli_stop(tmp_path, monkeypatch, valid_media)
     install_child_boundary(monkeypatch, tmp_path, valid_media)
     class Resolver:
         def resolve(self, raw):
-            return ResolvedRoom(raw, RoomStatus.LIVE, room_id='77000000000000000' + raw)
+            return ResolvedRoom(raw, RoomStatus.LIVE, room_id='77000000000000000' + raw, anchor_uid='900001')
     state_dir = tmp_path / 'state'
     store = Store(state_dir / 'orchestrator.sqlite3')
     for raw in ('11', '12', '13'):

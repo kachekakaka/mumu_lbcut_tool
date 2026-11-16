@@ -83,7 +83,7 @@ def test_command_receipt_idempotency_and_removed_target(api):
 
 def seed(store):
     target = store.add_target('A', now=1)
-    observe_room(store, target, ResolvedRoom('A', RoomStatus.LIVE, room_id='session', nickname='主播甲'), 2)
+    observe_room(store, target, ResolvedRoom('A', RoomStatus.LIVE, room_id='1065', anchor_uid='900001', nickname='主播甲'), 2)
     job = store.create_pending(target, 3)
     return target, job
 
@@ -231,10 +231,10 @@ def test_first_start_is_not_retrying_and_fix_alert_time_does_not_move(api):
         db.execute('UPDATE targets SET attempts=1 WHERE id=?', (target,))
     assert client.get('/api/targets').json()['items'][0]['is_retrying'] is False
     store.finish_job(job, 9, 50, True, 'target_invalid')
-    observe_room(store, target, ResolvedRoom('A', RoomStatus.LIVE, room_id='new'), 100)
+    observe_room(store, target, ResolvedRoom('A', RoomStatus.LIVE, room_id='2065', anchor_uid='900001'), 100)
     alert = Queries(store).overview()['alerts']['items'][0]
     assert alert['type'] == 'needs_fix' and alert['timestamp'] == 50
-    observe_room(store, target, ResolvedRoom('A', RoomStatus.LIVE, room_id='new'), 200)
+    observe_room(store, target, ResolvedRoom('A', RoomStatus.LIVE, room_id='2065', anchor_uid='900001'), 200)
     assert Queries(store).overview()['alerts']['items'][0]['timestamp'] == 50
 
 

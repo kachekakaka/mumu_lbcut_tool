@@ -15,7 +15,8 @@ from src.orchestrator.instance_pool import InstancePool
 from src.orchestrator.models import WorkerLaunchSpec
 from src.orchestrator.room_scanner import ObservationDispatcher
 from src.orchestrator.room_query_process import QueryProcesses
-from src.orchestrator.storage import NEEDS_FIX, Store, ControlError
+from src.orchestrator.storage import NEEDS_FIX, Store, ControlError, identity_admission
+from src.worker.room_locator import valid_identity_id
 from src.orchestrator.worker_process import WorkerProcessHandle
 
 logger = logging.getLogger(__name__)
@@ -203,6 +204,15 @@ class Scheduler:
         if job_id in self._handles and job_id not in self._closing:
             self._closing[job_id] = self._stoppers.submit(self._handles[job_id].stop, 60.0)
 
+    def _identity_reason(self, target):
+        return identity_admission(target, self.clock(), max(60, self.scan_interval * 2))
+
+    def _pending_needs_refresh(self, target_id):
+        job = self.store.active_job(target_id)
+        target = self.store.row('SELECT * FROM targets WHERE id=?', (target_id,))
+        return bool(job and job['status'] == 'pending' and not job['pid'] and target
+                    and self._identity_reason(target))
+
     def _commands(self):
         for command in self.store.rows("SELECT * FROM commands WHERE status='pending' ORDER BY created_at,id LIMIT 30"):
             if self._shutdown:
@@ -214,7 +224,7 @@ class Scheduler:
                     if kind == "record":
                         self.store.validate_subject(kind, subject)
                         result = self.store.existing_record(subject)
-                        if result is None:
+                        if result is None or self._pending_needs_refresh(subject):
                             target = self.store.row("SELECT * FROM targets WHERE id=?", (subject,))
                             if not self.observations.dispatch("manual", target, command["id"]):
                                 raise ControlError("query_busy", "手动查询繁忙，请稍后重试")
@@ -261,7 +271,7 @@ class Scheduler:
             reason = ("observation_superseded" if not accepted else
                       "anchor_offline" if target["trusted_status"] == "ended" else
                       "anchor_ended_unconfirmed" if result.room.status == RoomStatus.ENDED else
-                      "anchor_live" if result.room.status == RoomStatus.LIVE else "live_status_unknown")
+                      (self._identity_reason(target) or "anchor_live") if result.room.status == RoomStatus.LIVE else "live_status_unknown")
             self.store.record_event(job_id, dict(event="login_status_checked", timestamp=self.clock(),
                 reason=reason, observed_status=result.room.status.value, accepted=accepted,
                 query_error=result.error), self.clock())
@@ -292,7 +302,7 @@ class Scheduler:
                     return
                 t = self.store.row("SELECT * FROM targets WHERE id=?", (meta["target_id"],))
                 existing = self.store.existing_record(t["id"]) if t and t["enabled"] else None
-                if existing and self.store.active_job(t["id"])["session_key"] == t["session_key"]:
+                if existing and self.store.active_job(t["id"])["session_key"] == t["session_key"] and not self._pending_needs_refresh(t['id']):
                     self.store.complete_command(command_id, existing, now=self.clock())
                     return
                 if not t or not t["enabled"] or t["control_revision"] != meta["revision"] or t["session_key"] != meta["session_key"]:
@@ -307,6 +317,20 @@ class Scheduler:
                 t = self.store.row("SELECT * FROM targets WHERE id=?", (t["id"],))
                 if not t["enabled"]:
                     self.store.complete_command(command_id, error_code="target_changed", message="解析结果与已有监控目标重复", now=self.clock())
+                    return
+                active = self.store.active_job(t['id'])
+                if active and active['session_key'] != t['session_key']:
+                    self._stop_job(active['id'], 'live_session_changed')
+                    self.store.complete_command(command_id, error_code='live_session_changed',
+                        message='已换场，旧任务正在结束，请重新查询开录', now=self.clock())
+                    return
+                admission = self._identity_reason(t)
+                if admission:
+                    if active and active['status'] == 'pending':
+                        db.execute('UPDATE jobs SET error_reason=? WHERE id=?', (admission, active['id']))
+                    self.store.complete_command(command_id, error_code=admission,
+                        message=('主播在播，但身份标识未齐，等待重新查询后开录' if admission == 'target_identity_incomplete'
+                                 else '身份信息已过期，等待重新查询后开录'), now=self.clock())
                     return
                 db.execute("UPDATE targets SET record_session_key=session_key,suppressed_session=NULL,note=CASE WHEN note LIKE ? THEN NULL ELSE note END,attempts=0,retry_at=0,updated_at=?,control_revision=control_revision+1 WHERE id=?", (NEEDS_FIX + "%", self.clock(), t["id"]))
                 job_id = self.store.create_pending(t["id"], self.clock())
@@ -384,7 +408,7 @@ class Scheduler:
             if self._shutdown or not target["enabled"]:
                 continue
             ready = (target["trusted_status"] == "live" and target["observed_status"] == "live"
-                     and now - target["observed_at"] <= max(60, self.scan_interval * 2)
+                     and self._identity_reason(target) is None
                      and (target["auto_record"] or (target["record_session_key"] and target["record_session_key"] == target["session_key"]))
                      and not (target["suppressed_session"] and target["suppressed_session"] == target["session_key"])
                      and not (target["note"] or "").startswith(NEEDS_FIX) and now >= target["retry_at"])
@@ -402,11 +426,20 @@ class Scheduler:
         for job in self.store.rows("SELECT * FROM jobs WHERE status='starting' AND pid IS NULL ORDER BY created_at,rowid"):
             if job["id"] not in self._verifying and job["id"] not in self._handles:
                 target = self.store.row("SELECT * FROM targets WHERE id=?", (job["target_id"],))
+                reason = self._identity_reason(target)
+                if reason in {'target_identity_incomplete', 'target_identity_stale'}:
+                    self.store.defer_start(job['id'], now, reason)
+                    continue
                 if self.observations.dispatch("verify", target, job["id"]):
                     self._verifying[job["id"]] = True
         for job in self.store.rows("SELECT * FROM jobs WHERE status='pending' ORDER BY created_at,rowid"):
             target = self.store.row("SELECT * FROM targets WHERE id=?", (job["target_id"],))
-            if target["observed_status"] != "live" or now < target["retry_at"]:
+            reason = self._identity_reason(target)
+            if reason:
+                with self.store.transaction() as db:
+                    db.execute('UPDATE jobs SET error_reason=? WHERE id=?', (reason, job['id']))
+                continue
+            if now < target["retry_at"]:
                 continue
             slot = self.store.row("SELECT * FROM instances WHERE enabled=1 AND status='idle' AND job_id IS NULL ORDER BY vmindex")
             if not slot:
@@ -415,16 +448,21 @@ class Scheduler:
                 if self.observations.dispatch("verify", target, job["id"]):
                     self._verifying[job["id"]] = True
         if not self._boots:
-            vmindex = self.store.claim_boot(now)
+            vmindex = self.store.claim_boot(now, max(60, self.scan_interval * 2))
             if vmindex is not None:
                 self._boots[vmindex] = self._queries.submit(self.pool.boot_instance, vmindex, self._boot_stop)
 
     def _launch(self, job: dict, target: dict, room: ResolvedRoom):
         job_id = job["id"]
+        reason = self._identity_reason(target)
+        if not valid_identity_id(room.room_id) or not valid_identity_id(room.anchor_uid):
+            reason = 'target_identity_incomplete'
+        if reason:
+            self.store.defer_start(job_id, self.clock(), reason)
+            return
         journal = self.store.path.parent / "events" / f"{job_id}.ndjson"
-        internal = bool(room.room_id and room.room_id != room.web_rid)
-        spec = WorkerLaunchSpec(vmindex=job["vmindex"], target=room.room_id if internal else room.web_rid,
-            output_dir=self.output_dir / job_id, target_kind="room_id" if internal else "web_rid",
+        spec = WorkerLaunchSpec(vmindex=job["vmindex"], target=room.room_id,
+            output_dir=self.output_dir / job_id, target_kind="room_id",
             web_rid=room.web_rid, expected_anchor_uid=getattr(room, "anchor_uid", None),
             allow_unconfirmed_identity=bool(target["allow_unconfirmed"]), job_id=job_id,
             event_log_path=journal, log_path=journal.with_suffix(".log"), segment_duration_sec=self.segment_duration,

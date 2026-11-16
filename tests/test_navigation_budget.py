@@ -39,7 +39,7 @@ def test_slow_evidence_does_not_starve_final_picture(monkeypatch):
     result=locate_target(nav,'900',target_kind='room_id',anchor_uid='123',timeout_sec=150,
                          on_step=lambda **kw:steps.append(kw))
     assert result.success
-    assert nav.routes==['primary'] and nav.reads==1
+    assert nav.routes==['primary'] and nav.reads==2
     assert nav.pictures[-1]>=45
     assert all('remaining_sec' in row for row in steps)
 
@@ -53,7 +53,7 @@ def test_final_picture_transient_failure_reuses_verified_room(monkeypatch):
         return len(nav.pictures)>=2
     nav.wait_live_picture=picture
     result=locate_target(nav,'900',target_kind='room_id',anchor_uid='123',timeout_sec=300)
-    assert result.success and nav.reads==1 and nav.routes==['primary']
+    assert result.success and nav.reads==2 and nav.routes==['primary']
 
 
 def test_budget_exhaustion_never_launches_another_route(monkeypatch):
@@ -135,7 +135,7 @@ def test_known_page_change_invalidates_previous_verified_evidence(monkeypatch):
     def changed(deadline,stop_requested,**kw):
         nav.last_gate_reason='navigation_failed';clock.sleep(2);return False
     nav.wait_live_picture=changed
-    result=locate_target(nav,'900',target_kind='room_id',timeout_sec=100,max_attempts=1)
+    result=locate_target(nav,'900',target_kind='room_id',anchor_uid='123',timeout_sec=100,max_attempts=1)
     assert not result.success and result.status==IdentityStatus.UNCONFIRMED and result.evidence is None
 
 
@@ -145,9 +145,9 @@ def test_stuck_picture_stays_in_stage_and_ends_within_total_deadline(monkeypatch
     def stuck(deadline,stop_requested,**kw):
         nav.last_gate_reason='render_timeout';clock.sleep(deadline-clock.monotonic());return False
     nav.wait_live_picture=stuck
-    result=locate_target(nav,'900',target_kind='room_id',timeout_sec=150)
+    result=locate_target(nav,'900',target_kind='room_id',anchor_uid='123',timeout_sec=150)
     assert not result.success and result.reason=='render_timeout'
-    assert nav.reads==1 and nav.routes==['primary'] and clock.monotonic()<=1150
+    assert nav.reads==2 and nav.routes==['primary'] and clock.monotonic()<=1150
 
 
 def test_worker_cli_passes_configured_timeout_to_controller(monkeypatch,tmp_path):
@@ -160,7 +160,7 @@ def test_worker_cli_passes_configured_timeout_to_controller(monkeypatch,tmp_path
     monkeypatch.setattr(cli,'WorkerController',Controller)
     monkeypatch.setattr(cli.signal,'signal',lambda *a:None)
     assert cli.main(['--vmindex','2','--target','900','--output-dir',str(tmp_path),
-                     '--navigation-timeout','420'])==0
+                     '--navigation-timeout','420','--target-kind','room_id','--expected-anchor-uid','123'])==0
     assert configs[0].navigation_timeout_sec==420
 
 

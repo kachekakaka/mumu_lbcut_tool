@@ -108,7 +108,7 @@ def new_scheduler(env):
 def observe(env, values):
     env.clock.advance(2)
     for raw, status in values.items():
-        env.network.rooms[raw] = ResolvedRoom(raw, status, room_id='room-' + raw)
+        env.network.rooms[raw] = ResolvedRoom(raw, status, room_id=str(1000 + sum(map(ord, raw))), anchor_uid='900001')
     for target in env.store.rows("SELECT * FROM targets WHERE enabled=1"):
         if target['raw'] in env.network.rooms:
             observe_room(env.store, target['id'], env.network.rooms[target['raw']], env.clock())
@@ -241,7 +241,7 @@ def test_login_checks_end_without_waiting_for_periodic_scan(system,notice):
 def test_login_live_or_unknown_does_not_mean_offline(system, status):
     e = system
     target, job = start_one(e)
-    e.network.rooms['A'] = ResolvedRoom('A', status, room_id='room-A')
+    e.network.rooms['A'] = ResolvedRoom('A', status, room_id='1065', anchor_uid='900001')
     e.children[0].emit('stall_detected', reason='login_prompt_detected')
     e.scheduler.tick()
     e.scheduler.tick()
@@ -273,7 +273,7 @@ def test_login_late_result_cannot_override_current_state(system, change):
         with e.store.transaction() as db:
             db.execute('UPDATE targets SET enabled=0,control_revision=control_revision+1 WHERE id=?', (target,))
     elif change == 'newer_observation':
-        observe_room(e.store, target, ResolvedRoom('A', RoomStatus.LIVE, room_id='room-A'), e.clock())
+        observe_room(e.store, target, ResolvedRoom('A', RoomStatus.LIVE, room_id='1065', anchor_uid='900001'), e.clock())
     elif change == 'new_recovery':
         # 同一时钟刻度也必须区分两轮恢复，不能用到期时间当作身份。
         e.children[0].emit('stall_healed')
@@ -395,7 +395,7 @@ def test_invalid_target_needs_fix_until_record(system):
     # 下一场同样不自动开录。
     observe(e, {'A': RoomStatus.ENDED})
     observe(e, {'A': RoomStatus.ENDED})
-    e.network.rooms['A'] = ResolvedRoom('A', RoomStatus.LIVE, room_id='room-A-2')
+    e.network.rooms['A'] = ResolvedRoom('A', RoomStatus.LIVE, room_id='2065', anchor_uid='900001')
     e.clock.advance(2)
     observe_room(e.store, target, e.network.rooms['A'], e.clock())
     for _ in range(3):
@@ -630,7 +630,7 @@ def test_dynamic_instance_discovery_defaults_disabled_and_cleans_removed_ghost(t
 
         # 未启用任何实例时不派发录制任务
         target = store.add_target('A', now=clock())
-        network.rooms['A'] = ResolvedRoom('A', RoomStatus.LIVE, room_id='room-A')
+        network.rooms['A'] = ResolvedRoom('A', RoomStatus.LIVE, room_id='1065', anchor_uid='900001')
         observe_room(store, target, network.rooms['A'], clock())
         scheduler.tick()
         assert not children

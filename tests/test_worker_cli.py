@@ -67,7 +67,8 @@ def test_cli_parser_accepts_valid_parameters():
     parser = build_arg_parser()
     args = parser.parse_args([
         "--vmindex", "2",
-        "--target", "https://live.douyin.com/123456",
+        "--target", "7704666294802123554",
+        "--expected-anchor-uid", "900001",
         "--output-dir", "./output",
         "--segment-duration", "60",
         "--total-duration", "180"

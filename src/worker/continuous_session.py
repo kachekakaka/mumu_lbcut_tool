@@ -346,6 +346,7 @@ class ContinuousSession:
             if not landing.success:
                 if not self.device_online():
                     self.device_lost();return False
+                c._exit_code=c._landing_exit_code(landing.reason)
                 c._failure_reason=landing.reason;c._fatal_error=True;c.request_stop();return False
         self.bad_pages=0
         try:

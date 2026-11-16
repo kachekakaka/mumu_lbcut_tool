@@ -8,8 +8,8 @@ def test_worker_corrects_other_room_then_records(monkeypatch,tmp_path,valid_medi
     import src.worker.controller as cm
     h=build_worker(monkeypatch,tmp_path,valid_media,uid=None)
     seen=[]
-    observations=iter([RoomEvidence('999','wrong','其他主播','fresh_profile_intent'),
-                       RoomEvidence('7704666294802123554','900001','目标主播','fresh_profile_intent')])
+    observations=iter([RoomEvidence('999','456','其他主播','fresh_profile_intent')]*7+
+                      [RoomEvidence('7704666294802123554','900001','目标主播','fresh_profile_intent')]*2)
     monkeypatch.setattr(cm.WorkerNavigator,'observe_live_room',lambda self,**kw: next(observations))
     monkeypatch.setattr(cm.WorkerNavigator,'navigate_route',lambda self,t,w,route,d,stop: seen.append(route) or True)
     assert h.controller.run()==0
@@ -21,15 +21,15 @@ def test_worker_corrects_other_room_then_records(monkeypatch,tmp_path,valid_medi
                and e['observed_room_id']=='7704666294802123554' for e in h.events())
 
 
-def test_room_evidence_starts_real_control_flow_without_ui_uid_or_escape(monkeypatch,tmp_path,valid_media):
+def test_missing_observed_uid_blocks_real_control_flow(monkeypatch,tmp_path,valid_media):
     import src.worker.controller as cm
-    h=build_worker(monkeypatch,tmp_path,valid_media,uid=None,expected_uid=None)
+    h=build_worker(monkeypatch,tmp_path,valid_media,uid=None)
     monkeypatch.setattr(cm.WorkerNavigator,'observe_live_room',lambda self,**kw:
                         RoomEvidence(room_id='7704666294802123554',source='fresh_profile_intent'))
     assert h.controller.config.allow_unconfirmed_identity is False
-    assert h.controller.run()==0
-    assert_paired(h.events())
-    assert all(e['room_identity_status']=='verified' for e in h.events() if e['event']=='segment_finished')
+    assert h.controller.run()==18
+    assert not h.launched
+    assert not any(e['event']=='segment_finished' for e in h.events())
 
 
 def test_runtime_relocation_closes_capture_before_opening_profile(monkeypatch,tmp_path,valid_media):
@@ -43,13 +43,13 @@ def test_runtime_relocation_closes_capture_before_opening_profile(monkeypatch,tm
     monkeypatch.setattr(cm.WorkerNavigator,'observe_live_room',observe)
     posted=[False]
     def drift(now):
-        if now>=1001 and not posted[0]:
+        if any(p.alive for p in h.pipelines) and not posted[0]:
             posted[0]=True
             h.controller.action_dispatcher.post_action(PipelineAction(ActionType.IN_PLACE_HEAL,
                 h.controller.current_generation_id,'runtime_left_live_page'))
     h.clock.on_sleep=drift
     assert h.controller.run()==0
-    assert len(calls)==2 and h.launched==[1,2]
+    assert len(calls)==4 and h.launched==[1,2]
     terminals=assert_paired(h.events())
     assert [e['event'] for e in terminals]==['segment_aborted','segment_finished']
     assert len(h.controller._recovery_times)==1

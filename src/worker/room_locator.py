@@ -15,6 +15,7 @@ class RoomEvidence:
     source: str = "unavailable"
     activity_token: str | None = None
     observed_at: float = 0.0
+    returned_to_live: bool = True  # 可靠冲突即使返回失败也保留；成功匹配必须返回原直播任务。
 
 
 @dataclass(frozen=True)
@@ -60,7 +61,7 @@ def fresh_profile_evidence(before: str, after: str, live_task: str,
         if single('previous_page') != 'live' and single('extra_previous_page') != 'live':
             continue
         uid, room_id, anchor = single('uid'), single('room_id'), single('anchor_id')
-        if not uid or not room_id or not uid.isdigit() or not room_id.isdigit():
+        if not valid_identity_id(uid) or not valid_identity_id(room_id):
             continue
         if anchor is not None and anchor != uid:
             continue
@@ -87,14 +88,17 @@ def current_live_fragment_evidence(activity_top: str, current_activity: str | No
     for body in bundles:
         if 'live_backend_roomid=' not in body or 'is_LiveRoomFragment=true' not in body:
             continue
-        rooms = re.findall(r'live_backend_roomid=(\d+)', body)
-        uids = re.findall(r'live\.intent\.extra\.USER_ID=(\d+)', body)
-        room_args = re.findall(r'live\.intent\.extra\.ROOM_ID=(\d+)', body)
-        unique = re.findall(r'live\.intent\.extra\.EXTRA_ROOM_UNIQUE_KEY=(\d+)_\d+', body)
+        rooms = re.findall(r'live_backend_roomid=([^,\s}]+)', body)
+        uids = re.findall(r'live\.intent\.extra\.USER_ID=([^,\s}]+)', body)
+        room_args = re.findall(r'live\.intent\.extra\.ROOM_ID=([^,\s}]+)', body)
+        unique_values = re.findall(r'live\.intent\.extra\.EXTRA_ROOM_UNIQUE_KEY=([^,\s}]+)', body)
+        if any(not re.fullmatch(r'[0-9]+_[0-9]+', value) for value in unique_values):
+            return None
+        unique = [value.split('_')[0] for value in unique_values]
         if len(set(rooms)) != 1 or len(set(uids)) != 1:
             return None
         room_id, uid = rooms[0], uids[0]
-        if uid == '0' or not room_id.isdigit() or not uid.isdigit():
+        if not all(valid_identity_id(value) for value in rooms + uids + room_args + unique):
             return None
         if room_args and (len(set(room_args)) != 1 or room_args[0] != room_id):
             return None
@@ -109,17 +113,35 @@ def current_live_fragment_evidence(activity_top: str, current_activity: str | No
     return RoomEvidence(room_id, uid, None, 'live_fragment_arguments', token, time.time())
 
 
+def valid_identity_id(value) -> bool:
+    """同语义标识使用非零 ASCII 数字字符串，不进行浮点转换。"""
+    return isinstance(value, str) and bool(re.fullmatch(r'[0-9]+', value)) and bool(value.strip('0'))
+
+
+def validate_expected_identity(target, target_kind, anchor_uid, allow_unconfirmed=False):
+    internal = target_kind == 'room_id' or (target_kind == 'auto' and bool(re.fullmatch(r'[0-9]{19}', target)))
+    if internal and not valid_identity_id(target):
+        raise ValueError('预期 room_id 必须为非零数字字符串')
+    if anchor_uid is not None and not valid_identity_id(anchor_uid):
+        raise ValueError('预期主播 UID 必须为非零数字字符串')
+    if not allow_unconfirmed and (not internal or not valid_identity_id(anchor_uid)):
+        raise ValueError('默认身份核验需要内部 room_id 和 --expected-anchor-uid；缺项仅可显式允许未确认身份')
+
+
 def compare_evidence(evidence: RoomEvidence, room_id: str | None,
                      anchor_uid: str | None) -> IdentityStatus:
     """比较同类稳定标识；昵称只展示，不用同名文本替代身份匹配。"""
     pairs = [(room_id, evidence.room_id), (anchor_uid, evidence.anchor_uid)]
-    comparable = [(str(a), str(b)) for a,b in pairs if a and b]
+    comparable = [(a, b) for a,b in pairs if valid_identity_id(a) and valid_identity_id(b)]
     if any(a != b for a,b in comparable):
         return IdentityStatus.MISMATCH
-    return IdentityStatus.VERIFIED if comparable else IdentityStatus.UNCONFIRMED
+    return IdentityStatus.VERIFIED if len(comparable) == 2 and evidence.returned_to_live else IdentityStatus.UNCONFIRMED
 
 
 DEFAULT_NAVIGATION_TIMEOUT_SEC = 300.0
+IDENTITY_INTERVAL_SEC = 1.0
+IDENTITY_GRACE_SEC = 5.0
+IDENTITY_TIMEOUT_SEC = 60.0
 
 
 def validate_navigation_timeout(value: float) -> None:
@@ -151,6 +173,7 @@ def locate_target(navigator, target: str, *, target_kind: str = 'auto',
     expected_room = target if internal else None
     last_reason, last_status, last_evidence = 'navigation_failed', IdentityStatus.UNCONFIRMED, None
     attempted, phase, route = 0, 'navigation', ''
+    unresolved_conflict = False
 
     def emit(action, reason='', evidence=None, stage_deadline=None):
         now = time.monotonic()
@@ -168,12 +191,17 @@ def locate_target(navigator, target: str, *, target_kind: str = 'auto',
         return not stop_requested()
 
     def finish(success, reason):
+        if not success and unresolved_conflict and reason not in {'cancelled', 'login_blocked', 'device_unavailable', 'id_mismatch'}:
+            reason = 'identity_conflict_unresolved'
         if stop_requested():
             success, reason = False, 'cancelled'
         return LandingResult(success, reason, last_status, last_evidence, attempted)
 
-    def device_lost():
+    def device_lost(stage_deadline=None):
         # 探测失败多数只是页面慢；只有 adb 确认实例掉线才提前结束，交给上层换实例，不耗尽整段预算。
+        # device_online 最多执行 3 秒状态查询＋5 秒重连，余额不足时不能突破阶段截止时间。
+        if (stage_deadline or deadline) - time.monotonic() < 8:
+            return False
         if stop_requested() or navigator.device_online():
             return False
         emit('device_lost', 'device_unavailable')
@@ -212,30 +240,73 @@ def locate_target(navigator, target: str, *, target_kind: str = 'auto',
             continue
 
         phase = 'identity'
-        # 单次取证最多60秒，包含返回自己打开的资料页的清理；不是拿走所有总预算。
-        for read_attempt in range(2):
+        identity_started = time.monotonic()
+        identity_deadline = min(preparation_deadline, identity_started + IDENTITY_TIMEOUT_SEC)
+        matches, conflicts, conflict_key, read_attempt = 0, 0, None, 0
+        last_reason = 'identity_unstable'
+        while identity_deadline - time.monotonic() >= 2:
             if stop_requested():
                 return finish(False, 'cancelled')
-            if preparation_deadline-time.monotonic() < 12:
-                last_reason = 'room_evidence_unavailable'
+            remaining = identity_deadline - time.monotonic()
+            budget = remaining if matches else (remaining - IDENTITY_INTERVAL_SEC) / 2
+            if budget < 2:
                 break
-            until = min(preparation_deadline, time.monotonic()+60)
+            until = time.monotonic() + budget
             emit('observe' if read_attempt == 0 else 'retry_observation',
                  'read_current_room' if read_attempt == 0 else 'wait_current_page', stage_deadline=until)
+            observation_started = time.monotonic()
             last_evidence = navigator.observe_live_room(deadline=until, stop_requested=stop_requested)
-            last_status = compare_evidence(last_evidence, expected_room, anchor_uid)
-            if last_status != IdentityStatus.UNCONFIRMED:
+            if last_evidence.source == 'login_blocked':
+                return finish(False, 'login_blocked')
+            if last_evidence.source == 'page_changed':
+                last_status, last_evidence = IdentityStatus.UNCONFIRMED, None
+                last_reason = 'navigation_failed'
                 break
-            if read_attempt == 0 and not pause(1.0, preparation_deadline):
+            candidate = compare_evidence(last_evidence, expected_room, anchor_uid)
+            read_attempt += 1
+            last_status = IdentityStatus.UNCONFIRMED
+            if candidate == IdentityStatus.MISMATCH:
+                unresolved_conflict = True
+                matches = 0
+                key = (last_evidence.room_id, last_evidence.anchor_uid)
+                if observation_started >= identity_started + IDENTITY_GRACE_SEC:
+                    conflicts = conflicts + 1 if key == conflict_key else 1
+                else:
+                    conflicts = 0
+                conflict_key = key
+                last_reason = 'identity_conflict_unresolved'
+                if conflicts >= 2:
+                    last_status = IdentityStatus.MISMATCH
+                    break
+            elif candidate == IdentityStatus.VERIFIED and time.monotonic() <= until:
+                matches += 1
+                conflicts, conflict_key = 0, None
+                last_reason = 'identity_conflict_unresolved' if unresolved_conflict else 'identity_unstable'
+                if matches >= 2:
+                    last_status = IdentityStatus.VERIFIED
+                    unresolved_conflict = False
+                    break
+            else:
+                matches, conflicts, conflict_key = 0, 0, None
+                last_reason = 'identity_conflict_unresolved' if unresolved_conflict else 'room_evidence_unavailable'
+                if device_lost(identity_deadline):
+                    return finish(False, 'device_unavailable')
+            emit('identity_sample', last_reason, last_evidence, identity_deadline)
+            if not pause(IDENTITY_INTERVAL_SEC, identity_deadline):
                 return finish(False, 'cancelled')
+            if time.monotonic() >= identity_deadline:
+                break
         if stop_requested():
             return finish(False, 'cancelled')
         if last_status == IdentityStatus.MISMATCH:
             last_reason = 'id_mismatch'
             emit('correct_wrong_room', last_reason, last_evidence)
             continue
-        if last_status == IdentityStatus.UNCONFIRMED and not allow_unconfirmed:
-            last_reason = 'room_evidence_unavailable'
+        if last_reason == 'navigation_failed':
+            continue
+        if last_status == IdentityStatus.UNCONFIRMED and (not allow_unconfirmed or unresolved_conflict):
+            if unresolved_conflict:
+                last_reason = 'identity_conflict_unresolved'
             emit('retry', last_reason, last_evidence)
             continue
 

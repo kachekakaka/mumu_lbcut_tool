@@ -66,7 +66,7 @@ def test_media_failure_does_not_start_device(monkeypatch, tmp_path):
     monkeypatch.setattr(module, 'DependencyManager', lambda: dependency)
     device = Mock()
     monkeypatch.setattr(module, 'MuMuClient', device)
-    config = WorkerConfig(vmindex=321, target='123', output_dir=tmp_path/'out', lock_dir=tmp_path/'locks')
+    config = WorkerConfig(vmindex=321, target='123', target_kind='room_id', expected_anchor_uid='456', output_dir=tmp_path/'out', lock_dir=tmp_path/'locks')
     worker = WorkerController(config, WorkerEventEmitter(io.StringIO()))
     assert worker.run() != 0
     device.assert_not_called()

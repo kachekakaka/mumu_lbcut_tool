@@ -51,7 +51,7 @@ def test_expected_identity_is_not_filled_from_room_id(monkeypatch, tmp_path, val
 
 
 def test_strict_identity_without_evidence_is_blocked(monkeypatch, tmp_path, valid_media):
-    h = build_worker(monkeypatch, tmp_path, valid_media, uid=None, expected_uid=None)
+    h = build_worker(monkeypatch, tmp_path, valid_media, uid=None)
     assert h.controller.run() == 18
     assert not h.launched
 

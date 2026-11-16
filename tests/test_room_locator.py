@@ -2,6 +2,16 @@
 from src.worker.room_locator import RoomEvidence, fresh_profile_evidence, current_live_fragment_evidence, compare_evidence, locate_target
 from src.worker.identity_verifier import IdentityStatus
 from src.worker.navigator import WorkerNavigator
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def virtual_clock(monkeypatch):
+    from test_navigation_budget import Clock
+    import src.worker.room_locator as module
+    clock = Clock()
+    monkeypatch.setattr(module, 'time', clock)
+    return clock
 
 
 def dump(token='new', task='41', uid='123', room='900', previous='live'):
@@ -73,17 +83,18 @@ class NavigationFixture:
     online=True
     def device_online(self): return self.online
     def __init__(self, observations, pages=None):
+        self.last_observation = observations[-1] if observations else RoomEvidence()
         self.observations = iter(observations); self.pages=iter(pages or [True]*10)
         self.routes=[]; self.reads=0; self.ready_checks=0
     def navigate_route(self,target,web,route,deadline,stop_requested):
         self.routes.append(route); return True
     def wait_live_page(self,**kwargs): return next(self.pages)
-    def observe_live_room(self,**kwargs): self.reads+=1; return next(self.observations)
+    def observe_live_room(self,**kwargs): self.reads+=1; return next(self.observations, self.last_observation)
     def wait_live_picture(self,**kwargs): self.ready_checks+=1; return True
 
 
 def test_wrong_room_is_corrected_instead_of_only_rejected():
-    nav=NavigationFixture([RoomEvidence('901','124'),RoomEvidence('900','123')])
+    nav=NavigationFixture([RoomEvidence('901','124')]*7+[RoomEvidence('900','123')]*2)
     steps=[]
     result=locate_target(nav,'900',target_kind='room_id',web_rid='88',anchor_uid='123',on_step=lambda **kw: steps.append(kw))
     assert result.success and result.attempts==2
@@ -94,14 +105,14 @@ def test_wrong_room_is_corrected_instead_of_only_rejected():
 
 def test_intent_accepted_but_home_page_changes_route():
     nav=NavigationFixture([RoomEvidence('900','123')],pages=[False,True])
-    result=locate_target(nav,'900',target_kind='room_id',web_rid='88')
+    result=locate_target(nav,'900',target_kind='room_id',web_rid='88',anchor_uid='123')
     assert result.success and nav.routes==['primary','web']
 
 
-def test_unavailable_uid_uses_fresh_room_proof_not_escape_flag():
+def test_unavailable_uid_does_not_upgrade_single_room_proof():
     nav=NavigationFixture([RoomEvidence(room_id='900',source='fresh_profile_intent')])
     result=locate_target(nav,'900',target_kind='room_id')
-    assert result.success and result.status==IdentityStatus.VERIFIED
+    assert not result.success and result.status==IdentityStatus.UNCONFIRMED
 
 
 def test_no_evidence_tries_all_routes_then_reports_real_reason():
@@ -109,7 +120,7 @@ def test_no_evidence_tries_all_routes_then_reports_real_reason():
     result=locate_target(nav,'900',target_kind='room_id',web_rid='88')
     assert not result.success and result.reason=='room_evidence_unavailable'
     assert nav.routes==['primary','web','reset']
-    assert nav.reads==6
+    assert nav.reads>6
 
 
 def test_stop_prevents_navigation_and_recording():
@@ -233,7 +244,7 @@ def test_live_page_settles_before_repeating_navigation():
     nav=NavigationFixture([RoomEvidence(),RoomEvidence('900','123')])
     result=locate_target(nav,'900',target_kind='room_id',anchor_uid='123')
     assert result.success and result.attempts==1
-    assert nav.routes==['primary'] and nav.reads==2
+    assert nav.routes==['primary'] and nav.reads==3
 
 
 def test_actual_header_entry_excludes_chat_user_and_follow_control():
@@ -251,7 +262,7 @@ def test_actual_header_entry_excludes_chat_user_and_follow_control():
 def test_first_navigate_event_has_no_failure_reason_and_retry_carries_previous_one():
     nav=NavigationFixture([RoomEvidence('900','123')],pages=[False,True])
     steps=[]
-    locate_target(nav,'900',target_kind='room_id',web_rid='88',on_step=lambda **kw: steps.append(kw))
+    locate_target(nav,'900',target_kind='room_id',web_rid='88',anchor_uid='123',on_step=lambda **kw: steps.append(kw))
     navigates=[s['reason'] for s in steps if s['action']=='navigate']
     assert navigates[0]==''
     assert navigates[1]=='navigation_failed'  # 来自 wait_live_page 失败时的 last_gate_reason

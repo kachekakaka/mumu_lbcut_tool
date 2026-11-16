@@ -14,6 +14,7 @@ def test_preflight_gate_unresolved_short_link_rejected(capsys):
     config = WorkerConfig(
         vmindex=0,
         target="https://v.douyin.com/iANgXXXX/",
+        allow_unconfirmed_identity=True,  # 本用例验证输入清洗；双标识配置校验另测。
         output_dir=MagicMock(),
     )
     controller = WorkerController(config=config)

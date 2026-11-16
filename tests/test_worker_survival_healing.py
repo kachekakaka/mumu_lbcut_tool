@@ -7,7 +7,7 @@ from src.worker.events import WorkerEventEmitter
 
 
 def make_controller(tmp_path):
-    return WorkerController(WorkerConfig(0, '123', tmp_path), WorkerEventEmitter(io.StringIO()))
+    return WorkerController(WorkerConfig(0, '123', tmp_path, target_kind='room_id', expected_anchor_uid='456'), WorkerEventEmitter(io.StringIO()))
 
 
 def test_rolling_window_blocks_third_immediate_recovery(tmp_path):

@@ -30,9 +30,9 @@ def test_unknown_then_live_must_not_start_duplicate(tmp_path):
         target = store.add_target('123')
         ids = []
         for n, status in enumerate((RoomStatus.LIVE, RoomStatus.UNKNOWN, RoomStatus.LIVE)):
-            observe_room(store, target, ResolvedRoom('123', status), 10 + n * 2)
+            observe_room(store, target, ResolvedRoom('123', status, room_id='900', anchor_uid='456'), 10 + n * 2)
             ids.append(store.create_pending(target, 10 + n * 2))
-        assert len(set(ids)) == 1
+        assert all(ids) and len(set(ids)) == 1
     finally:
         store.close()
 

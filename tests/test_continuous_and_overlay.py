@@ -15,10 +15,10 @@ from src.mvp.dep_manager import MediaTools
 
 def test_no_blind_background_tap_in_identity_cleanup():
     import inspect
-    source=inspect.getsource(WorkerNavigator.observe_live_room)
+    source=inspect.getsource(WorkerNavigator._observe_live_room)
     assert "int(frame.shape[0]*.2)" not in source
     assert "int(h*.25)" not in source
-    assert 'dismiss_live_overlay' in source
+    assert "'input','tap'" not in source.split('finally:')[1]
 
 
 def test_overlay_back_rechecks_and_does_not_leave_clean_live(monkeypatch):

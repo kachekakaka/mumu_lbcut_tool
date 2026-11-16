@@ -15,7 +15,7 @@ def test_local_worker_does_not_request_network(monkeypatch, tmp_path, valid_medi
 
 def test_stop_request_closes_active_recording(monkeypatch, tmp_path, valid_media):
     h = build_worker(monkeypatch, tmp_path, valid_media, total=0, segment=20)
-    h.clock.on_sleep = lambda now: h.controller.request_stop() if now >= 1001 else None
+    h.clock.on_sleep = lambda now: h.controller.request_stop() if any(p.alive for p in h.pipelines) else None
     assert h.controller.run() == 0
     terminals = assert_paired(h.events())
     assert terminals[-1]['is_final']

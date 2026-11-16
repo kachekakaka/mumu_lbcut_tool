@@ -117,10 +117,10 @@ def test_manual_query_late_after_control_does_not_reopen(system, mutation):
         command(e, 'remove', target)
         command(e, 'add', '', dict(targets=['A'], manual_only=True, allow_unconfirmed_identity=False))
     elif mutation == 'stop_target':
-        command(e, mutation, target, {'session_key': 'room:room-A'})
+        command(e, mutation, target, {'session_key': 'room:1065'})
     else:
         command(e, mutation, target, {'auto_record': False})
-    queries.calls[0][2].set_result(QueryResult(ResolvedRoom('A', RoomStatus.LIVE, room_id='room-A')))
+    queries.calls[0][2].set_result(QueryResult(ResolvedRoom('A', RoomStatus.LIVE, room_id='1065', anchor_uid='900001')))
     e.scheduler.tick()
     assert result(e, key)['error_code'] == 'target_changed'
     assert not e.store.active_job(target)
@@ -134,14 +134,14 @@ def test_old_scan_cannot_overwrite_new_manual_session(system):
     t = row(e, 'SELECT * FROM targets WHERE id=?', target)
     assert e.scheduler.observations.dispatch('scan', t)
     key = command(e, 'record', target)
-    queries.calls[1][2].set_result(QueryResult(ResolvedRoom('A', RoomStatus.LIVE, room_id='B')))
+    queries.calls[1][2].set_result(QueryResult(ResolvedRoom('A', RoomStatus.LIVE, room_id='2065', anchor_uid='900001')))
     e.scheduler.tick()
     assert result(e, key)['status'] == 'succeeded'
-    queries.calls[0][2].set_result(QueryResult(ResolvedRoom('A', RoomStatus.LIVE, room_id='room-A')))
+    queries.calls[0][2].set_result(QueryResult(ResolvedRoom('A', RoomStatus.LIVE, room_id='1065', anchor_uid='900001')))
     e.scheduler.tick()
     t = row(e, 'SELECT * FROM targets WHERE id=?', target)
-    assert t['session_key'] == t['record_session_key'] == 'room:B'
-    assert e.store.active_job(target)['session_key'] == 'room:B'
+    assert t['session_key'] == t['record_session_key'] == 'room:2065'
+    assert e.store.active_job(target)['session_key'] == 'room:2065'
 
 
 def test_superseded_verify_retries_and_unknown_blocks_old_live(system):
@@ -155,12 +155,12 @@ def test_superseded_verify_retries_and_unknown_blocks_old_live(system):
     e.scheduler.observations.dispatch('scan', t)
     queries.calls[1][2].set_result(QueryResult(ResolvedRoom('A', RoomStatus.UNKNOWN)))
     e.scheduler.tick()
-    first_verify.set_result(QueryResult(ResolvedRoom('A', RoomStatus.LIVE, room_id='room-A')))
+    first_verify.set_result(QueryResult(ResolvedRoom('A', RoomStatus.LIVE, room_id='1065', anchor_uid='900001')))
     e.scheduler.tick()
     assert not e.children
     assert row(e, 'SELECT observed_status FROM targets WHERE id=?', target)['observed_status'] == 'unknown'
     assert len(queries.calls) == 3 and queries.calls[2][0] == 'verify'
-    queries.calls[2][2].set_result(QueryResult(ResolvedRoom('A', RoomStatus.LIVE, room_id='room-A')))
+    queries.calls[2][2].set_result(QueryResult(ResolvedRoom('A', RoomStatus.LIVE, room_id='1065', anchor_uid='900001')))
     pump(e, lambda: len(e.children) == 1)
 
 
@@ -197,14 +197,14 @@ def test_target_stop_session_recheck_and_reconcile_intent(system):
     e = system
     target, job = start_one(e)
     key = e.store.enqueue_command('stop_target', target, payload={'session_key': job['session_key']})
-    observe_room(e.store, target, ResolvedRoom('A', RoomStatus.LIVE, room_id='B'), e.clock() + 2)
+    observe_room(e.store, target, ResolvedRoom('A', RoomStatus.LIVE, room_id='2065', anchor_uid='900001'), e.clock() + 2)
     e.scheduler._commands()
     assert result(e, key)['error_code'] == 'session_changed'
     assert row(e, 'SELECT suppressed_session FROM targets WHERE id=?', target)['suppressed_session'] is None
     with e.store.transaction() as db:
-        db.execute("UPDATE jobs SET status='needs_reconcile',session_key='room:B' WHERE id=?", (job['id'],))
+        db.execute("UPDATE jobs SET status='needs_reconcile',session_key='room:2065' WHERE id=?", (job['id'],))
         db.execute("UPDATE targets SET record_session_key=session_key WHERE id=?", (target,))
-    key = command(e, 'stop_target', target, {'session_key': 'room:B'})
+    key = command(e, 'stop_target', target, {'session_key': 'room:2065'})
     assert json.loads(result(e, key)['result_json'])['reconcile_job_ids'] == [job['id']]
     assert e.children[0].alive
 

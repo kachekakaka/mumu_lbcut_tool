@@ -94,7 +94,7 @@ def test_identity_mismatch_after_startup_rejection_still_blocks(monkeypatch,tmp_
     h=build_worker(monkeypatch,tmp_path,valid_media,total=1)
     def surface(nav,**kw):
         from src.worker.room_locator import RoomEvidence
-        monkeypatch.setattr(h.navigator_type,'observe_live_room',lambda *a,**kw:RoomEvidence(anchor_uid='wrong'))
+        monkeypatch.setattr(h.navigator_type,'observe_live_room',lambda *a,**kw:RoomEvidence(anchor_uid='456'))
         return {'activity':'com.ss.android.ugc.aweme.DYLoginActivity','ui_available':True}
     monkeypatch.setattr(h.navigator_type,'inspect_live_surface',surface)
     assert h.controller.run()==18

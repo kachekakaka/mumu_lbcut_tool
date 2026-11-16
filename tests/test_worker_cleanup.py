@@ -51,7 +51,7 @@ def test_cleanup_after_sealing_and_before_unlock(monkeypatch, tmp_path, valid_me
 @pytest.mark.parametrize('reason', ['manual_stop', 'anchor_offline', 'scheduler_shutdown', 'event_stream_lost'])
 def test_requested_stop_closes_app_after_tail(monkeypatch, tmp_path, valid_media, reason):
     h = build_worker(monkeypatch, tmp_path, valid_media, total=6)
-    h.clock.on_sleep = lambda now: h.controller.request_stop(reason) if now >= 1001 else None
+    h.clock.on_sleep = lambda now: h.controller.request_stop(reason) if any(p.alive for p in h.pipelines) else None
     assert h.controller.run() == 0
     assert len(h.adb_calls) == 1 and h.adb_calls[0]['pipelines_stopped']
     assert all(e['event'] == 'segment_finished' for e in assert_paired(h.adb_calls[0]['events']))
@@ -91,6 +91,8 @@ def test_cleanup_resource_error_still_closes_app_and_unlocks(monkeypatch, tmp_pa
                      watchdog_factory=FailingWatchdog if stage == 'watchdog' else PassiveWatchdog)
     if stage == 'pipeline':
         def inject(now):
+            if not h.pipelines:
+                return
             pipe = h.pipelines[0]
             def teardown():
                 pipe.stop()

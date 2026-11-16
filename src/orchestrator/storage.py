@@ -10,6 +10,18 @@ import time
 import uuid
 
 from src.mvp.room_resolver import ResolvedRoom
+from src.worker.room_locator import valid_identity_id
+
+
+def identity_admission(target, now, freshness_sec=60):
+    """准入只用同一次最近观测；不改变在播与场次事实。"""
+    if target['observed_status'] != 'live':
+        return 'prelaunch_not_confirmed_live'
+    if not valid_identity_id(target['room_id']) or not valid_identity_id(target['anchor_uid']):
+        return 'target_identity_incomplete'
+    if now - target['observed_at'] > freshness_sec:
+        return 'target_identity_stale'
+    return None
 
 ACTIVE = ("pending", "starting", "running", "stopping", "needs_reconcile")
 NEEDS_FIX = "needs_fix: "          # 目标无效，直到显式 record 查询确认 LIVE 后解除
@@ -223,14 +235,14 @@ class Store:
                 db.execute("UPDATE targets SET ended_count=0,ended_since=0 WHERE id=?", (target_id,))
                 return
             if value == "live":
-                room_id = room.room_id or room.web_rid
-                new_session = t["trusted_status"] != "live" or (room_id and t["room_id"] and room_id != t["room_id"])
-                session = ("room:" + str(room_id)) if room_id else ("live:" + uuid.uuid4().hex)
-                if not new_session and t["session_key"]:
-                    session = t["session_key"]
+                room_id = room.room_id if valid_identity_id(room.room_id) else None
+                uid = getattr(room, 'anchor_uid', None)
+                uid = uid if valid_identity_id(uid) else None
+                session = ('room:' + room_id) if room_id else (t['session_key'] if t['trusted_status'] == 'live' else None)
+                new_session = bool(room_id) and (t['trusted_status'] != 'live' or session != t['session_key'])
                 db.execute("""UPDATE targets SET trusted_status='live',confirmed_at=?,room_id=?,anchor_uid=?,nickname=?,
                     session_key=?,ended_count=0,ended_since=0 WHERE id=?""",
-                    (now, room_id, getattr(room, "anchor_uid", None), room.nickname, session, target_id))
+                    (now, room_id, uid, room.nickname, session, target_id))
                 if new_session:
                     db.execute("UPDATE targets SET record_session_key=NULL,suppressed_session=NULL,attempts=0,retry_at=0,control_revision=control_revision+1 WHERE id=?", (target_id,))
             else:
@@ -319,15 +331,15 @@ class Store:
                         (observed_at, index),
                     )
 
-    def claim_boot(self, now: float) -> int | None:
+    def claim_boot(self, now: float, freshness_sec=60) -> int | None:
         """存在可派发排队任务且无可用空闲槽位时，按顺序认领 1 台未开机已启用实例进入 booting。"""
         with self.transaction() as db:
             pending = db.execute(
-                "SELECT 1 FROM jobs j JOIN targets t ON t.id=j.target_id "
-                "WHERE j.status='pending' AND t.observed_status='live' AND t.retry_at<=? LIMIT 1",
+                "SELECT t.* FROM jobs j JOIN targets t ON t.id=j.target_id "
+                "WHERE j.status='pending' AND t.enabled=1 AND t.session_key=j.session_key AND t.retry_at<=?",
                 (now,),
-            ).fetchone()
-            if not pending:
+            ).fetchall()
+            if not any(identity_admission(t, now, freshness_sec) is None for t in pending):
                 return None
             if db.execute("SELECT 1 FROM instances WHERE enabled=1 AND status='idle' AND job_id IS NULL LIMIT 1").fetchone():
                 return None

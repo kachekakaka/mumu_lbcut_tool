@@ -17,7 +17,7 @@ def test_log_file_receives_worker_logs_and_handler_is_removed(tmp_path, caplog):
     with patch('src.worker.cli.WorkerController') as ctrl_cls:
         ctrl_cls.return_value.run.side_effect = run
         assert cli_main(['--vmindex', '2', '--target', '12345', '--output-dir', str(tmp_path / 'out'),
-                         '--log-file', str(log_path)]) == 0
+                         '--log-file', str(log_path), '--target-kind', 'room_id', '--expected-anchor-uid', '456']) == 0
     assert root.handlers == before
     content = log_path.read_text(encoding='utf-8')
     assert '[INFO] (Worker) 切片封口完成 seg_001' in content

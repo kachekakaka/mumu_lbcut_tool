@@ -1,5 +1,6 @@
 """抖音直播间 Intent 导航与原地刷新控制器。"""
 from pathlib import Path
+from dataclasses import replace
 import logging
 import subprocess
 import time
@@ -402,6 +403,11 @@ class WorkerNavigator:
         return int(w * .14), int(h * .335)
 
     def observe_live_room(self, deadline, stop_requested):
+        self._observation_returned_to_live = True
+        evidence = self._observe_live_room(deadline, stop_requested)
+        return replace(evidence, returned_to_live=self._observation_returned_to_live)
+
+    def _observe_live_room(self, deadline, stop_requested):
         """优先从当前 LivePlayFragment 直接读取场次 UID/room_id，失败才走资料页回退。
 
         快速路径只读取当前 LivePlayActivity 的 Fragment mArguments，不查询公网，
@@ -414,18 +420,22 @@ class WorkerNavigator:
         self._operation_deadline = operation_deadline
         card_open = False
         profile_open = False
-        entry_clicked = False
         fast_identity = False
+        live_task = None
         frame = None
         try:
             if stop_requested():
                 return RoomEvidence(source='cancelled')
             current_activity = self.get_current_focus_activity() or ''
             if 'LivePlayActivity' not in current_activity:
-                return RoomEvidence()
+                return RoomEvidence(source='login_blocked' if 'login' in current_activity.lower() else 'page_changed' if current_activity else 'page_probe_unavailable')
             # 先读取当前 Activity 顶部 Fragment 参数；成功时完全跳过 UIAutomator 和头像点击。
             # 直播页刚打开时参数可能尚未就绪，先短暂重读，避免过早落入耗时且需点击的资料卡取证。
             for fast_try in range(FAST_IDENTITY_TRIES):
+                if getattr(self, '_profile_entry_clicked_generation', None) == getattr(self, '_navigation_generation', 0):
+                    break  # 已点击的资料卡先处理完，不用其背后的 Fragment 跳过返回确认。
+                if stop_requested() or time.monotonic() >= operation_deadline:
+                    return RoomEvidence(source='observation_budget_exhausted')
                 activity_top = self._adb('shell', 'dumpsys', 'activity', 'top',
                                          timeout=min(8.0, max(1.0, operation_deadline-time.monotonic())))
                 fast_evidence = current_live_fragment_evidence(activity_top, current_activity)
@@ -441,7 +451,8 @@ class WorkerNavigator:
                         return RoomEvidence(source='cancelled')
                     current_activity = self.get_current_focus_activity() or ''
                     if 'LivePlayActivity' not in current_activity:
-                        return RoomEvidence()
+                        return RoomEvidence(source='login_blocked' if 'login' in current_activity.lower() else 'page_changed' if current_activity else 'page_probe_unavailable')
+            self._observation_returned_to_live = False
             frame = self._capture_frame_array()
             if frame is None:
                 return RoomEvidence(source='screenshot_unavailable')
@@ -475,7 +486,6 @@ class WorkerNavigator:
                 # 当前直播布局的主播入口是顶部 user_name；没有 XML 时仅用已验证竖屏头像坐标。
                 generation = getattr(self, '_navigation_generation', 0)
                 already_clicked = getattr(self, '_profile_entry_clicked_generation', None) == generation
-                entry_clicked = already_clicked
                 if not already_clicked:
                     point = self._anchor_entry_point(tree, w, h) if tree is not None else None
                     if point is None:
@@ -483,7 +493,6 @@ class WorkerNavigator:
                         point = (int(w*.0833), int(h*.079))
                     self._adb('shell','input','tap',str(point[0]),str(point[1]))
                     self._profile_entry_clicked_generation = generation
-                    entry_clicked = True
                     # 网络慢或直播页刚完成冷启动时，资料卡动画可能晚于入口点击；
                     # 多等一小段再截图确认，不重复点击入口。
                     if not self._navigation_sleep(2.5, operation_deadline, stop_requested):
@@ -505,6 +514,7 @@ class WorkerNavigator:
             )
             if not active:
                 return RoomEvidence()
+            live_task = active.group(1)
             self._adb('shell', 'input', 'tap', str(avatar_point[0]), str(avatar_point[1]))
             profile_open = True
             until = min(operation_deadline, time.monotonic()+12)
@@ -521,22 +531,33 @@ class WorkerNavigator:
         finally:
             cleanup_deadline = min(deadline, time.monotonic()+10.0)
             self._operation_deadline = cleanup_deadline
-            if profile_open:
-                for _ in range(3):
-                    act = self.get_current_focus_activity() or ''
-                    if 'UserProfileActivity' in act or 'login' in act.lower():
-                        self._adb('shell','input','keyevent','4')
-                        self._navigation_sleep(.3, cleanup_deadline, lambda: False)
-                    else:
-                        break
-            elif card_open:
-                self._adb('shell','input','keyevent','4')
-            if not fast_identity and 'LivePlayActivity' in (self.get_current_focus_activity() or ''):
-                preserve_pending_profile = entry_clicked and not profile_open
-                # 入口已点击但尚未确认资料卡时，保留当前直播页给下一轮只读复检，不发送 Back。
-                if not preserve_pending_profile and not profile_open:
-                    self.dismiss_live_overlay(cleanup_deadline, lambda: False)
-            self._operation_deadline = old
+            try:
+                if profile_open:
+                    for _ in range(3):
+                        if stop_requested() or time.monotonic() >= cleanup_deadline:
+                            break
+                        act = self.get_current_focus_activity() or ''
+                        if 'UserProfileActivity' in act or 'login' in act.lower():
+                            self._adb('shell','input','keyevent','4')
+                            self._navigation_sleep(.3, cleanup_deadline, stop_requested)
+                        else:
+                            break
+                elif card_open and not stop_requested():
+                    self._adb('shell','input','keyevent','4')
+                if (not fast_identity and (profile_open or card_open) and live_task
+                        and not stop_requested() and time.monotonic() < cleanup_deadline):
+                    returned = self._adb('shell', 'dumpsys', 'activity', 'activities')
+                    active = re.search(
+                        r'(?:topResumedActivity|mResumedActivity|ResumedActivity).*?ActivityRecord\{.*?\s+u\d+\s+[^ ]*LivePlayActivity\s+t(\d+)', returned)
+                    if active and active.group(1) == live_task:
+                        self._observation_returned_to_live = True
+                        self._profile_entry_clicked_generation = None
+                # 未确认资料卡出现时保留点击标记，不连点、不盲目 Back。
+            except Exception as exc:
+                self._observation_returned_to_live = False
+                logger.warning('资料页返回未确认，保留本轮身份观察：%s', exc)
+            finally:
+                self._operation_deadline = old
 
     def wait_live_picture(self, deadline, stop_requested, *, check_overlay=True,
                           return_from_profile=False):

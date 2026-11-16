@@ -7,7 +7,7 @@ import signal
 import sys
 
 from src.worker.controller import WorkerConfig, WorkerController
-from src.worker.room_locator import validate_navigation_timeout
+from src.worker.room_locator import validate_navigation_timeout, validate_expected_identity
 
 # 日志输出至 stderr，确保 stdout 仅有纯净的 NDJSON 事件流
 logging.basicConfig(
@@ -23,7 +23,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     """构建 Worker 命令行参数解析器。"""
     parser = argparse.ArgumentParser(description="抖音独立录播 Worker (执行单元)")
     parser.add_argument("--vmindex", type=int, required=True, help="绑定的 MuMu 模拟器实例索引 (如 2)")
-    parser.add_argument("--target", type=str, required=True, help="直播间标识 (分享口令/短链/网页URL/web_rid)")
+    parser.add_argument("--target", type=str, required=True, help="默认传入独立查询得到的内部 room_id；网页入口仅用于显式未确认模式")
     parser.add_argument("--output-dir", type=str, required=True, help="切片录像保存目录")
     parser.add_argument(
         "--segment-duration", "--segment",
@@ -47,7 +47,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--allow-unconfirmed-identity",
         action="store_true",
         default=False,
-        help="逃逸开关：当主播身份处于无法确认状态时允许临时录制（确诊错房仍强制阻断）"
+        help="显式允许有界复核后身份未确认的录制；任何未解决的可靠冲突仍阻断"
     )
     parser.add_argument(
         "--background",
@@ -92,6 +92,8 @@ def validate_args(args: argparse.Namespace) -> None:
     errors = []
     try:
         validate_navigation_timeout(args.navigation_timeout)
+        validate_expected_identity(args.target, args.target_kind, args.expected_anchor_uid,
+                                   args.allow_unconfirmed_identity)
     except ValueError as exc:
         errors.append(str(exc))
 

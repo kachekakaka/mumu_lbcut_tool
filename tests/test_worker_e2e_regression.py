@@ -138,8 +138,10 @@ class TestWorkerE2ERegression(unittest.TestCase):
             cfg = WorkerConfig(vmindex=321,target='88888',target_kind='room_id',
                 expected_anchor_uid='11111',output_dir=Path(tmp_dir)/'out',lock_dir=Path(tmp_dir)/'locks')
             ctrl = WorkerController(cfg, WorkerEventEmitter(stream))
-            self.assertEqual(ctrl.run(), EXIT_ROOM_MISMATCH)
-            self.assertEqual(nav.observe_live_room.call_count, 3)
+            from test_navigation_budget import Clock
+            with patch('src.worker.room_locator.time', Clock()):
+                self.assertEqual(ctrl.run(), EXIT_ROOM_MISMATCH)
+            self.assertEqual(nav.observe_live_room.call_count, 21)
             self.assertFalse(mock_session.called)
             events = [json.loads(line) for line in stream.getvalue().splitlines()]
             self.assertEqual(sum(e.get('action')=='correct_wrong_room' for e in events),3)
@@ -247,8 +249,8 @@ class TestWorkerE2ERegression(unittest.TestCase):
         """场景 12: 同一输出根目录下多次或并发运行：独立 run_id 目录彻底隔离产物。"""
         with tempfile.TemporaryDirectory() as tmp_dir:
             root_out = Path(tmp_dir)
-            cfg1 = WorkerConfig(vmindex=1, target="t1", output_dir=root_out)
-            cfg2 = WorkerConfig(vmindex=2, target="t2", output_dir=root_out)
+            cfg1 = WorkerConfig(vmindex=1, target="t1", output_dir=root_out, allow_unconfirmed_identity=True)
+            cfg2 = WorkerConfig(vmindex=2, target="t2", output_dir=root_out, allow_unconfirmed_identity=True)
 
             ctrl1 = WorkerController(config=cfg1)
             ctrl2 = WorkerController(config=cfg2)
