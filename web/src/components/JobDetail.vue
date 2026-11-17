@@ -72,7 +72,12 @@ watch([tick, segPage], () => void load())
         <el-descriptions-item label="身份核验">
           <el-tag v-if="job.room_identity_status" :type="identityType(job.room_identity_status)" size="small">{{ identityLabel(job.room_identity_status) }}</el-tag>
           <span v-else>—</span>
+          <span class="muted">（最近报告）</span>
+          <div v-if="job.room_identity_stale" class="warn-text">确认依据已过期或尚未取得</div>
+          <div v-if="job.room_identity_reason">{{ reasonLabel({ code: job.room_identity_reason, detail: null }) }}</div>
         </el-descriptions-item>
+        <el-descriptions-item label="最近确认身份">{{ fmtTime(job.room_identity_confirmed_at) }}</el-descriptions-item>
+        <el-descriptions-item label="报告时证据年龄">{{ fmtDuration(job.room_identity_age_sec) }}</el-descriptions-item>
         <el-descriptions-item label="最近心跳">
           {{ fmtTime(job.heartbeat_at) }}
           <span v-if="(heartbeatAge(job, connection.system?.server_time) ?? 0) > STALE_HEARTBEAT_SEC" class="warn-text">

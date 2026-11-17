@@ -184,6 +184,10 @@ def build_worker(monkeypatch, tmp_path, valid_media, *, total=4, segment=2,
             return gate
         def observe_live_room(self, **kwargs):
             return RoomEvidence(room_id='7704666294802123554', anchor_uid=uid, nickname='synthetic anchor', source='synthetic-device-observation')
+        def inspect_live_identity(self, deadline, stop_requested=lambda:False):
+            from src.worker.runtime_identity import IdentityObservation
+            evidence=RoomEvidence('7704666294802123554',uid,source='live_fragment_arguments',observed_at=clock.time())
+            return IdentityObservation(evidence,'',clock.monotonic(),clock.monotonic(),clock.time())
         def wait_live_picture(self, **kwargs):
             return gate
         def get_current_focus_activity(self):

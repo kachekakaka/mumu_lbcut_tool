@@ -110,6 +110,11 @@ export interface Job {
   elapsed_sec: number | null
   fps: number | null
   room_identity_status: string | null
+  room_identity_checked_at: number | null
+  room_identity_confirmed_at: number | null
+  room_identity_age_sec: number | null
+  room_identity_stale: boolean | null
+  room_identity_reason: string | null
   heartbeat_at: number | null
   finished_segment_count: number
   aborted_segment_count: number

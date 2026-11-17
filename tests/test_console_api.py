@@ -173,6 +173,27 @@ def test_segment_times_quality_alerts_and_beijing_day(api):
     assert client.get(f'/api/segments?from_time={midnight}&to_time={midnight+10}').json()['total'] == 1
 
 
+def test_runtime_identity_projection_late_risk_and_capability_stop(api):
+    client,store,_,_=api
+    target,job=seed(store)
+    identity=dict(room_identity_status='unconfirmed',room_identity_checked_at=40,
+        room_identity_confirmed_at=10,room_identity_age_sec=30,room_identity_stale=True,
+        room_identity_reason='runtime_identity_unavailable')
+    store.record_event(job,dict(event='heartbeat',timestamp=40,**identity),40)
+    data=client.get('/api/jobs/'+job).json()
+    assert all(data[k]==v for k,v in identity.items())
+    store.record_event(job,dict(event='segment_started',segment_index=1,timestamp=11,file_path='raw.mp4'),11)
+    store.record_event(job,dict(event='segment_finished',segment_index=1,timestamp=20,file_path='final.mp4'),20)
+    risk=dict(event='segment_quality_warning',event_id='risk-1',segment_index=1,timestamp=41,
+              flag='identity_mismatch',suspected_start_time=10)
+    store.record_event(job,risk,41);store.record_event(job,risk,42)
+    segments=client.get('/api/segments?job_id='+job).json()['items']
+    assert segments[0]['status']=='finished' and len(segments[0]['quality_flags'])==1
+    store.finish_job(job,9,43,True,reason='runtime_identity_probe_unavailable')
+    t=next(t for t in client.get('/api/targets').json()['items'] if t['id']==target)
+    assert t['needs_fix_reason']['code']=='runtime_identity_probe_unavailable'
+
+
 def test_log_tail_byte_limits_and_path_escape(api, tmp_path):
     client, store, runtime, config = api
     target, job = seed(store)

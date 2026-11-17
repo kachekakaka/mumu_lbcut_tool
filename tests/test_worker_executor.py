@@ -59,6 +59,17 @@ def test_monotonic_deadline_budget_and_expiry():
         expired_deadline.check_not_expired()
 
 
+def test_readonly_client_timeout_does_not_wait_for_tree_scan(monkeypatch):
+    def unexpected_scan(pid):
+        pytest.fail('只读客户端超时不应调用进程树扫描')
+    monkeypatch.setattr('src.worker.executor._kill_process_tree',unexpected_scan)
+    started=time.monotonic()
+    with pytest.raises(CommandTimeoutError):
+        run_command([sys.executable,'-c','import time; time.sleep(10)'],timeout=.3,
+                    kill_tree_on_timeout=False)
+    assert time.monotonic()-started<1.5
+
+
 def test_monotonic_deadline_dynamic_subcommand_clipping():
     """多步骤流程中，动态为后续子命令裁剪剩余超时预算，总耗时不超总预算。"""
     deadline = MonotonicDeadline(budget_seconds=1.5)

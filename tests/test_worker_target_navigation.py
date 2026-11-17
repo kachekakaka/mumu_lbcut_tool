@@ -6,7 +6,7 @@ from worker_harness import build_worker, assert_paired
 
 def test_worker_corrects_other_room_then_records(monkeypatch,tmp_path,valid_media):
     import src.worker.controller as cm
-    h=build_worker(monkeypatch,tmp_path,valid_media,uid=None)
+    h=build_worker(monkeypatch,tmp_path,valid_media)
     seen=[]
     observations=iter([RoomEvidence('999','456','其他主播','fresh_profile_intent')]*7+
                       [RoomEvidence('7704666294802123554','900001','目标主播','fresh_profile_intent')]*2)

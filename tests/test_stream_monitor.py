@@ -229,7 +229,8 @@ def test_feed_never_raises_into_the_capture_bridge():
 class SessionRig:
     def __init__(self, monitor):
         self.stream = io.StringIO()
-        controller = SimpleNamespace(emitter=WorkerEventEmitter(self.stream), current_generation_id=1)
+        controller = SimpleNamespace(emitter=WorkerEventEmitter(self.stream), current_generation_id=1,
+                                     target_room_id='123',target_uid='456',config=SimpleNamespace(allow_unconfirmed_identity=False))
         self.session = ContinuousSession(controller, 'serial', 'scrcpy', 'adb',
                                          SimpleNamespace(ffmpeg='ffmpeg', ffprobe='ffprobe'))
         self.session.pipe = SimpleNamespace(monitor=monitor)

@@ -125,6 +125,25 @@ class SegmentQualityWarningEvent(BaseWorkerEvent):
 
 
 @dataclass
+class RoomIdentityCheckEvent(BaseWorkerEvent):
+    event: str = 'room_identity_check'
+    action: str = ''
+    reason: str = ''
+    generation_id: int = 0
+    probe_id: int = 0
+    observed_room_id: str | None = None
+    observed_anchor_uid: str | None = None
+    sample_started_at: float = 0.0
+    sample_finished_at: float | None = None
+    duration_sec: float = 0.0
+    accepted: bool = True
+    anomaly_detected_at: float | None = None
+    stop_decided_at: float | None = None
+    capture_stopped_at: float | None = None
+    recovered_at: float | None = None
+
+
+@dataclass
 class RoomNavigationEvent(BaseWorkerEvent):
     event: str = "room_navigation"
     attempt: int = 0
@@ -164,9 +183,9 @@ class WorkerEventEmitter:
     def set_context(self, **values):
         self.context.update(values)
 
-    def emit(self, event_obj: BaseWorkerEvent):
+    def emit(self, event_obj: BaseWorkerEvent, context=None):
         """发射单行 JSON。"""
-        payload = {**self.context, **asdict(event_obj)}
+        payload = {**self.context, **(context or {}), **asdict(event_obj)}
         line = json.dumps(payload, ensure_ascii=False) + "\n"
         lost_now = False
         with self._lock:

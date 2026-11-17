@@ -170,6 +170,11 @@ class JobResponse(StrictModel):
     elapsed_sec: float | None
     fps: float | None
     room_identity_status: str | None
+    room_identity_checked_at: float | None
+    room_identity_confirmed_at: float | None
+    room_identity_age_sec: float | None
+    room_identity_stale: bool | None
+    room_identity_reason: str | None
     heartbeat_at: float | None
     finished_segment_count: int
     aborted_segment_count: int

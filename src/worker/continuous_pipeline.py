@@ -313,28 +313,31 @@ class ContinuousPipeline:
 
     def stop(self, timeout_sec=15):
         if self._stopped:return self.get_exit_code()==0
-        if self.monitor:self.monitor.stop()
         deadline=time.monotonic()+timeout_sec
+        graceful_deadline=max(time.monotonic(),deadline-2)
         # 先停止唯一采集进程，等 MKV 字节桥自然 EOF，再让封装器写完最后一片。
         if self._proc and self._proc.poll() is None:
             self._proc.send_signal(signal.CTRL_BREAK_EVENT if os.name=='nt' else signal.SIGINT)
-        while self._proc and self._proc.poll() is None and time.monotonic()<deadline:
+        while self._proc and self._proc.poll() is None and time.monotonic()<graceful_deadline:
             if self.wait_hook:self.wait_hook()
             time.sleep(.05)
         if self._proc and self._proc.poll() is None:
-            self.forced_stop=True;self._proc.kill();self._proc.wait(timeout=3)
+            self.forced_stop=True;self._proc.kill();self._proc.wait(timeout=max(.001,deadline-time.monotonic()))
         if self.bridge:
             if not self.bridge.join(max(0,deadline-time.monotonic())):
                 self.forced_stop=True;self.bridge.cancel.set()
         if self._mux:
-            try:self._mux.wait(timeout=max(.05,deadline-time.monotonic()))
+            try:self._mux.wait(timeout=max(.001,graceful_deadline-time.monotonic()))
             except subprocess.TimeoutExpired:
-                self.forced_stop=True;self._mux.kill();self._mux.wait(timeout=3)
+                self.forced_stop=True;self._mux.kill();self._mux.wait(timeout=max(.001,deadline-time.monotonic()))
         if self.bridge:
             self.bridge.cancel.set()
-            if not self.bridge.join(2):raise RuntimeError('分装字节桥未退出，禁止释放实例')
-        if self._capture_drainer:self._capture_drainer.join(timeout=2)
-        if self._progress_thread:self._progress_thread.join(timeout=2)
+            if not self.bridge.join(max(0,deadline-time.monotonic())):raise RuntimeError('分装字节桥未退出，禁止释放实例')
+        if self._capture_drainer:self._capture_drainer.join(timeout=max(0,deadline-time.monotonic()))
+        if self._progress_thread:self._progress_thread.join(timeout=max(0,deadline-time.monotonic()))
+        self.capture_stopped_at=time.time()
+        self.capture_stopped_mono=time.monotonic()
+        if self.monitor:self.monitor.stop()
         if self._mux_log:self._mux_log.close()
         self._stopped=True
         return self.get_exit_code()==0

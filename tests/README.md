@@ -11,6 +11,7 @@ python -m pip install -r requirements-test.txt
 $Dev = Join-Path (Split-Path (Get-Location).Path -Parent) 'mumu_lbcut_tool_dev'
 $Batch = 'console-tests-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0,8)
 $TestRoot = Join-Path $Dev ('mumu_lbcut_tool_tmp/' + $Batch)
+New-Item -ItemType Directory -Path $TestRoot | Out-Null
 python -m pytest tests -q -p no:cacheprovider --basetemp "$TestRoot/work" --junitxml "$TestRoot/results.xml"
 ```
 
@@ -27,6 +28,7 @@ python -m pytest tests -q -p no:cacheprovider --basetemp "$TestRoot/work" --juni
 | `test_pinned_media_tools.py` | 固定路径、旧版与不同构建拒绝、配套配置不一致拒绝、依赖失败前不启动设备；进程执行为替身 |
 | `test_aac_without_keyflag.py` | 合成无关键标记 AAC 输入、旧命令丢音轨负对照、真实命名管道分段、所有编码包逐字节一致、逐流 DTS 单调、所有分段完整解码；不是 MuMu 实机 |
 | `test_continuous_real_transport.py`、`test_stream_monitor_media.py` | 固定版本真实媒体传输、总时长封口与分析分支重建；循环输入可能有 AAC padding，CSV 相邻端点不替代逐包无漏失校验 |
+| `test_runtime_identity.py` | 运行期双样本、冲突宽限与失证期限、开录证据过期、同 Activity 错房恢复、迟到观察、风险回标与受控边界重建；固定时钟及设备注入不能替代实机时延验收 |
 
 ## 前端测试
 

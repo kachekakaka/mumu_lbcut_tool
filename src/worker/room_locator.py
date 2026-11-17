@@ -25,6 +25,8 @@ class LandingResult:
     status: IdentityStatus = IdentityStatus.UNCONFIRMED
     evidence: RoomEvidence | None = None
     attempts: int = 0
+    confirmed_mono: float | None = None
+    confirmed_at: float | None = None
 
 
 def activity_records(dump: str) -> list[dict]:
@@ -174,6 +176,7 @@ def locate_target(navigator, target: str, *, target_kind: str = 'auto',
     last_reason, last_status, last_evidence = 'navigation_failed', IdentityStatus.UNCONFIRMED, None
     attempted, phase, route = 0, 'navigation', ''
     unresolved_conflict = False
+    confirmed_mono = confirmed_at = None
 
     def emit(action, reason='', evidence=None, stage_deadline=None):
         now = time.monotonic()
@@ -195,7 +198,8 @@ def locate_target(navigator, target: str, *, target_kind: str = 'auto',
             reason = 'identity_conflict_unresolved'
         if stop_requested():
             success, reason = False, 'cancelled'
-        return LandingResult(success, reason, last_status, last_evidence, attempted)
+        return LandingResult(success, reason, last_status, last_evidence, attempted,
+                             confirmed_mono if success else None, confirmed_at if success else None)
 
     def device_lost(stage_deadline=None):
         # 探测失败多数只是页面慢；只有 adb 确认实例掉线才提前结束，交给上层换实例，不耗尽整段预算。
@@ -220,6 +224,7 @@ def locate_target(navigator, target: str, *, target_kind: str = 'auto',
             route = 'reset'
         # 每一次实际重新导航都使上一页身份依据失效，禁止跨页面复用。
         last_status, last_evidence = IdentityStatus.UNCONFIRMED, None
+        confirmed_mono = confirmed_at = None
         phase = 'navigation'
         until = min(preparation_deadline, time.monotonic()+30)
         # 首次导航尚无失败原因；重试时带上一次的失败原因便于排查。
@@ -255,6 +260,7 @@ def locate_target(navigator, target: str, *, target_kind: str = 'auto',
             emit('observe' if read_attempt == 0 else 'retry_observation',
                  'read_current_room' if read_attempt == 0 else 'wait_current_page', stage_deadline=until)
             observation_started = time.monotonic()
+            observation_wall = time.time()
             last_evidence = navigator.observe_live_room(deadline=until, stop_requested=stop_requested)
             if last_evidence.source == 'login_blocked':
                 return finish(False, 'login_blocked')
@@ -285,6 +291,7 @@ def locate_target(navigator, target: str, *, target_kind: str = 'auto',
                 if matches >= 2:
                     last_status = IdentityStatus.VERIFIED
                     unresolved_conflict = False
+                    confirmed_mono, confirmed_at = observation_started, observation_wall
                     break
             else:
                 matches, conflicts, conflict_key = 0, 0, None

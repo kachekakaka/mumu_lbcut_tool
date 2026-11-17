@@ -60,7 +60,8 @@ class FakeAdb:
     def __init__(self, states):
         self.states, self.calls = list(states), []
 
-    def run_adb(self, *args, timeout=5.0, check=False):
+    def run_adb(self, *args, timeout=5.0, check=False, kill_tree_on_timeout=True):
+        assert not kill_tree_on_timeout
         self.calls.append(args)
         assert args[:3] == ('shell', 'dumpsys', 'window'), args
         displays_text, windows_text = self.states[0]

@@ -114,14 +114,16 @@ class AdbDeviceClient:
                 if len(self._slow_commands) > 32:
                     del self._slow_commands[:-32]
 
-    def run_adb(self, *args: str, timeout: float = 5.0, check: bool = False) -> CommandResult:
+    def run_adb(self, *args: str, timeout: float = 5.0, check: bool = False,
+                kill_tree_on_timeout: bool = True) -> CommandResult:
         """执行 ADB 命令，强制携带 -s <exact_serial>，并记录分类耗时。"""
         cmd = [str(self.adb_exe), "-s", self.serial, *args]
         kind = self._command_kind(args)
         started = time.monotonic()
         status = "ok"
         try:
-            result = run_command(cmd, timeout=timeout, check=check, cwd=self.adb_exe.parent)
+            options = {} if kill_tree_on_timeout else {'kill_tree_on_timeout': False}
+            result = run_command(cmd, timeout=timeout, check=check, cwd=self.adb_exe.parent, **options)
             if result.exit_code != 0:
                 status = "error"
             return result
@@ -140,7 +142,7 @@ class AdbDeviceClient:
     def is_device_ready(self, timeout: float = 3.0) -> bool:
         """检查目标设备状态是否为 'device'。"""
         try:
-            res = self.run_adb("get-state", timeout=timeout)
+            res = self.run_adb("get-state", timeout=max(.001,timeout-.2), kill_tree_on_timeout=False)
             return res.exit_code == 0 and res.stdout.strip() == "device"
         except Exception:
             return False
@@ -152,7 +154,8 @@ class AdbDeviceClient:
         if timeout < 1.0:
             return False
         try:
-            res = run_command(cmd, timeout=timeout, cwd=self.adb_exe.parent)
+            res = run_command(cmd, timeout=max(.001,timeout-.2), cwd=self.adb_exe.parent,
+                              kill_tree_on_timeout=False)
             logger.debug(f"ADB connect {self.serial}: {res.stdout.strip()}")
         except Exception as e:
             logger.warning(f"ADB connect 异常: {e}")

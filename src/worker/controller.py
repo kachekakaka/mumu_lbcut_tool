@@ -115,6 +115,7 @@ class WorkerController:
 
         # 身份状态
         self.identity_status: IdentityStatus = IdentityStatus.UNCONFIRMED
+        self.runtime_identity = None
         self.target_room_id: str = ""
         self.target_uid: str = ""
 
@@ -135,8 +136,8 @@ class WorkerController:
         try:
             code = self._run_inner()
         except InterruptedError:
-            code = EXIT_SUCCESS if self.stop_requested else EXIT_RECORDING_FAILED
-            self._failure_reason = self._stop_reason if self.stop_requested else "startup_interrupted"
+            code = self._exit_code or (EXIT_RECORDING_FAILED if self._fatal_error or not self.stop_requested else EXIT_SUCCESS)
+            self._failure_reason = self._failure_reason or (self._stop_reason if self.stop_requested else 'startup_interrupted')
         except Exception as exc:
             logger.exception("Worker 未处理异常")
             self._fatal_error = True
@@ -255,6 +256,8 @@ class WorkerController:
     def _pipeline_wait_tick(self) -> bool:
         """管线短轮询期间仍响应停止、输出真实状态，不运行新的切片动作。"""
         now = time.monotonic()
+        if self.runtime_identity:
+            self.emitter.set_context(**self.runtime_identity.context(now))
         if now - self._last_wait_heartbeat >= self.config.heartbeat_interval_sec:
             self.emitter.emit(HeartbeatEvent(elapsed_sec=int(now - self._task_start_mono),
                 status=self.state_machine.state.value.lower(), fps=None,
@@ -264,6 +267,11 @@ class WorkerController:
 
     def _locate_target_room(self):
         self.identity_status = IdentityStatus.UNCONFIRMED
+        if self.runtime_identity:
+            self.runtime_identity.status = IdentityStatus.UNCONFIRMED
+            self.runtime_identity.source = 'unavailable'
+            self.runtime_identity.evidence_at = 0.0
+            self.runtime_identity.reason = 'identity_relocating'
         self.emitter.set_context(room_identity_status='unconfirmed',
                                  room_evidence_source='unavailable', room_evidence_at=0.0)
         navigation_started = time.monotonic()
@@ -289,6 +297,12 @@ class WorkerController:
             anchor_uid=self.target_uid, timeout_sec=self.config.navigation_timeout_sec, max_attempts=3,
             stop_requested=lambda: not self._pipeline_wait_tick(), on_step=report,
             allow_unconfirmed=self.config.allow_unconfirmed_identity)
+        if result.success:
+            from src.worker.runtime_identity import RuntimeIdentity
+            if self.runtime_identity is None:
+                self.runtime_identity = RuntimeIdentity(self.target_room_id, self.target_uid,
+                                                       self.config.allow_unconfirmed_identity)
+            self.runtime_identity.adopt(result)
         if self._navigator and callable(getattr(type(self._navigator), "metrics_snapshot", None)):
             logger.info("NAVIGATION_PERF %s", json.dumps(
                 self._navigator.metrics_snapshot(), ensure_ascii=False, sort_keys=True))

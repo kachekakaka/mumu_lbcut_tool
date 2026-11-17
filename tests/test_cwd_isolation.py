@@ -178,7 +178,7 @@ def test_adb_device_client_cwd(fake_mumu_env):
 
     captured_cmds = []
 
-    def mock_run_cmd(cmd, timeout=None, check=False, cwd=None, env=None):
+    def mock_run_cmd(cmd, timeout=None, check=False, cwd=None, env=None, kill_tree_on_timeout=True):
         captured_cmds.append((list(cmd), cwd))
         from src.worker.executor import CommandResult
         return CommandResult(exit_code=0, stdout="device\n", stderr="", duration=0.01)

@@ -144,10 +144,11 @@ async function stop(job: Job) {
       <el-table-column label="帧率" width="70">
         <template #default="{ row }">{{ fmtFps(row.fps) }}</template>
       </el-table-column>
-      <el-table-column label="身份核验" width="90">
+      <el-table-column label="身份最近报告" min-width="120">
         <template #default="{ row }">
           <el-tag v-if="row.room_identity_status" :type="identityType(row.room_identity_status)" size="small">{{ identityLabel(row.room_identity_status) }}</el-tag>
           <span v-else>—</span>
+          <div v-if="row.room_identity_stale" class="warn-text">依据过期／未取得</div>
         </template>
       </el-table-column>
       <el-table-column label="切片 完成/中止" min-width="100">

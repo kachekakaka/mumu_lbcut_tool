@@ -32,6 +32,8 @@ function job(id: string, targetId: string, status: string, extra: Partial<Job> =
     id, target_id: targetId, nickname: t?.nickname ?? null, target_raw: t?.raw ?? null, vmindex: 0, status,
     created_at: t0 - 3600, started_at: t0 - 3590, recording_started_at: status === 'pending' ? null : t0 - 3550, ended_at: null, exit_code: null, stop_reason: null, error_reason: null,
     elapsed_sec: 3500, fps: 29.7, room_identity_status: 'verified', heartbeat_at: t0, finished_segment_count: 1,
+    room_identity_checked_at: t0 - 2, room_identity_confirmed_at: t0 - 2,
+    room_identity_age_sec: 2, room_identity_stale: false, room_identity_reason: null,
     aborted_segment_count: 0, reconcile_requested: false, recovery_context: null, ...extra,
   }
 }

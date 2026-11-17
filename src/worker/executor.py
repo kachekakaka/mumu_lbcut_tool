@@ -95,6 +95,7 @@ def run_command(
     check: bool = False,
     cwd: Path | str | None = None,
     env: dict[str, str] | None = None,
+    kill_tree_on_timeout: bool = True,
 ) -> CommandResult:
     """带硬超时保护的外部命令执行函数。
 
@@ -104,6 +105,7 @@ def run_command(
         check: 退出码非 0 时是否抛出 subprocess.CalledProcessError
         cwd: 执行工作目录
         env: 自定义环境变量字典
+        kill_tree_on_timeout: 一般命令清理进程树；只读 ADB 客户端可仅终止本次客户端，避免额外树扫描延长探针期限
 
     异常:
         CommandTimeoutError: 当执行时长超过 timeout 时强杀子进程树并抛出
@@ -152,13 +154,21 @@ def run_command(
         )
 
     except subprocess.TimeoutExpired:
-        logger.warning(f"外部命令超时 (时限 {timeout}s)，执行子进程树强杀: {' '.join(cmd)} (PID: {proc.pid})")
+        cleanup = '执行子进程树强杀' if kill_tree_on_timeout else '结束本次命令客户端'
+        logger.warning(f"外部命令超时 (时限 {timeout}s)，{cleanup}: {' '.join(cmd)} (PID: {proc.pid})")
         try:
             proc.kill()
         except Exception:
             pass
-        _kill_process_tree(proc.pid)
-        stdout_data, stderr_data = proc.communicate()
+        if kill_tree_on_timeout:
+            _kill_process_tree(proc.pid)
+        try:
+            stdout_data, stderr_data = proc.communicate(timeout=.2 if not kill_tree_on_timeout else None)
+        except subprocess.TimeoutExpired:
+            # 只读客户端不等待其他进程持有的管道；本次观察仍按超时处理。
+            stdout_data, stderr_data = '', ''
+            proc.stdout.close()
+            proc.stderr.close()
         raise CommandTimeoutError(
             cmd=cmd,
             timeout=timeout or 0.0,

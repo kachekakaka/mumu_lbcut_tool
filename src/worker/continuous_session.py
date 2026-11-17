@@ -5,6 +5,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import logging
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -16,6 +17,9 @@ from src.worker.events import (BaseWorkerEvent, SegmentStartedEvent, SegmentFini
 from src.worker.segment_verifier import finalize_segment
 from src.worker.state_machine import WorkerState, ActionType
 from src.worker.watchdog import StallWatchdog
+from src.worker.runtime_identity import RuntimeIdentity, OBSERVATION_BUDGET, SAMPLE_INTERVAL, MAX_AGE
+from src.worker.identity_verifier import IdentityStatus
+from src.worker.events import RoomIdentityCheckEvent
 
 log=logging.getLogger(__name__)
 
@@ -35,6 +39,9 @@ class CaptureSessionEvent(BaseWorkerEvent):
     capture_launch_at: float=0.0
     first_media_observed_at: float=0.0
     surface_verified_at: float=0.0
+    stop_decided_at: float=0.0
+    capture_stopped_at: float=0.0
+    stop_latency_sec: float=0.0
 
 
 @dataclass
@@ -112,6 +119,160 @@ class ContinuousSession:
         self.epoch_accepted=False
         self.startup_attempt=0
         self.startup_reason=''
+        self.identity = getattr(controller, 'runtime_identity', None) or RuntimeIdentity(
+            controller.target_room_id, getattr(controller, 'target_uid', ''),
+            getattr(controller.config, 'allow_unconfirmed_identity', False))
+        self.identity_probes=ThreadPoolExecutor(max_workers=1,thread_name_prefix='live-identity')
+        self.identity_future=None
+        self.identity_token=0
+        self.identity_request=None
+        self.identity_checkpoint=None
+        self.identity_media_highwater=None
+        self.identity_invalid_timeline=set()
+        self.identity_risks={}
+        self.identity_boundary_pending=False
+        self.preparation_deadline=None
+
+    def identity_context(self):
+        context=self.identity.context(self.clock())
+        self.c.identity_status=self.identity.status
+        self.c.emitter.set_context(**context)
+        return context
+
+    def invalidate_identity_probe(self):
+        self.identity_token+=1
+        if self.identity_future:self.identity_future.cancel()
+        # 未结束的请求保留到完成；不能取消失败后又堆入新请求。
+        self.identity.invalidate_samples()
+
+    def mark_identity_risk(self, mismatch=False):
+        if not self.pipe or self.epoch_ended:return
+        checkpoint=self.identity_checkpoint
+        self.identity_media_position()
+        lower=checkpoint[1] if checkpoint and checkpoint[0]==self.epoch and self.epoch not in self.identity_invalid_timeline else 0.0
+        risk=self.identity_risks.setdefault(self.epoch,dict(
+            lower=lower,wall=self.identity.confirmed_at or getattr(self.pipe,'capture_launch_at',time.time()),
+            flags=set(),marked=set()))
+        risk['flags'].add('identity_unconfirmed')
+        if mismatch:risk['flags'].add('identity_mismatch')
+        self.apply_identity_risks()
+
+    def identity_media_position(self):
+        """进度缺失、非有限值或回退时整代保守标记，不继续使用旧下界。"""
+        if not self.pipe:return 0.0
+        media=self.pipe.media_time()
+        if media is None or not math.isfinite(media) or media<0:
+            self.identity_invalid_timeline.add(self.epoch)
+            return 0.0
+        if self.identity_media_highwater is not None and media<self.identity_media_highwater:
+            self.identity_invalid_timeline.add(self.epoch)
+        self.identity_media_highwater=max(media,self.identity_media_highwater or 0.0)
+        return media
+
+    def apply_identity_risks(self):
+        for row in self.ledger.values():
+            if not row.get('closed'):continue
+            start,end=row.get('start_pts'),row.get('end_pts')
+            if start is None or end is None or not math.isfinite(start) or not math.isfinite(end) or start<0 or end<start:
+                self.identity_invalid_timeline.add(row['epoch'])
+        for index,row in self.ledger.items():
+            risk=self.identity_risks.get(row['epoch'])
+            if not risk:continue
+            if row['epoch'] in self.identity_invalid_timeline:risk['lower']=0.0
+            end=row.get('end_pts')
+            if end is not None and end < risk['lower']:continue
+            row['identity_context']=dict(row.get('identity_context',{}),room_identity_status='unconfirmed')
+            for flag in sorted(risk['flags']):
+                key=(index,flag)
+                if key in risk['marked']:continue
+                risk['marked'].add(key)
+                self.c.emitter.emit(SegmentQualityWarningEvent(segment_index=index,flag=flag,
+                    suspected_start_time=risk['wall']),context=row['identity_context'])
+
+    def emit_identity_observation(self, observation, action, accepted=True, request=None):
+        evidence=observation.evidence
+        self.c.emitter.emit(RoomIdentityCheckEvent(action=action,reason=observation.reason or self.identity.reason,
+            generation_id=request[1] if request else self.c.current_generation_id,
+            probe_id=request[0] if request else self.identity_token,
+            observed_room_id=evidence.room_id if evidence else None,
+            observed_anchor_uid=evidence.anchor_uid if evidence else None,
+            sample_started_at=observation.wall_started,
+            sample_finished_at=observation.wall_finished if observation.wall_finished is not None else observation.wall_started+observation.finished-observation.started,
+            duration_sec=round(observation.finished-observation.started,3),accepted=accepted,
+            anomaly_detected_at=time.time() if action=='suspect' else None))
+
+    def accept_identity(self, observation, media):
+        result=self.identity.accept(observation)
+        if result=='suspect':self.mark_identity_risk(self.identity.status==IdentityStatus.MISMATCH)
+        if result in ('confirmed','recovered'):
+            self.identity_checkpoint=(self.epoch,media or 0.0)
+            if self.epoch_accepted and not self.epoch_ended and self.epoch in self.identity_risks:
+                self.identity_boundary_pending=True
+        self.identity_context()
+        if result!='sample':self.emit_identity_observation(observation,result)
+
+    def check_identity_gate(self):
+        """准备阶段过期复核，不发布正式片段，不消耗运行期恢复额度。"""
+        c=self.c
+        age=self.identity.age(self.clock())
+        # 还需容纳运行期首轮双样本；不能在证据即将到期时刚好放行后立即恢复。
+        if age is not None and age+2*OBSERVATION_BUDGET+SAMPLE_INTERVAL<MAX_AGE and self.identity.source=='live_fragment_arguments':return True
+        if self.preparation_deadline is None:self.preparation_deadline=self.clock()+30
+        uncertain=self.identity.stale(self.clock()) or self.identity.status!=IdentityStatus.VERIFIED or self.identity.source!='live_fragment_arguments'
+        self.identity.invalidate_samples()
+        self.identity.suspect(self.clock(),'startup_identity_recheck')
+        # 采集启动已经写出的准备媒体也属于尚未复核的区间。
+        if uncertain:self.mark_identity_risk()
+        while self.clock()<self.preparation_deadline and not c.stop_requested:
+            if not c._pipeline_wait_tick():break
+            if self.clock()<self.identity.next_at:
+                self.sleep(min(.1,self.identity.next_at-self.clock()));continue
+            until=min(self.preparation_deadline,self.clock()+OBSERVATION_BUDGET)
+            observation=c._navigator.inspect_live_identity(until,lambda:c.stop_requested)
+            self.accept_identity(observation,self.identity_media_position())
+            if self.identity.status==IdentityStatus.VERIFIED and not self.identity.stale(self.clock()):return True
+            if observation.reason=='page_changed' or self.identity.pending_reason:
+                raise StartupSurfaceChanged('startup_identity_changed')
+        if c.stop_requested:return False
+        if not self.device_online():
+            self.device_lost();return False
+        if self.identity.allow_unconfirmed and self.identity.conflict_since is None:
+            self.identity_context();return True
+        if self.identity.conflict_since is not None:
+            c._failure_reason='runtime_identity_conflict_unresolved';c._exit_code=18
+        else:
+            c._failure_reason='runtime_identity_probe_unavailable';c._exit_code=9
+        c._fatal_error=True;c.request_stop(c._failure_reason)
+        return False
+
+    def poll_identity(self, stopping=False):
+        c=self.c
+        if self.identity_future and self.identity_future.done():
+            request=self.identity_request
+            try:observation=self.identity_future.result()
+            except Exception:observation=None
+            self.identity_future=None
+            if observation and request[0]==self.identity_token and request[1]==self.epoch and not c.stop_requested:
+                self.accept_identity(observation,request[2])
+            elif observation:self.emit_identity_observation(observation,'discarded',False,request)
+        reason=self.identity.recovery_reason(self.clock())
+        if reason:
+            if reason!='runtime_identity_mismatch':self.identity.suspect(self.clock(),reason)
+            self.mark_identity_risk(reason=='runtime_identity_mismatch')
+        self.identity_context()
+        if stopping or c.stop_requested:return False
+        if reason:
+            self.recover(reason,True);return True
+        if self.identity_boundary_pending:
+            self.recover('identity_risk_boundary_reset',False);return True
+        if self.identity_future is None and self.clock()>=self.identity.next_at:
+            self.identity_token+=1
+            token=self.identity_token
+            self.identity_request=(token,self.epoch,self.identity_media_position())
+            deadline=min(self.clock()+OBSERVATION_BUDGET,self.identity.deadline())
+            self.identity_future=self.identity_probes.submit(c._navigator.inspect_live_identity,
+                deadline,lambda:c.stop_requested or token!=self.identity_token)
+        return False
 
     def _adb_device_online(self):
         try:
@@ -138,6 +299,7 @@ class ContinuousSession:
     def start_epoch(self):
         """启动期间持续复核页面；最多三轮准备，不消耗运行期恢复次数。"""
         c=self.c
+        self.preparation_deadline=None
         for attempt in range(1,4):
             self.startup_attempt=attempt
             self.startup_reason=''
@@ -146,6 +308,7 @@ class ContinuousSession:
             self.pipe=None
             try:
                 self._check_startup_surface('before_capture')
+                if not self.check_identity_gate():return False
                 self._start_prepared_epoch()
                 return True
             except StartupSurfaceChanged as exc:
@@ -159,6 +322,9 @@ class ContinuousSession:
                     c._fatal_error=True
                     c.request_stop()
                     return False
+                if self.startup_reason=='startup_identity_risk_boundary_reset':
+                    # 身份已重新确认；旧准备媒体不发布，也不消费运行期恢复额度。
+                    continue
                 landing=c._locate_target_room()
                 if c.stop_requested:return False
                 if not landing.success:
@@ -174,7 +340,7 @@ class ContinuousSession:
             raise InterruptedError('开录准备期间收到停止请求')
         detail=''
         try:
-            observation=c._navigator.inspect_live_surface(timeout_sec=1.0)
+            observation=c._navigator.inspect_live_surface(timeout_sec=2.0)
         except Exception as exc:
             observation={}
             detail=str(exc)
@@ -209,6 +375,7 @@ class ContinuousSession:
         c=self.c
         if c.stop_requested:raise InterruptedError('停止后禁止启动采集')
         self.epoch+=1
+        self.identity_media_highwater=None
         self.epoch_ended=False
         self.quality_marks={}
         self.low_frame_rate=False
@@ -227,6 +394,9 @@ class ContinuousSession:
         self.pipe.start()
         self.pipe.wait_hook=c._pipeline_wait_tick
         self._check_startup_surface('before_recording')
+        if not self.check_identity_gate():raise InterruptedError('身份准备门禁未通过')
+        if self.identity.status==IdentityStatus.VERIFIED and self.epoch in self.identity_risks:
+            raise StartupSurfaceChanged('startup_identity_risk_boundary_reset')
         self.epoch_accepted=True
         c.state_machine.transition_to(WorkerState.RECORDING)
         c.emitter.emit(CaptureSessionEvent(action='started',capture_pid=self.pipe._proc.pid,
@@ -234,6 +404,9 @@ class ContinuousSession:
             capture_launch_at=getattr(self.pipe,'capture_launch_at',0.0),
             first_media_observed_at=getattr(self.pipe,'first_media_observed_at',0.0),
             surface_verified_at=self.surface_verified_at))
+        if self.identity.issue_since is not None:self.mark_identity_risk()
+        self.identity.next_at=0.0
+        self.identity_context()
         self.sync()
         c._watchdog=self.watchdog_factory(pipeline=self.pipe,navigator=c._navigator,
             room_id=c.target_room_id,stall_threshold_sec=c.config.stall_timeout_sec,
@@ -245,17 +418,24 @@ class ContinuousSession:
 
     def sync(self, ending=False, final=False, interrupted=''):
         if not self.pipe:return
+        self.identity_media_position()
         c=self.c
         fragments=self.pipe.fragments()
         latest=max((f.index for f in fragments),default=0)
         for f in fragments:
             if f.index not in self.ledger:
                 self.ledger[f.index]={'path':f.path,'terminal':False,'submitted':False,
-                    'epoch':self.epoch,'generation':c.current_generation_id,'wall':time.time()}
+                    'epoch':self.epoch,'generation':c.current_generation_id,'wall':time.time(),
+                    'identity_context':self.identity.context(self.clock())}
+                risk=self.identity_risks.get(self.epoch)
+                if risk and (self.epoch in self.identity_invalid_timeline or f.end_pts is None or f.end_pts>=risk['lower']):
+                    self.ledger[f.index]['identity_context']['room_identity_status']='unconfirmed'
                 c.emitter.emit(SegmentStartedEvent(segment_index=f.index,file_path=str(f.path),
-                    target_duration_sec=c.config.segment_duration_sec))
+                    target_duration_sec=c.config.segment_duration_sec),context=self.ledger[f.index]['identity_context'])
             row=self.ledger[f.index]
             row['closed']=f.closed
+            row['start_pts'],row['end_pts']=f.start_pts,f.end_pts
+            self.apply_identity_risks()
             c.current_segment_index=max(c.current_segment_index,f.index)
             c._highest_segment_index=max(c._highest_segment_index,f.index)
             if f.index==latest:c.current_file_path=f.path
@@ -276,7 +456,8 @@ class ContinuousSession:
     def abort(self,index,reason):
         row=self.ledger[index]
         if row['terminal']:return
-        self.c.emitter.emit(SegmentAbortedEvent(segment_index=index,file_path=str(row['path']),reason=reason))
+        self.c.emitter.emit(SegmentAbortedEvent(segment_index=index,file_path=str(row['path']),reason=reason),
+                            context=row.get('identity_context'))
         row['terminal']=True
         self.c._had_segment_errors=True
         self.c._last_segment_failed=True
@@ -296,23 +477,27 @@ class ContinuousSession:
                 self.abort(index,'validation_failed: '+str(exc))
             else:
                 self.c.emitter.emit(SegmentFinishedEvent(segment_index=index,file_path=str(path),
-                    duration_sec=result.duration,file_size_mb=result.size_mb,is_final=row.get('final',False)))
+                    duration_sec=result.duration,file_size_mb=result.size_mb,is_final=row.get('final',False)),
+                    context=row.get('identity_context'))
                 row.update(terminal=True,path=path)
                 self.c._last_segment_failed=False
 
     def end_epoch(self, final=False, interrupted=''):
         c=self.c
+        stop_started=self.clock()
+        stop_decided_at=time.time()
         if c._watchdog:c._watchdog.stop()
         if not self.pipe or self.epoch_ended:return
         self.pipe.wait_hook=c._pipeline_wait_tick
-        ok=self.pipe.stop()
+        ok=self.pipe.stop(timeout_sec=max(.001,8-(self.clock()-stop_started)))
         if not self.epoch_accepted:
             self.epoch_ended=True
             c.emitter.emit(CaptureStartupEvent(action='discarded',phase='cleanup',attempt=self.startup_attempt,
                 reason=self.startup_reason or c._failure_reason or ('cancelled' if c.stop_requested else 'startup_failed'),
                 directory=str(self.pipe.directory),
                 capture_launch_at=getattr(self.pipe,'capture_launch_at',0.0),
-                first_media_observed_at=getattr(self.pipe,'first_media_observed_at',0.0)))
+                first_media_observed_at=getattr(self.pipe,'first_media_observed_at',0.0)),
+                context={'room_identity_status':'unconfirmed'} if self.epoch in self.identity_risks else None)
             if not ok:raise RuntimeError('准备阶段采集收尾失败: '+self.pipe.failure_details())
             return
         self.media_done+=self.pipe.media_time() or 0.0
@@ -320,27 +505,46 @@ class ContinuousSession:
         self.sync(ending=True,final=final and not reason,interrupted=reason)
         c.emitter.emit(CaptureSessionEvent(action='stopped',capture_pid=self.pipe._proc.pid if self.pipe._proc else 0,
             muxer_pid=self.pipe._mux.pid if self.pipe._mux else 0,
-            generation_id=c.current_generation_id,reason=reason))
+            generation_id=c.current_generation_id,reason=reason,stop_decided_at=stop_decided_at,
+            capture_stopped_at=getattr(self.pipe,'capture_stopped_at',time.time()),
+            stop_latency_sec=max(0,getattr(self.pipe,'capture_stopped_mono',self.clock())-stop_started)))
         self.epoch_ended=True
         if reason:self.last_error=reason
+        if self.pipe.is_recording():raise RuntimeError('采集尚未停止，禁止启动下一代际')
 
     def recover(self,reason,relocate):
         c=self.c
         if c.stop_requested:return False
-        # 设备离线时重新定位或重开采集都无意义；以 20 退出，由调度器同步实例在线状态后重开。
-        if not self.device_online():
+        if self.identity.conflict_since is not None or self.identity.recovery_reason(self.clock()):
+            relocate=True
+            reason=self.identity.recovery_reason(self.clock()) or 'runtime_identity_conflict_unresolved'
+        self.invalidate_identity_probe()
+        if reason.startswith('runtime_identity'):
+            self.mark_identity_risk(reason=='runtime_identity_mismatch')
+        # 身份到期先停止采集，不能被 ADB 在线查询延长；其他恢复保留离线优先判定。
+        online_checked=not reason.startswith('runtime_identity')
+        if online_checked and not self.device_online():
             self.device_lost();return False
         if not c._consume_recovery_budget():return False
+        decided_at=time.time()
         c.state_machine.transition_to(WorkerState.RECOVERING)
         action='relocate_target' if relocate else 'restart_capture'
         c.emitter.emit(StallDetectedEvent(action=action,reason=reason))
         self.end_epoch(interrupted=reason)
+        c.emitter.emit(RoomIdentityCheckEvent(action='capture_stopped',reason=reason,
+            generation_id=c.current_generation_id,sample_started_at=decided_at,
+            duration_sec=max(0,time.time()-decided_at),stop_decided_at=decided_at,
+            capture_stopped_at=getattr(self.pipe,'capture_stopped_at',time.time())))
+        self.identity_boundary_pending=False
         if c.stop_requested:return False
+        if not online_checked and not self.device_online():
+            self.device_lost();return False
         remaining=self.remaining_duration()
         if remaining is not None and remaining<1:
             self.limit_reached=True
             return False
         if relocate:
+            self.identity_checkpoint=None
             landing=c._locate_target_room()
             if c.stop_requested:return False
             if not landing.success:
@@ -361,6 +565,8 @@ class ContinuousSession:
             return False
         c._failure_reason=''
         c.emitter.emit(StallHealedEvent(action=action))
+        c.emitter.emit(RoomIdentityCheckEvent(action='capture_recovered',reason=reason,
+            generation_id=c.current_generation_id,recovered_at=time.time()))
         return True
 
     def check_stream_quality(self):
@@ -441,6 +647,7 @@ class ContinuousSession:
                 self.bad_pages=0
                 kind=observation.get('overlay')
                 if kind:
+                    self.invalidate_identity_probe()
                     self.sync()
                     affected=[idx for idx,row in self.ledger.items()
                               if row['epoch']==self.epoch and (not row['terminal'] or row['wall']>=self.last_clear_wall)]
@@ -452,12 +659,14 @@ class ContinuousSession:
                     c.state_machine.transition_to(WorkerState.RECOVERING)
                     if c._watchdog:c._watchdog.stop()
                     # 遮挡关闭不停止采集；持续保留原始媒体，风险区间通过事件说明。
-                    recovery_deadline=time.monotonic()+30
+                    recovery_deadline=min(time.monotonic()+30,self.identity.deadline())
+                    def interrupted():
+                        return c.stop_requested or self.clock()>=self.identity.deadline()
                     ok=c._navigator.dismiss_live_overlay(min(recovery_deadline,time.monotonic()+18),
-                        lambda:c.stop_requested,require_observed_clear=True)
+                        interrupted,require_observed_clear=True)
                     if ok and not c.stop_requested:
                         # 上一步已确认面板消失，画面检查不再重复遮挡检查。
-                        ok=c._navigator.wait_live_picture(recovery_deadline,lambda:c.stop_requested,
+                        ok=c._navigator.wait_live_picture(recovery_deadline,interrupted,
                                                          check_overlay=False)
                     self.sync()
                     # 确认关闭期间采集仍在轮转；新发现的片段也必须保守标记，不能只标检测时那一片。
@@ -469,7 +678,12 @@ class ContinuousSession:
                     c.emitter.emit(OverlayRecoveryEvent(action='closed' if ok else 'failed',overlay_kind=kind,success=ok,
                         suspected_start_time=self.last_clear_wall))
                     if not c.stop_requested:
-                        if ok:
+                        reason=self.identity.recovery_reason(self.clock())
+                        if reason:
+                            self.identity.suspect(self.clock(),reason)
+                            self.mark_identity_risk();self.identity_context()
+                            self.recover(reason,True)
+                        elif ok:
                             c.state_machine.transition_to(WorkerState.RECORDING)
                             c._watchdog=self.watchdog_factory(pipeline=self.pipe,navigator=c._navigator,
                                 room_id=c.target_room_id,stall_threshold_sec=c.config.stall_timeout_sec,
@@ -495,7 +709,10 @@ class ContinuousSession:
                 if self.pipe.reached_total_duration():
                     # 封装器已按总时长在录像时间轴上截止并封好最后一片。
                     self.limit_reached=True
+                    self.poll_identity(stopping=True)
                     break
+                # 先接收已经完成的身份证据，再仲裁采集故障，避免重启抹掉冲突。
+                if self.poll_identity():continue
                 if not self.pipe.is_recording():
                     log.error('持续采集异常: %s',self.pipe.failure_details())
                     if not self.recover('capture_process_exited',False):break
@@ -526,6 +743,7 @@ class ContinuousSession:
                     self.last_heartbeat=now
                 self.sleep(.1)
         finally:
+            self.poll_identity(stopping=True)
             self.close()
         if c._exit_code:
             return c._exit_code
@@ -551,6 +769,8 @@ class ContinuousSession:
             for idx,row in self.ledger.items():
                 if not row['terminal']:self.abort(idx,'fragment_terminal_missing')
         finally:
+            self.invalidate_identity_probe()
+            self.identity_probes.shutdown(wait=True,cancel_futures=True)
             self.probes.shutdown(wait=True,cancel_futures=True)
             self.pool.shutdown(wait=True,cancel_futures=True)
             self.closed=True

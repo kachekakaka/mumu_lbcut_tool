@@ -57,7 +57,8 @@ class WorkerNavigator:
                 timeout = min(timeout, self._operation_deadline - time.monotonic())
                 if timeout < 1.0:
                     raise TimeoutError("导航流程预算耗尽")
-            res = self.adb_client.run_adb(*args, timeout=timeout)
+            options = {'kill_tree_on_timeout': False} if self._operation_deadline is not None else {}
+            res = self.adb_client.run_adb(*args, timeout=max(.001,timeout-.2) if options else timeout, **options)
             self._last_adb_failed = res.exit_code != 0
             output = res.stdout.strip() or res.stderr.strip()
             if "not found" in output or "offline" in output:
@@ -68,7 +69,7 @@ class WorkerNavigator:
                 retry_budget = min(timeout, self._operation_deadline-time.monotonic()) if self._operation_deadline is not None else timeout
                 if retry_budget < 1.0:
                     return ''
-                res2 = self.adb_client.run_adb(*args, timeout=retry_budget)
+                res2 = self.adb_client.run_adb(*args, timeout=max(.001,retry_budget-.2) if options else retry_budget, **options)
                 self._last_adb_failed = res2.exit_code != 0
                 output = res2.stdout.strip()
             return output
@@ -633,7 +634,8 @@ class WorkerNavigator:
                 break
             try:
                 result = self.adb_client.run_adb('shell', 'dumpsys', 'window', target,
-                                                 timeout=remaining, check=False)
+                                                 timeout=max(.001,remaining-.2), check=False,
+                                                 kill_tree_on_timeout=False)
                 if result.exit_code == 0:
                     texts[target] = result.stdout or ''
             except Exception as exc:
@@ -643,7 +645,61 @@ class WorkerNavigator:
                 'markers': list(surface.markers), 'ui_available': surface.available,
                 'observed_at': time.time()}
 
+    def inspect_live_identity(self, deadline, stop_requested=lambda: False):
+        """运行期只读观察：独立预算，无点击、缓存和主导航状态写入。"""
+        from src.worker.runtime_identity import IdentityObservation
+        started, wall = time.monotonic(), time.time()
+        def read(target):
+            remaining = deadline - time.monotonic()
+            if stop_requested() or remaining <= 0:
+                raise TimeoutError('identity_probe_deadline')
+            result = self.adb_client.run_adb('shell', 'dumpsys', 'activity', target,
+                                            timeout=max(.001,remaining-.2), check=False,
+                                            kill_tree_on_timeout=False)
+            if result.exit_code:
+                raise RuntimeError('identity_probe_failed')
+            return result.stdout or ''
+        def context(text):
+            match = re.search(r'(?:topResumedActivity|mResumedActivity|ResumedActivity).*?ActivityRecord\{(\S+)\s+u\d+\s+(\S+)\s+t(\d+)', text)
+            return match.groups() if match else None
+        evidence, reason = None, 'room_evidence_unavailable'
+        try:
+            before = context(read('activities'))
+            if before and 'LivePlayActivity' in before[1]:
+                # top 还转储后台桌面等任务；只请求实际前台组件，并限定任务及实例。
+                top = read(before[1])
+                after = context(read('activities'))
+                if before == after:
+                    blocks=re.split(r'(?=^TASK\s)',top,flags=re.MULTILINE)
+                    blocks=[block for block in blocks if re.search(r'^TASK[^\n]*\bid='+re.escape(before[2])+r'\b',block)]
+                    token_ids={before[0].lower()}
+                    if before[0].isdigit():token_ids.add(format(int(before[0]),'x'))
+                    if len(blocks)==1:
+                        headers=re.findall(r'^\s*ACTIVITY\s+(\S+)\s+(\S+)',blocks[0],re.MULTILINE)
+                        if len(headers)==1 and headers[0][0]==before[1] and headers[0][1].lower() in token_ids:
+                            evidence = current_live_fragment_evidence(blocks[0], before[1])
+                    reason = '' if evidence else 'room_evidence_unavailable'
+                else:
+                    reason = 'page_changed'
+            else:
+                reason = 'page_changed' if before else 'page_probe_unavailable'
+        except Exception as exc:
+            reason = 'identity_probe_timeout' if isinstance(exc, (TimeoutError, subprocess.TimeoutExpired)) else 'identity_probe_failed'
+        finished = time.monotonic()
+        if finished > deadline or stop_requested():
+            evidence, reason = None, 'identity_probe_timeout'
+        return IdentityObservation(evidence, reason, started, finished, wall, time.time())
+
     def dismiss_live_overlay(self, deadline, stop_requested, *, require_observed_clear=False):
+        old = getattr(self, '_operation_deadline', None)
+        self._operation_deadline = min(old, deadline) if old is not None else deadline
+        try:
+            return self._dismiss_live_overlay(self._operation_deadline, stop_requested,
+                                               require_observed_clear=require_observed_clear)
+        finally:
+            self._operation_deadline = old
+
+    def _dismiss_live_overlay(self, deadline, stop_requested, *, require_observed_clear=False):
         """只在新鲜窗口证据确认面板持有焦点时发送 BACK；关闭后必须再次观察。
 
         每次 BACK 前都重新读取焦点：面板若已自行关闭，BACK 会退出直播间。
@@ -655,7 +711,7 @@ class WorkerNavigator:
             if stop_requested() or time.monotonic() >= deadline:
                 return False
             current = self.inspect_live_surface(
-                timeout_sec=max(.5, min(3, deadline-time.monotonic())))
+                timeout_sec=max(.001, min(3, deadline-time.monotonic())))
             activity = current.get('activity', '')
             if activity and 'LivePlayActivity' not in activity:
                 return False
@@ -668,9 +724,10 @@ class WorkerNavigator:
                 continue
             if backs >= 2:
                 return False
+            if stop_requested() or time.monotonic()>=deadline:return False
             logger.info('关闭直播面板窗口: %s，使用返回键', ' '.join(current.get('markers', [])))
             self._adb('shell', 'input', 'keyevent', '4',
-                      timeout=min(2, max(.1, deadline-time.monotonic())))
+                      timeout=min(2, max(.001, deadline-time.monotonic())))
             backs += 1
             if not self._navigation_sleep(.6, deadline, stop_requested):
                 return False

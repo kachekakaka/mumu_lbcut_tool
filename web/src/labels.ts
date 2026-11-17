@@ -47,7 +47,7 @@ export const TRUSTED_STATUS: Record<string, string> = { live: '在播', ended: '
 const TRUSTED_TAG: Record<string, TagType> = { live: 'success', ended: 'info', unknown: 'warning' }
 
 export const EXIT_CODE: Record<string, string> = {
-  '0': '正常结束', '2': '直播流结束', '9': '目标无效', '10': '确认未开播', '11': '开播检测服务异常',
+  '0': '正常结束', '2': '直播流结束', '9': '目标或运行条件需处理', '10': '确认未开播', '11': '开播检测服务异常',
   '15': '登录强阻断', '16': '预检卡顿', '17': '进房导航失败', '18': '错房或身份未确认', '20': '设备不可用',
   '30': '录制失败',
 }
@@ -72,6 +72,7 @@ export const QUALITY_FLAG: Record<string, string> = {
   static_picture: '画面静止',
   visual_check_unavailable: '画面检查不可用',
   identity_unconfirmed: '身份未确认',
+  identity_mismatch: '可能包含错房画面',
 }
 const OVERLAY_KIND: Record<string, string> = { live_panel_window: '直播面板' }
 
@@ -84,6 +85,7 @@ const ALERT_TAG: Record<string, TagType> = {
 }
 
 export const EVENT: Record<string, string> = {
+  room_identity_check: '运行期身份核验',
   worker_started: 'Worker 启动', room_navigation: '进房导航', stall_detected: '发现卡顿', stall_healed: '卡顿恢复',
   overlay_recovery: '遮挡处理', login_blocked: '登录阻断', stream_ended: '直播流结束', worker_stopped: 'Worker 结束',
   worker_failed: 'Worker 失败', segment_quality_warning: '切片质量标记', login_status_checked: '登录后的开播状态复核',
@@ -185,6 +187,7 @@ export function qualityFlagLabel(flag: string | null | undefined): string {
 
 /** 后端返回的稳定原因代码；详情独立显示，不解析内部字符串。 */
 export const WORKER_REASON: Record<string, string> = {
+  startup_identity_risk_boundary_reset: '准备期间身份曾未确认，重新准备采集',
   completed: '正常完成',
   recovery_budget_exhausted: '自动恢复次数用尽',
   video_frozen: '画面冻结',
@@ -206,6 +209,16 @@ export const WORKER_REASON: Record<string, string> = {
   room_evidence_unavailable: '无法读取房间信息',
   identity_unstable: '房间身份尚未稳定',
   identity_conflict_unresolved: '房间身份冲突尚未解除',
+  runtime_identity_mismatch: '运行中检测到错房，重新定位',
+  runtime_identity_unavailable: '运行中身份核验过期，重新定位',
+  runtime_identity_conflict_unresolved: '运行中身份冲突未解除',
+  runtime_identity_probe_unavailable: '运行期身份核验不可用，需检查后手动重试',
+  identity_relocating: '正在重新定位并确认身份',
+  identity_risk_boundary_reset: '身份恢复后重开采集，封闭旧片风险范围',
+  startup_identity_recheck: '开录前重新确认身份',
+  startup_identity_changed: '开录准备期间身份变化',
+  identity_probe_timeout: '身份读取超时',
+  identity_probe_failed: '身份读取失败',
   target_identity_incomplete: '主播在播，身份标识未齐，等待重新查询',
   target_identity_stale: '身份信息已过期，等待重新查询',
   id_mismatch: '房间身份不符',

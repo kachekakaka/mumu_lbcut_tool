@@ -82,7 +82,8 @@ def job_object(row):
     for key in ("stop_reason", "error_reason"):
         data[key] = reason_object(data[key])
     heartbeat = json.loads(row["heartbeat_json"] or "{}")
-    for key in ("elapsed_sec", "fps", "room_identity_status"):
+    for key in ("elapsed_sec", "fps", "room_identity_status", "room_identity_checked_at",
+                "room_identity_confirmed_at", "room_identity_age_sec", "room_identity_stale", "room_identity_reason"):
         data[key] = heartbeat.get(key)
     data["heartbeat_at"] = heartbeat.get("timestamp")
     data["reconcile_requested"] = bool(data["reconcile_requested"])
