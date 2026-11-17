@@ -19,6 +19,7 @@ python -m pytest tests -q -p no:cacheprovider --basetemp "$TestRoot/work" --juni
 
 | 文件 | 验证边界 |
 | --- | --- |
+| `test_worker_state_machine.py`、`test_worker_lifecycle_state.py` | ADR 0008 全部状态对、非法迁移不改变原状态、重复状态幂等；真实 Controller 的早退、正常结束、恢复失败与异常收尾状态顺序，设备和采集边界为替身 |
 | `test_console_controls.py`、`test_scheduler_integration.py` | 真实 SQLite、本场意图、失败恢复、按主播停止、命令原子提交与幂等、跨来源迟到观测；设备与解析结果为注入边界 |
 | `test_console_api.py` | FastAPI 请求/响应、严格参数、分页与筛选、历史关联、北京时间统计、告警、日志尾部和静态托管；测试日志与静态夹具均在临时目录 |
 | `test_console_query_process.py` | 真实受控子进程；分阶段阻塞、IPC 截断、重复超时、容量与解析器进程复用、回收失败。网络阻塞为合成注入，不调用外网 |

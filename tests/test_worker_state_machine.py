@@ -38,20 +38,24 @@ def test_state_machine_valid_transitions():
     assert sm.state == WorkerState.STOPPED
 
 
-def test_state_machine_rejects_invalid_transitions():
-    """状态机严禁非法跃迁，如 PREFLIGHT 直接到 RECOVERING，或 STOPPED 逆迁到 RECORDING。"""
-    sm = WorkerStateMachine()
-    assert sm.state == WorkerState.PREFLIGHT
-
-    with pytest.raises(InvalidStateTransitionError):
-        sm.transition_to(WorkerState.RECOVERING)
-
-    sm.transition_to(WorkerState.RECORDING)
-    sm.transition_to(WorkerState.STOPPING)
-    sm.transition_to(WorkerState.STOPPED)
-
-    with pytest.raises(InvalidStateTransitionError):
-        sm.transition_to(WorkerState.RECORDING)
+@pytest.mark.parametrize('source', list(WorkerState))
+@pytest.mark.parametrize('target', list(WorkerState))
+def test_state_machine_transition_contract(source, target):
+    """独立按 ADR 0008 核对全部状态对，不从实现的允许表推导预期。"""
+    permitted = {
+        ('PREFLIGHT', 'RECORDING'), ('PREFLIGHT', 'STOPPING'),
+        ('RECORDING', 'RECOVERING'), ('RECORDING', 'STOPPING'),
+        ('RECOVERING', 'RECORDING'), ('RECOVERING', 'STOPPING'),
+        ('STOPPING', 'STOPPED'),
+    }
+    sm = WorkerStateMachine(source)
+    if source == target or (source.value, target.value) in permitted:
+        sm.transition_to(target)
+        assert sm.state == target
+    else:
+        with pytest.raises(InvalidStateTransitionError):
+            sm.transition_to(target)
+        assert sm.state == source
 
 
 def test_generation_action_queue_discards_stale_actions():

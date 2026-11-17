@@ -47,17 +47,18 @@ class WorkerStateMachine:
     """严格有向状态机。
 
     合法迁移图：
-    - PREFLIGHT  -> RECORDING, STOPPING, STOPPED
-    - RECORDING  -> RECOVERING, STOPPING, STOPPED
-    - RECOVERING -> RECORDING, STOPPING, STOPPED
+    - PREFLIGHT  -> RECORDING, STOPPING
+    - RECORDING  -> RECOVERING, STOPPING
+    - RECOVERING -> RECORDING, STOPPING
     - STOPPING   -> STOPPED
     - STOPPED    -> (终态，禁止任何迁出)
+    重复请求当前状态为幂等空操作；所有结束路径必须先进入 STOPPING。
     """
 
     ALLOWED_TRANSITIONS = {
-        WorkerState.PREFLIGHT: {WorkerState.RECORDING, WorkerState.STOPPING, WorkerState.STOPPED},
-        WorkerState.RECORDING: {WorkerState.RECOVERING, WorkerState.STOPPING, WorkerState.STOPPED},
-        WorkerState.RECOVERING: {WorkerState.RECORDING, WorkerState.STOPPING, WorkerState.STOPPED},
+        WorkerState.PREFLIGHT: {WorkerState.RECORDING, WorkerState.STOPPING},
+        WorkerState.RECORDING: {WorkerState.RECOVERING, WorkerState.STOPPING},
+        WorkerState.RECOVERING: {WorkerState.RECORDING, WorkerState.STOPPING},
         WorkerState.STOPPING: {WorkerState.STOPPED},
         WorkerState.STOPPED: set(),  # 终态无迁出
     }
