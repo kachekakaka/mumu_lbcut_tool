@@ -608,6 +608,25 @@ def test_quality_warnings_for_one_segment_are_all_kept(tmp_path):
     assert [r['flag'] for r in risks] == ['overlay_live_panel_window', 'low_frame_rate', 'visual_check_unavailable']
 
 
+def test_late_incomplete_quality_does_not_block_other_worker_events(system):
+    e = system
+    target = e.store.add_target('A', now=e.clock())
+    observe(e, {'A': RoomStatus.LIVE})
+    pump(e, lambda: len(e.children) == 1)
+    current = e.children[0]
+    with e.store.transaction() as db:
+        db.execute("""INSERT INTO jobs(id,target_id,session_key,status,created_at,ended_at,exit_code,collection_complete,vmindex)
+                      VALUES('old',?,'old','finished',1,2,0,1,?)""", (target, current.spec.vmindex))
+    e.scheduler._events.put(('old', dict(event='segment_quality_warning', event_id='late', segment_index=99)))
+    current.emit('heartbeat', fps=20, elapsed_sec=10)
+    e.scheduler._drain_events()
+    assert e.store.row("SELECT status FROM jobs WHERE id='old'")['status'] == 'failed'
+    job = e.store.row('SELECT * FROM jobs WHERE id=?', (current.spec.job_id,))
+    assert json.loads(job['heartbeat_json'])['fps'] == 20
+    assert current.alive and job['status'] == 'running'
+    assert e.scheduler._event_pending is None and e.scheduler._events.empty()
+
+
 def test_dynamic_instance_discovery_defaults_disabled_and_cleans_removed_ghost(tmp_path):
     clock, network = Clock(), Network()
     store = Store(tmp_path / 'state' / 'orchestrator.sqlite3')

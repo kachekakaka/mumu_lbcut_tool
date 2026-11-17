@@ -43,3 +43,32 @@ it('身份仅表示最近报告；已完成切片刷新后仍显示迟到的错�
   expect(wrapper.text()).toContain('完成但有警告')
   expect(wrapper.text()).toContain('可能包含错房画面')
 })
+
+it('成功任务刷新后显示迟到风险条数，再显示收集不完整失败原因', async () => {
+  const job = { id: 'job-t20', status: 'finished', nickname: '质量测试', created_at: 1000,
+    recent_events: [] } as unknown as Job
+  const segment = { job_id: job.id, segment_index: 1, status: 'finished', nickname: '质量测试',
+    file_path: null, quality_flags: [] } as unknown as Segment
+  vi.mocked(api.job).mockResolvedValue(job)
+  vi.mocked(api.segments).mockResolvedValue({ items: [segment], total: 1, limit: 20, offset: 0, generated_at: 1001 })
+  const router = createRouter({ history: createMemoryHistory(), routes: [{ path: '/:p(.*)', component: { template: '<div/>' } }] })
+  const wrapper = mount(JobDetail, { props: { jobId: job.id }, global: { plugins: [ElementPlus, router] } })
+  await flushPromises()
+  const risk = { flag: 'low_frame_rate', suspected_start_time: null }
+  vi.mocked(api.job).mockResolvedValue({ ...job, status: 'finished_with_warnings' })
+  vi.mocked(api.segments).mockResolvedValue({ items: [{ ...segment, quality_flags: [risk, risk] }],
+    total: 1, limit: 20, offset: 0, generated_at: 1002 })
+  tick.value++
+  await nextTick()
+  await flushPromises()
+  expect(wrapper.text()).toContain('完成但有警告')
+  expect(wrapper.text()).toContain('低帧率 · 2 条')
+  vi.mocked(api.job).mockResolvedValue({ ...job, status: 'failed', exit_code: 30,
+    error_reason: { code: 'event_collection_incomplete', detail: '迟到质量事件，切片 2：未知切片' } })
+  tick.value++
+  await nextTick()
+  await flushPromises()
+  expect(wrapper.text()).toContain('失败')
+  expect(wrapper.text()).toContain('迟到质量事件，切片 2：未知切片')
+  expect(wrapper.text()).toContain('低帧率 · 2 条')
+})

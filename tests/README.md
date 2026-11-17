@@ -30,6 +30,9 @@ python -m pytest tests -q -p no:cacheprovider --basetemp "$TestRoot/work" --juni
 | `test_aac_without_keyflag.py` | 合成无关键标记 AAC 输入、旧命令丢音轨负对照、真实命名管道分段、所有编码包逐字节一致、逐流 DTS 单调、所有分段完整解码；不是 MuMu 实机 |
 | `test_continuous_real_transport.py`、`test_stream_monitor_media.py` | 固定版本真实媒体传输、总时长封口与分析分支重建；循环输入可能有 AAC padding，CSV 相邻端点不替代逐包无漏失校验 |
 | `test_runtime_identity.py` | 运行期双样本、冲突宽限与失证期限、开录证据过期、同 Activity 错房恢复、迟到观察、风险回标与受控边界重建；固定时钟及设备注入不能替代实机时延验收 |
+| `test_quality_delivery.py`、`test_worker_events.py` | 质量事件编号／无编号重投、日志回放同编号、正常迟到回标、未知／未完成切片完整性异常、原任务与新任务隔离、事务回滚；调度队列不中断由 `test_scheduler_integration.py` 补充 |
+
+质量标记的 HTTP 非法时间投影、固定时钟跨 24 小时窗口和任务摘要见 `test_console_api.py` 的 `test_quality_*`。原始风险经存储写入，实际列表请求必须成功；单片是内部查询入口，使用同一响应模型验证，不假定存在单片 GET 接口。历史实施和页面联验结果见 [T20 验证记录](../docs/证据/验证/20261117-T20质量标记去重与汇总实施验证.md)。
 
 ## 前端测试
 
@@ -42,6 +45,8 @@ npm run build       # Vue TypeScript 检查与生产构建
 ```
 
 脚本定义以 `web/package.json` 为准。组件测试使用 jsdom 与接口替身，不打开真实录制机桌面、不证明浏览器布局或手机访问已通过；构建成功也不替代页面联调。按改动核对[当前页面交互](../docs/设计说明.md#控制台页面与交互)和[接口契约](../docs/控制台接口契约.md)。
+
+`quality_flags.test.ts` 核对真实提示组件接收的完整条数、疑似时间与未知条数文案，包括同内容多条、零值、非有限值和名称分组；`job_identity.test.ts` 核对轮询刷新后的风险保留、告警完成和完整性失败原因。
 
 ## 实机验收与记录
 

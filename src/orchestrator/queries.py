@@ -1,6 +1,7 @@
 """控制台只读投影：一次响应一个 SQLite 快照，固定筛选与排序。"""
 from datetime import datetime, timedelta, timezone
 import json
+import math
 from pathlib import Path
 import time
 
@@ -91,13 +92,18 @@ def job_object(row):
     return data
 
 
+def finite_time(value):
+    """未知时间投影为空；不能让单条异常风险拖垮整个响应。"""
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) else None
+
+
 def segment_object(row):
     data = fields(row, "job_id,target_id,nickname,target_raw,segment_index,status,file_path,duration_sec,file_size_mb,is_final,reason,created_at,started_at,ended_at,updated_at")
     data["is_final"] = bool(data["is_final"])
     data["reason"] = reason_object(data["reason"])
     if row["status"] == "started":
         data["file_path"] = row["file_path"] or row["raw_path"]
-    data["quality_flags"] = [{"flag": r.get("flag"), "suspected_start_time": r.get("suspected_start_time")}
+    data["quality_flags"] = [{"flag": r.get("flag"), "suspected_start_time": finite_time(r.get("suspected_start_time"))}
                              for r in json.loads(row["risk_json"] or "[]")]
     return data
 
@@ -241,9 +247,10 @@ class Queries:
                                    reason=reason_object(j["error_reason"] or "needs_reconcile"), attempts=None, retry_at=None, timestamp=j["ended_at"] or j["created_at"]))
             for s in db.execute(SEGMENT_SQL + " WHERE s.updated_at>=?", (now - 86400,)):
                 risks = json.loads(s["risk_json"] or "[]")
-                risk_time = max((r.get("timestamp") or s["updated_at"] for r in risks), default=0)
+                times = [finite_time(r.get("timestamp")) for r in risks]
+                risk_time = max((stamp if stamp is not None else s["updated_at"] for stamp in times), default=0)
                 for kind, stamp, message in (("segment_quality", risk_time, "segment_quality"), ("segment_aborted", s["ended_at"] or 0, s["reason"] or "segment_aborted")):
-                    if stamp < now - 86400 or (kind == "segment_aborted" and s["status"] != "aborted"):
+                    if stamp < now - 86400 or (kind == "segment_quality" and not risks) or (kind == "segment_aborted" and s["status"] != "aborted"):
                         continue
                     alerts.append(dict(type=kind, object_type="segment", target_id=s["target_id"], nickname=s["nickname"], target_raw=s["target_raw"], job_id=s["job_id"], segment_index=s["segment_index"],
                                        reason=reason_object(message), attempts=None, retry_at=None, timestamp=stamp))

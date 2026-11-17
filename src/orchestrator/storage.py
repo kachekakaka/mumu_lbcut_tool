@@ -1,6 +1,7 @@
 """最小调度持久化：SQLite 事务、活跃任务/实例唯一约束、幂等事件、任务结果规则和人工命令。"""
 from contextlib import contextmanager
 import json
+import logging
 import math
 from pathlib import Path
 import re
@@ -11,6 +12,9 @@ import uuid
 
 from src.mvp.room_resolver import ResolvedRoom
 from src.worker.room_locator import valid_identity_id
+
+
+logger = logging.getLogger(__name__)
 
 
 def identity_admission(target, now, freshness_sec=60):
@@ -453,6 +457,7 @@ class Store:
         stamp = stamp if isinstance(stamp, (int, float)) and not isinstance(stamp, bool) and math.isfinite(stamp) else now
         if event.get("job_id") not in (None, "", job_id):
             raise ValueError("Worker 事件 job_id 不匹配")
+        quality_issue = None
         with self.transaction() as db:
             if db.execute("INSERT OR IGNORE INTO events VALUES(?,?,?,?,?)", (key, job_id, kind, payload, now)).rowcount == 0:
                 return
@@ -464,29 +469,53 @@ class Store:
                     db.execute("UPDATE jobs SET heartbeat_json=? WHERE id=?", (json.dumps(dict(event, timestamp=stamp), ensure_ascii=False), job_id))
             if kind in ("segment_started", "segment_finished", "segment_aborted", "segment_quality_warning"):
                 idx = int(event["segment_index"])
-                db.execute("INSERT OR IGNORE INTO segments(job_id,segment_index,created_at,updated_at) VALUES(?,?,?,?)", (job_id, idx, stamp, stamp))
-                db.execute("UPDATE segments SET updated_at=? WHERE job_id=? AND segment_index=?", (stamp, job_id, idx))
                 old = db.execute("SELECT * FROM segments WHERE job_id=? AND segment_index=?", (job_id, idx)).fetchone()
+                db.execute("INSERT OR IGNORE INTO segments(job_id,segment_index,created_at,updated_at) VALUES(?,?,?,?)", (job_id, idx, stamp, stamp))
+                db.execute("UPDATE segments SET updated_at=MAX(updated_at,?) WHERE job_id=? AND segment_index=?", (stamp, job_id, idx))
                 if kind == "segment_started":
                     db.execute("UPDATE segments SET started=1,raw_path=?,started_at=? WHERE job_id=? AND segment_index=?", (event.get("file_path"), stamp, job_id, idx))
                     # Popen 成功不等于开始录制；首片开始后才将任务标为 running，并把失败计数清零。
                     if db.execute("UPDATE jobs SET status='running' WHERE id=? AND status='starting'", (job_id,)).rowcount:
                         db.execute("UPDATE targets SET attempts=0 WHERE id=(SELECT target_id FROM jobs WHERE id=?)", (job_id,))
                 elif kind == "segment_quality_warning":
-                    # 同一切片可先后出现遮挡、低帧率、画面检查不可用，全部保留为列表。
-                    risks = json.loads(old["risk_json"]) if old["risk_json"] else []
-                    risks.append(dict(event, timestamp=stamp))
-                    db.execute("UPDATE segments SET risk_json=? WHERE job_id=? AND segment_index=?",
-                               (json.dumps(risks, sort_keys=True, ensure_ascii=False), job_id, idx))
+                    quality_issue = self._record_quality_warning(db, job_id, idx, old, event, stamp)
                 else:
                     status = "finished" if kind == "segment_finished" else "aborted"
-                    if old["status"] in ("finished", "aborted"):
+                    if old and old["status"] in ("finished", "aborted"):
                         if old["status"] != status or old["file_path"] != event.get("file_path"):
                             raise ValueError("同一切片收到冲突终态")
                         return
                     db.execute("""UPDATE segments SET status=?,file_path=?,duration_sec=?,file_size_mb=?,is_final=?,reason=?,ended_at=?
                         WHERE job_id=? AND segment_index=?""", (status, event.get("file_path"), event.get("duration_sec"),
                         event.get("file_size_mb"), int(bool(event.get("is_final"))), event.get("reason"), stamp, job_id, idx))
+        if quality_issue:
+            logger.warning("迟到质量事件收集不完整：job_id=%s event_id=%s segment_index=%s reason=%s",
+                           job_id, event.get("event_id"), idx, quality_issue)
+
+    def _record_quality_warning(self, db, job_id, idx, old, event, stamp):
+        """保留每条独立风险；只更新任务结果，不重跑实例释放或目标重试。"""
+        risks = json.loads(old["risk_json"]) if old and old["risk_json"] else []
+        risks.append(dict(event, timestamp=stamp))
+        db.execute("UPDATE segments SET risk_json=? WHERE job_id=? AND segment_index=?",
+                   (json.dumps(risks, sort_keys=True, ensure_ascii=False), job_id, idx))
+        job = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if job["status"] not in ("finished", "finished_with_warnings", "failed", "cancelled"):
+            return None
+        success = job["status"] in ("finished", "finished_with_warnings")
+        issue = ("未知切片" if old is None else "切片未开始" if not old["started"] else
+                 "切片未终结" if old["status"] not in ("finished", "aborted") else
+                 "原完整性标记异常" if success and not job["collection_complete"] else None)
+        if issue:
+            db.execute("UPDATE jobs SET collection_complete=0 WHERE id=?", (job_id,))
+            if success:
+                reason = f"event_collection_incomplete: 迟到质量事件，切片 {idx}：{issue}"
+                if job["error_reason"]:
+                    reason += f"；原原因：{job['error_reason']}"
+                db.execute("UPDATE jobs SET status='failed',exit_code=?,error_reason=? WHERE id=?",
+                           (job["exit_code"] or 30, reason, job_id))
+            return issue
+        db.execute("UPDATE jobs SET status='finished_with_warnings' WHERE id=? AND status='finished' AND exit_code=0", (job_id,))
+        return None
 
     def finish_job(self, job_id: str, code: int, now: float, collection_complete: bool,
                    reason: str = "", hold_instance: bool = False, ended_at: float | None = None):

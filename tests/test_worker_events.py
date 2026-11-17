@@ -12,6 +12,7 @@ from src.worker.events import (
     SegmentFinishedEvent,
     StreamEndedEvent,
     LoginBlockedEvent,
+    SegmentQualityWarningEvent,
 )
 
 
@@ -107,6 +108,30 @@ def test_stream_loss_without_journal_still_requests_stop():
     emitter.emit(HeartbeatEvent())
     emitter.emit(HeartbeatEvent())
     assert lost == [1]
+
+
+def test_quality_stdout_and_journal_replay_share_event_id(tmp_path):
+    from src.orchestrator.storage import Store
+    stream = BrokenAfter(1)
+    journal = tmp_path / 'quality.ndjson'
+    emitter = WorkerEventEmitter(stream, fallback_path=journal)
+    emitter.emit(SegmentQualityWarningEvent(segment_index=1, flag='low_frame_rate', suspected_start_time=10))
+    emitter.emit(SegmentQualityWarningEvent(segment_index=1, flag='low_frame_rate', suspected_start_time=10))
+    emitter.close()
+    live = json.loads(stream.lines[0])
+    replay = [json.loads(line) for line in journal.read_text(encoding='utf-8').splitlines()]
+    assert replay[0] == live and replay[0]['event_id'] != replay[1]['event_id']
+    store = Store(tmp_path / 'replay.sqlite3')
+    try:
+        target = store.add_target('回放', now=1)
+        with store.transaction() as db:
+            db.execute("INSERT INTO jobs(id,target_id,session_key,status,created_at) VALUES('j',?,'s','running',1)", (target,))
+        for event in [live, *replay, *replay]:
+            store.record_event('j', event, 20)
+        assert len(store.rows('SELECT * FROM events')) == 2
+        assert len(json.loads(store.row('SELECT risk_json FROM segments')['risk_json'])) == 2
+    finally:
+        store.close()
 
 
 def test_real_closed_stdout_pipe_switches_to_journal(tmp_path):

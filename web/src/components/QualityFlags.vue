@@ -16,17 +16,17 @@ interface GroupedFlag {
 
 const groupedFlags = computed<GroupedFlag[]>(() => {
   if (!props.flags || !props.flags.length) return []
-  const map = new Map<string, { flag: string | null; times: number[]; count: number }>()
+  const map = new Map<string | null, { flag: string | null; times: number[]; count: number }>()
 
   for (const f of props.flags) {
-    const key = f.flag ?? '__null__'
+    const key = f.flag
     let item = map.get(key)
     if (!item) {
       item = { flag: f.flag, times: [], count: 0 }
       map.set(key, item)
     }
     item.count++
-    if (f.suspected_start_time != null) {
+    if (typeof f.suspected_start_time === 'number' && Number.isFinite(f.suspected_start_time)) {
       item.times.push(f.suspected_start_time)
     }
   }
@@ -37,18 +37,17 @@ const groupedFlags = computed<GroupedFlag[]>(() => {
     const lastTime = item.times.length ? item.times[item.times.length - 1] : null
     const code = item.flag ? `（${item.flag}）` : ''
 
-    let tooltip = ''
-    if (item.count > 1) {
-      if (firstTime != null && lastTime != null && firstTime !== lastTime) {
-        tooltip = `发生 ${item.count} 次，首次：${fmtTime(firstTime)}，最近：${fmtTime(lastTime)}${code}`
-      } else if (firstTime != null) {
-        tooltip = `发生 ${item.count} 次，疑似开始：${fmtTime(firstTime)}${code}`
-      } else {
-        tooltip = `发生 ${item.count} 次${code}`
-      }
+    let tooltip = `标记 ${item.count} 条；`
+    if (firstTime == null) {
+      tooltip += '疑似开始时间未知'
+    } else if (firstTime !== lastTime) {
+      tooltip += `最早疑似开始：${fmtTime(firstTime)}；最晚疑似开始：${fmtTime(lastTime)}`
     } else {
-      tooltip = `疑似开始：${fmtTime(firstTime)}${code}`
+      tooltip += `疑似开始：${fmtTime(firstTime)}`
     }
+    const unknown = item.count - item.times.length
+    if (firstTime != null && unknown) tooltip += `；另有 ${unknown} 条疑似开始时间未知`
+    tooltip += code
 
     return {
       flag: item.flag,
@@ -71,7 +70,7 @@ const groupedFlags = computed<GroupedFlag[]>(() => {
       placement="top"
     >
       <el-tag type="warning" size="small">
-        {{ qualityFlagLabel(g.flag) }}{{ g.count > 1 ? ` × ${g.count}` : '' }}
+        {{ qualityFlagLabel(g.flag) }}{{ g.count > 1 ? ` · ${g.count} 条` : '' }}
       </el-tag>
     </el-tooltip>
   </span>

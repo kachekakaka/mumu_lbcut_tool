@@ -194,6 +194,103 @@ def test_runtime_identity_projection_late_risk_and_capability_stop(api):
     assert t['needs_fix_reason']['code']=='runtime_identity_probe_unavailable'
 
 
+def test_quality_invalid_suspected_times_do_not_break_http_page(api):
+    from src.orchestrator.api import SegmentResponse
+    client, store, _, _ = api
+    _, job = seed(store)
+    invalid = [None, True, False, '123', 'bad', [], {}, float('nan'), float('inf'), -float('inf')]
+    values = [123.5, *invalid, 0, -1]
+    for n, value in enumerate(values):
+        store.record_event(job, dict(event='segment_quality_warning', event_id=f'risk{n}', segment_index=1,
+                           timestamp=100, flag='future_flag', suspected_start_time=value), 101)
+    store.record_event(job, dict(event='segment_quality_warning', event_id='missing', segment_index=1, timestamp=100), 102)
+    raw = store.rows('SELECT payload FROM events')
+    risks = store.row('SELECT risk_json FROM segments')['risk_json']
+    response = client.get('/api/segments?has_quality_flags=true&job_id=' + job)
+    assert response.status_code == 200, response.text
+    flags = response.json()['items'][0]['quality_flags']
+    assert [r['suspected_start_time'] for r in flags] == [123.5, *([None] * len(invalid)), 0, -1, None]
+    # 单片查询是内部入口；现有 HTTP 没有单片 GET，不为测试增加产品接口。
+    detail = SegmentResponse.model_validate(Queries(store).segment(job, 1)).model_dump()
+    assert detail['quality_flags'] == flags
+    assert store.rows('SELECT payload FROM events') == raw
+    assert store.row('SELECT risk_json FROM segments')['risk_json'] == risks
+
+
+@pytest.mark.parametrize('old_kind', ['segment_quality_warning', 'segment_started', 'segment_finished'])
+def test_quality_recent_alert_survives_event_outside_window(api, old_kind):
+    _, store, _, _ = api
+    _, job = seed(store)
+    now = 1_800_000_000
+    boundary = now - 86400
+    store.record_event(job, dict(event='segment_quality_warning', event_id='new', segment_index=1,
+                       timestamp=boundary + 10, flag='low_frame_rate'), now)
+    store.record_event(job, dict(event=old_kind, event_id='old', segment_index=1,
+                       timestamp=boundary - 10, flag='low_frame_rate', file_path='clip.mp4'), now + 1)
+    assert store.row('SELECT updated_at FROM segments')['updated_at'] == boundary + 10
+    alerts = Queries(store, clock=lambda: now).overview()['alerts']
+    quality = [a for a in alerts['items'] if a['type'] == 'segment_quality']
+    assert len(quality) == 1 and quality[0]['timestamp'] == boundary + 10
+
+
+def test_quality_window_boundary_and_nonrisk_does_not_refresh_old_risk(api):
+    _, store, _, _ = api
+    _, job = seed(store)
+    now = 1_800_000_000
+    boundary = now - 86400
+    for index, stamp in enumerate((boundary - 1, boundary, boundary + 1), 1):
+        event = dict(event='segment_quality_warning', event_id=f'r{index}', segment_index=index, timestamp=stamp)
+        store.record_event(job, event, now)
+        store.record_event(job, event, now + 100)
+    store.record_event(job, dict(event='segment_finished', event_id='new-finish', segment_index=1,
+                       timestamp=boundary + 10, file_path='clip.mp4'), now)
+    query = Queries(store, clock=lambda: now)
+    alerts = query.overview(limit=1)['alerts']
+    assert alerts['total'] == 2 and alerts['items'][0]['segment_index'] == 3
+    assert query.overview(limit=1, offset=1)['alerts']['items'][0]['segment_index'] == 2
+    assert len(json.loads(store.row('SELECT risk_json FROM segments WHERE segment_index=1')['risk_json'])) == 1
+
+
+def test_quality_zero_time_and_empty_risks_are_not_fresh(api):
+    _, store, _, _ = api
+    _, job = seed(store)
+    for index in (1, 2):
+        store.record_event(job, dict(event='segment_started', event_id=f's{index}', segment_index=index, timestamp=100), 100)
+    store.record_event(job, dict(event='segment_quality_warning', event_id='zero', segment_index=1, timestamp=0), 100)
+    # 候选都在窗口内；零值不能回退为 updated_at，空列表不能产生零时刻告警。
+    assert Queries(store, clock=lambda: 86401).overview()['alerts']['total'] == 0
+    alerts = Queries(store, clock=lambda: 100).overview()['alerts']
+    assert alerts['total'] == 1 and alerts['items'][0]['timestamp'] == 0
+
+
+@pytest.mark.parametrize('bad_stamp', [None, True, 'bad', float('nan'), float('inf')])
+def test_quality_missing_event_time_query_fallback(api, bad_stamp):
+    _, store, _, _ = api
+    _, job = seed(store)
+    store.record_event(job, dict(event='segment_quality_warning', event_id='r', segment_index=1), 100)
+    with store.transaction() as tx:
+        tx.execute('UPDATE segments SET risk_json=?', (json.dumps([dict(timestamp=bad_stamp)]),))
+    alert = Queries(store, clock=lambda: 101).overview()['alerts']['items'][0]
+    assert alert['timestamp'] == 100
+
+
+@pytest.mark.parametrize('index,expected', [(1, 'finished_with_warnings'), (2, 'failed')])
+def test_quality_late_summary_visible_through_http(api, index, expected):
+    client, store, _, _ = api
+    _, job = seed(store)
+    store.record_event(job, dict(event='segment_started', event_id='s', segment_index=1, timestamp=10), 10)
+    store.record_event(job, dict(event='segment_finished', event_id='f', segment_index=1, timestamp=20), 20)
+    store.finish_job(job, 0, 25, True)
+    store.record_event(job, dict(event='segment_quality_warning', event_id='r', segment_index=index,
+                       timestamp=30, flag='low_frame_rate'), 30)
+    assert client.get('/api/jobs/' + job).json()['status'] == expected
+    assert client.get('/api/jobs?active=false&status=' + expected).json()['total'] == 1
+    assert client.get('/api/overview').json()['job_counts'][expected] == 1
+    assert client.get('/api/segments?has_quality_flags=true').json()['total'] == 1
+    if expected == 'failed':
+        assert client.get('/api/jobs/' + job).json()['error_reason']['code'] == 'event_collection_incomplete'
+
+
 def test_log_tail_byte_limits_and_path_escape(api, tmp_path):
     client, store, runtime, config = api
     target, job = seed(store)
