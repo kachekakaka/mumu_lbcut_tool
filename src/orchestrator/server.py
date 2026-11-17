@@ -9,6 +9,7 @@ import signal
 import socket
 import threading
 import time
+import webbrowser
 
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse
@@ -36,6 +37,7 @@ class ServerConfig:
     navigation_timeout: float = 300.0
     max_runtime: float = 0.0
     static_root: Path = REPO_ROOT / "web" / "dist"
+    open_browser: bool = False
 
     def validate(self):
         from src.worker.room_locator import validate_navigation_timeout
@@ -171,6 +173,71 @@ def create_app(config, runtime=None):
     return app
 
 
+def browser_url(config):
+    host = "127.0.0.1" if config.host == "0.0.0.0" else config.host
+    if ":" in host:
+        host = f"[{host}]"
+    return f"http://{host}:{config.port}/segments"
+
+
+class ConsoleServer(uvicorn.Server):
+    def __init__(self, config, runtime):
+        super().__init__(config)
+        self.runtime = runtime
+        self.browser_attempted = False
+
+    def is_running(self):
+        runtime = self.runtime
+        with runtime.lock:
+            return (self.started and not self.should_exit and not runtime.stop.is_set()
+                    and runtime.failure is None and runtime.state == "running"
+                    and bool(runtime.thread and runtime.thread.is_alive()))
+
+    async def startup(self, sockets=None):
+        await super().startup(sockets=sockets)
+        if not self.is_running():
+            return
+        config = self.runtime.config
+        url = browser_url(config)
+        if not (config.static_root / "index.html").is_file():
+            logger.warning("服务已就绪，但前端尚未构建；构建后可访问 %s", url)
+            return
+        logger.info("控制台已就绪：%s", url)
+        if config.open_browser and not self.browser_attempted:
+            self.browser_attempted = True
+            try:
+                # 系统打开请求可能阻塞；不能占用 HTTP 循环或拖住服务退出。
+                threading.Thread(target=self.open_browser, args=(url,),
+                                 name="console-browser", daemon=True).start()
+            except Exception:
+                logger.warning("无法启动浏览器打开线程，请手动访问 %s", url, exc_info=True)
+
+    def open_browser(self, url):
+        if not self.is_running():
+            return
+        try:
+            if not webbrowser.open(url):
+                logger.warning("默认浏览器未接受打开请求，请手动访问 %s", url)
+        except Exception:
+            logger.warning("打开默认浏览器失败，请手动访问 %s", url, exc_info=True)
+
+    @contextmanager
+    def capture_signals(self):
+        old = {}
+
+        def stop(signum, frame):
+            self.runtime.request_close()
+            self.should_exit = True
+
+        try:
+            for sig in (signal.SIGINT, signal.SIGTERM, *([signal.SIGBREAK] if hasattr(signal, "SIGBREAK") else [])):
+                old[sig] = signal.signal(sig, stop)
+            yield
+        finally:
+            for sig, handler in old.items():
+                signal.signal(sig, handler)
+
+
 def run_server(config, scheduler_factory=Scheduler):
     config.validate()
     sock = socket.socket(socket.AF_INET6 if ":" in config.host else socket.AF_INET, socket.SOCK_STREAM)
@@ -182,23 +249,8 @@ def run_server(config, scheduler_factory=Scheduler):
         sock.listen(128)
         app = create_app(config, runtime)
 
-        class ConsoleServer(uvicorn.Server):
-            @contextmanager
-            def capture_signals(self):
-                old = {}
-                def stop(signum, frame):
-                    runtime.request_close()
-                    self.should_exit = True
-                try:
-                    for sig in (signal.SIGINT, signal.SIGTERM, *([signal.SIGBREAK] if hasattr(signal, "SIGBREAK") else [])):
-                        old[sig] = signal.signal(sig, stop)
-                    yield
-                finally:
-                    for sig, handler in old.items():
-                        signal.signal(sig, handler)
-
         server = ConsoleServer(uvicorn.Config(app, host=config.host, port=config.port, workers=1,
-            lifespan="on", timeout_graceful_shutdown=80, access_log=False))
+            lifespan="on", timeout_graceful_shutdown=80, access_log=False), runtime)
         runtime.on_exit = lambda: setattr(server, "should_exit", True)
         server.run(sockets=[sock])
         return 1 if runtime.failure or not server.started else 0

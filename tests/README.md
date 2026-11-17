@@ -23,7 +23,8 @@ python -m pytest tests -q -p no:cacheprovider --basetemp "$TestRoot/work" --juni
 | `test_console_controls.py`、`test_scheduler_integration.py` | 真实 SQLite、本场意图、失败恢复、按主播停止、命令原子提交与幂等、跨来源迟到观测；设备与解析结果为注入边界 |
 | `test_console_api.py` | FastAPI 请求/响应、严格参数、分页与筛选、历史关联、北京时间统计、告警、日志尾部和静态托管；测试日志与静态夹具均在临时目录 |
 | `test_console_query_process.py` | 真实受控子进程；分阶段阻塞、IPC 截断、重复超时、容量与解析器进程复用、回收失败。网络阻塞为合成注入，不调用外网 |
-| `test_console_lifecycle.py` | 独立 Windows 宿主；端口占用、双主控、初始化/调度异常、Ctrl+C/Ctrl+Break、强杀时仅回收查询 Job。模拟录制子进程不等于真实 MuMu |
+| `test_console_lifecycle.py` | 独立 Windows 宿主；端口占用、双主控、初始化/调度异常、Ctrl+C/Ctrl+Break、强杀时仅回收查询 Job；浏览器替身发起真实 HTTP 请求，覆盖慢初始化、健康旧服务冲突、缺前端、打开失败及阻塞时仍可退出。模拟录制子进程不等于真实 MuMu |
+| `test_console_browser.py` | CLI 默认值及传参、IPv4/IPv6 访问地址、HTTP 启动顺序、关闭/失败守卫、单次派发、线程和系统打开失败；浏览器调用为替身，不弹出真实浏览器 |
 | `test_real_process_delivery.py` | 真实 Worker 控制句柄、HTTP/CLI、合成媒体和事件收尾；模拟器与导航边界被替换 |
 | `test_room_scanner.py`、`test_minimal_loop_regression.py` | 逐目标收取、容量不足不分配序号、UNKNOWN 保留可信状态及任务去重 |
 | `test_pinned_media_tools.py` | 固定路径、旧版与不同构建拒绝、配套配置不一致拒绝、依赖失败前不启动设备；进程执行为替身 |
@@ -33,6 +34,8 @@ python -m pytest tests -q -p no:cacheprovider --basetemp "$TestRoot/work" --juni
 | `test_quality_delivery.py`、`test_worker_events.py` | 质量事件编号／无编号重投、日志回放同编号、正常迟到回标、未知／未完成切片完整性异常、原任务与新任务隔离、事务回滚；调度队列不中断由 `test_scheduler_integration.py` 补充 |
 
 质量标记的 HTTP 非法时间投影、固定时钟跨 24 小时窗口和任务摘要见 `test_console_api.py` 的 `test_quality_*`。原始风险经存储写入，实际列表请求必须成功；单片是内部查询入口，使用同一响应模型验证，不假定存在单片 GET 接口。历史实施和页面联验结果见 [T20 验证记录](../docs/证据/验证/20261117-T20质量标记去重与汇总实施验证.md)。
+
+浏览器启动定向回归运行 `test_console_browser.py`、`test_console_api.py`、`test_console_lifecycle.py`。夹具 `console_host.py` 默认替换浏览器并使用临时静态目录；仅人工桌面验收显式指定 `--open-browser --browser real --static-root <已构建前端目录>`，设备仍为空闲替身。候选部署入口、真实浏览器及远端验证边界见 [T19 验证记录](../docs/证据/验证/20261117-T19控制台启动实施验证.md)。
 
 ## 前端测试
 
