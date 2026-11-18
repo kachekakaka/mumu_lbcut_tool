@@ -1,5 +1,12 @@
 # 测试入口
 
+| 检查 | 运行目录 | 命令和条件 |
+| --- | --- | --- |
+| 文档链接 | 仓库根目录 | `python scripts/check_docs.py`，只需 Python 标准库和 Git。[覆盖范围](../docs/README.md#文档维护与检查) |
+| Python 测试 | 仓库根目录 | 选择已安装 `requirements-test.txt` 的 Python 3.11，再按下节运行 pytest。可用 `python -c "import sys; print(sys.executable)"` 确认当前解释器。 |
+| 前端测试 | `web/` | 首次或依赖变化后 `npm ci`，再用 `npm test`；项目已用 Node 24 和 npm 11 验证。 |
+| 前端类型检查 | `web/` | 同一套前端依赖，`npm run typecheck` 单独检查类型，`npm run build` 在类型通过后生成生产包。 |
+
 ## 后端测试
 
 在仓库根目录、Python 3.11 环境中安装 `requirements-test.txt`。Windows 子进程与信号测试只在 Windows 运行；真实媒体夹具使用与产品相同的固定 Gyan FFmpeg/ffprobe，按[运行说明](../docs/最小调度运行说明.md#固定媒体工具部署)部署。缺少这套工具会明确失败，不通过 PATH 替代或跳过来宣称媒体验收通过。
