@@ -152,7 +152,7 @@ def create_app(config, runtime=None):
     app.state.runtime = runtime
     install_api(app, runtime)
     from src.orchestrator.bilibili_api import install_accounts
-    install_accounts(app, config)
+    install_accounts(app, config, runtime)
 
     @app.get("/{path:path}")
     def static(path: str):

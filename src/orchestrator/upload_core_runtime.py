@@ -167,7 +167,7 @@ class CoreRuntime:
             return {
                 k: value[k]
                 for k in ("id", "python", "data_dir", "port", "engine_config")
-            }
+            } | {"selection": value.get("selection")}
         except (OSError, ValueError, KeyError, TypeError):
             raise BridgeError("configuration", "部署配置文件无法读取", 422) from None
 
@@ -230,12 +230,14 @@ class CoreRuntime:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             temp = self.path.with_name(str(uuid4()) + ".tmp")
             temp.write_text(
-                json.dumps({k: cfg[k] for k in values} | {"id": identifier}),
+                json.dumps({k: cfg[k] for k in values} | {
+                    "id": identifier, "selection": str(uuid4())
+                }),
                 encoding="utf8",
             )
             temp.replace(self.path)
 
-    def inspect(self, ensure=False):
+    def inspect(self, ensure=False, *, posting=False):
         with transaction(registry()) as db:
             p = self.profile()
             if p is None:
@@ -275,4 +277,10 @@ class CoreRuntime:
                     ),
                 )
                 observed = "starting"
-            return {"state": observed, "deployment": p["id"], "port": p["port"]}
+            info = {"state": observed, "deployment": p["id"], "port": p["port"]}
+            if posting and observed == "online":
+                info.update(
+                    selection=p["selection"], listener=(row["listener"], row["listener_time"]),
+                    config=json.loads(row["config"]),
+                )
+            return info

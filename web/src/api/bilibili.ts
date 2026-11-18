@@ -25,8 +25,8 @@ export async function request(path: string, body?: unknown, key?: string, image 
   if (!token) await renew()
   const send = (credential: string) => fetch(base + path, {
     method: body === undefined ? 'GET' : 'POST', cache: 'no-store',
-    signal: AbortSignal.timeout(15000),
-    headers: { 'X-Mumu-Page': credential, ...(deployment ? {'X-Mumu-Deployment':deployment} : {}), ...(body === undefined ? {} : {
+    signal: AbortSignal.timeout(path.startsWith('/segment-uploads') ? 50000 : 15000),
+    headers: { 'X-Mumu-Page': credential, ...(deployment && !path.startsWith('/segment-uploads') ? {'X-Mumu-Deployment':deployment} : {}), ...(body === undefined ? {} : {
       'Content-Type': 'application/json', 'Idempotency-Key': key!
     }) }, body: JSON.stringify(body),
   }).then(read)

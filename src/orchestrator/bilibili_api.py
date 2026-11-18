@@ -50,7 +50,7 @@ def failure(code, message, status):
     )
 
 
-def install_accounts(app, config):
+def install_accounts(app, config, runtime=None):
     core = CoreRuntime(
         config.core_profile or config.data_dir / "upload-core" / "profile.json"
     )
@@ -294,4 +294,8 @@ def install_accounts(app, config):
             store.finish(key, "rejected" if rejected else "unknown", error=code)
             raise
 
+    if runtime is not None:
+        from .segment_upload_api import install_segment_uploads
+
+        install_segment_uploads(router, config, runtime, core)
     app.include_router(router)

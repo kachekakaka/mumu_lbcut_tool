@@ -117,8 +117,12 @@ def safe_code(code):
 
 
 async def call(port, path, *, body=None, key=None, png=False, probe=False):
+    return await _call(port, path, body=body, key=key, png=png, probe=probe)
+
+
+async def _call(port, path, *, body=None, key=None, png=False, probe=False, posting=False):
     headers = {
-        "X-Upload-Platform-Client": "gui-bridge-v1",
+        "X-Upload-Platform-Client": "cli-v1" if posting else "gui-bridge-v1",
         "Accept-Encoding": "identity",
     }
     if key:
@@ -139,7 +143,7 @@ async def call(port, path, *, body=None, key=None, png=False, probe=False):
                 headers=headers,
             ) as response,
         ):
-            good = response.status_code in (200, 202)
+            good = response.status_code in ((200, 201) if posting else (200, 202))
             image = png and good
             limit = PNG_LIMIT if image else 1024 * 1024
             mime = response.headers.get("content-type", "").split(";")[0]
@@ -168,7 +172,8 @@ async def call(port, path, *, body=None, key=None, png=False, probe=False):
             if not isinstance(data, dict):
                 raise TypeError
             if not good:
-                code = safe_code(data.get("code"))
+                raw = data.get("code")
+                code = safe_code(raw.lower() if posting and isinstance(raw, str) else raw)
                 raise BridgeError(code, "Core 未完成本次请求", response.status_code)
             return data
     except (TimeoutError, httpx.HTTPError):
