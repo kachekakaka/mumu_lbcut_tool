@@ -44,6 +44,7 @@ def build_parser():
     run.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     run.add_argument("--host", default="127.0.0.1")
     run.add_argument("--port", type=int, default=8000)
+    run.add_argument("--core-profile", type=Path, help="本机扫码部署配置路径")
     run.add_argument("--open-browser", action="store_true",
                      help="服务就绪后在运行服务的计算机上打开默认浏览器")
     run.add_argument("--instances", default=None, help="可选初始启用的实例，例如 2,3；不传则保留数据库配置")
@@ -69,7 +70,7 @@ def main(argv=None) -> int:
             config = ServerConfig(args.data_dir.resolve(), args.output_dir.resolve(), instances,
                 host=args.host, port=args.port, scan_interval=args.scan_interval, segment_duration=args.segment_duration,
                 navigation_timeout=args.navigation_timeout, max_runtime=args.max_runtime,
-                open_browser=args.open_browser)
+                open_browser=args.open_browser, core_profile=args.core_profile)
             return run_server(config)
         if args.command == "stop" and (bool(args.job_id) == bool(args.target_id) or bool(args.target_id) != bool(args.session_key)):
             parser.error("stop JOB_ID 与 stop --target-id ID --session-key KEY 必须二选一")

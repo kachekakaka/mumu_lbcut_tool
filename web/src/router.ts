@@ -13,6 +13,7 @@ export const router = createRouter({
     { path: '/targets', component: TargetsView },
     { path: '/jobs', component: JobsView },
     { path: '/segments', component: SegmentsView },
+    { path: '/accounts', component: () => import('./views/AccountsView.vue') },
     { path: '/:rest(.*)', redirect: '/' },
   ],
 })

@@ -20,6 +20,7 @@ const NAV = [
   { path: '/targets', label: '主播' },
   { path: '/jobs', label: '任务' },
   { path: '/segments', label: '切片' },
+  { path: '/accounts', label: '账号' },
 ]
 
 const serviceWarning = computed(() => {

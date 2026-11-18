@@ -38,6 +38,7 @@ class ServerConfig:
     max_runtime: float = 0.0
     static_root: Path = REPO_ROOT / "web" / "dist"
     open_browser: bool = False
+    core_profile: Path | None = None
 
     def validate(self):
         from src.worker.room_locator import validate_navigation_timeout
@@ -150,6 +151,8 @@ def create_app(config, runtime=None):
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.runtime = runtime
     install_api(app, runtime)
+    from src.orchestrator.bilibili_api import install_accounts
+    install_accounts(app, config)
 
     @app.get("/{path:path}")
     def static(path: str):
@@ -250,7 +253,7 @@ def run_server(config, scheduler_factory=Scheduler):
         app = create_app(config, runtime)
 
         server = ConsoleServer(uvicorn.Config(app, host=config.host, port=config.port, workers=1,
-            lifespan="on", timeout_graceful_shutdown=80, access_log=False), runtime)
+            lifespan="on", timeout_graceful_shutdown=80, access_log=False, proxy_headers=False), runtime)
         runtime.on_exit = lambda: setattr(server, "should_exit", True)
         server.run(sockets=[sock])
         return 1 if runtime.failure or not server.started else 0
