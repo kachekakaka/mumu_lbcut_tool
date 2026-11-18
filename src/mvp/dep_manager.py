@@ -10,6 +10,7 @@ import logging
 import subprocess
 
 from src.mvp.config import SCRCPY_DIR, FFMPEG_DIR, FFMPEG_BUILD, get_adb_exe
+from src.mvp.command import run_client
 
 logger = logging.getLogger(__name__)
 
@@ -40,9 +41,7 @@ class DependencyManager:
             if not path.is_file():
                 raise FileNotFoundError(f"缺少固定媒体工具：{path}；请部署 Gyan {FFMPEG_BUILD} 的 ffmpeg/ffprobe 配套文件")
             try:
-                result = subprocess.run([str(path), "-version"], capture_output=True, text=True,
-                    encoding="utf-8", errors="replace", timeout=8,
-                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+                result = run_client([str(path), "-version"], timeout=8)
             except (OSError, subprocess.SubprocessError) as exc:
                 raise RuntimeError(f"固定媒体工具无法执行：{path}：{exc}") from exc
             lines = result.stdout.splitlines()
@@ -127,6 +126,13 @@ class DependencyManager:
             raise RuntimeError(f"解压后未找到 {self.scrcpy_exe_path}，请检查发布包内容。")
 
         logger.info(f"scrcpy 已就绪: {self.scrcpy_exe_path}")
+        return self.scrcpy_exe_path
+
+    def require_scrcpy(self) -> Path:
+        """仅检查本地依赖，不下载或改写任何工具文件。"""
+        for path in (self.scrcpy_exe_path, self.scrcpy_dir / 'scrcpy-server'):
+            if not path.is_file():
+                raise FileNotFoundError(f'缺少本地采集工具：{path}')
         return self.scrcpy_exe_path
 
     def _get_latest_win64_url(self) -> str:

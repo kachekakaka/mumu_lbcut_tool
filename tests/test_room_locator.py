@@ -173,19 +173,20 @@ def test_real_navigator_exposes_active_observation_and_correction():
     assert callable(getattr(WorkerNavigator,'navigate_route',None))
 
 
-def test_ui_dump_accepts_complete_xml_when_mumu_uiautomator_exits_139():
+def test_ui_dump_uses_32bit_entry_and_reads_only_fresh_xml():
     from src.worker.popup_bypasser import PopupBypasser
     from types import SimpleNamespace
     calls=[]
     class Adb:
         def run_adb(self,*args,**kwargs):
             calls.append((args,kwargs))
-            if args[:3] == ("shell","uiautomator","dump"):
-                assert len(args)==4 and args[3].startswith("/sdcard/wp_ui_")
+            if len(args)==2 and 'com.android.commands.uiautomator.Launcher dump ' in args[1]:
+                assert '/system/bin/app_process32 ' in args[1]
+                assert args[1].split()[-1].startswith("/sdcard/wp_ui_")
                 assert kwargs.get("check") is False
-                return SimpleNamespace(exit_code=139,stdout="UI hierarchy dumped",stderr="Segmentation fault")
+                return SimpleNamespace(exit_code=0,stdout="UI hierarchy dumped",stderr="")
             if args[:2] == ("shell","cat"):
-                assert args[2] == next(c[0][3] for c in reversed(calls) if c[0][:3] == ("shell","uiautomator","dump"))
+                assert args[2] == next(c[0][1].split()[-1] for c in reversed(calls) if len(c[0])==2)
                 return SimpleNamespace(exit_code=0,stdout='<?xml version="1.0"?><hierarchy><node text="当前页面"/></hierarchy>',stderr="")
             if args[:3] == ("shell","rm","-f"):
                 return SimpleNamespace(exit_code=0,stdout="",stderr="")
@@ -193,7 +194,7 @@ def test_ui_dump_accepts_complete_xml_when_mumu_uiautomator_exits_139():
     probe=PopupBypasser(Adb())
     assert "当前页面" in probe.get_ui_dump()
     assert "当前页面" in probe.get_ui_dump()
-    paths=[c[0][3] for c in calls if c[0][:3] == ("shell","uiautomator","dump")]
+    paths=[c[0][1].split()[-1] for c in calls if len(c[0])==2]
     assert len(set(paths))==2
     assert sum(c[0][:3] == ("shell","rm","-f") for c in calls)==2
 
@@ -205,13 +206,13 @@ def test_ui_dump_failure_never_reads_old_fixed_file():
     class Adb:
         def run_adb(self,*args,**kwargs):
             calls.append(args)
-            if args[:3] == ("shell","uiautomator","dump"):
+            if len(args)==2 and 'com.android.commands.uiautomator.Launcher dump ' in args[1]:
                 return SimpleNamespace(exit_code=139,stdout="",stderr="Segmentation fault")
             if args[:2] == ("shell","cat"):
                 return SimpleNamespace(exit_code=1,stdout="",stderr="No such file")
             return SimpleNamespace(exit_code=0,stdout="",stderr="")
     assert PopupBypasser(Adb()).get_ui_dump()==""
-    assert any(x[:2] == ("shell","cat") for x in calls)
+    assert not any(x[:2] == ("shell","cat") for x in calls)
     assert any(x[:3] == ("shell","rm","-f") for x in calls)
 
 
@@ -221,7 +222,7 @@ def test_ui_dump_timeout_returns_empty_and_cleans_unique_path():
     class Adb:
         def run_adb(self,*args,**kwargs):
             calls.append(args)
-            if args[:3] == ("shell","uiautomator","dump"):
+            if len(args)==2 and 'com.android.commands.uiautomator.Launcher dump ' in args[1]:
                 raise TimeoutError("dump timeout")
             return type("R",(),{"exit_code":0,"stdout":"","stderr":""})()
     assert PopupBypasser(Adb()).get_ui_dump()==""

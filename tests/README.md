@@ -20,6 +20,9 @@ python -m pytest tests -q -p no:cacheprovider --basetemp "$TestRoot/work" --juni
 | 文件 | 验证边界 |
 | --- | --- |
 | `test_bilibili_bridge.py`、`test_bilibili_host.py`、`web/tests/bilibili.test.ts` | 合成 Core 回包、SQLite 占用与恢复、本机访问限制、并发续领；Windows 专属 venv 验证双主控启动同一无窗口子进程。真实手机扫码单独验收。 |
+| `test_script_worker_process.py` | 真 Windows 子进程、合成媒体和实际 Ctrl+Break；脚本正常停止/最终片判定及忽略信号后的有界强制回收，不操作设备 |
+| `test_script_safety.py` | 脚本导入/帮助/预览无设备副作用，独立输出、离线解析、严格实例映射、有界客户端、取消及验收反例；设备/网络为替身，专属睡眠进程测试超时不涉及 MuMu；不能替代实机验收 |
+| `test_ui_dump_runtime.py`、`test_room_locator.py`、`test_navigation_budget.py` | 32 位 UI 导出命令、路径注入拒绝、精确 serial 和指标归类；非零/缺入口/超时不误读或点击，唯一文件及预算约束；设备为替身 |
 | `test_worker_state_machine.py`、`test_worker_lifecycle_state.py` | ADR 0008 全部状态对、非法迁移不改变原状态、重复状态幂等；真实 Controller 的早退、正常结束、恢复失败与异常收尾状态顺序，设备和采集边界为替身 |
 | `test_console_controls.py`、`test_scheduler_integration.py` | 真实 SQLite、本场意图、失败恢复、按主播停止、命令原子提交与幂等、跨来源迟到观测；设备与解析结果为注入边界 |
 | `test_console_api.py` | FastAPI 请求/响应、严格参数、分页与筛选、历史关联、北京时间统计、告警、日志尾部和静态托管；测试日志与静态夹具均在临时目录 |

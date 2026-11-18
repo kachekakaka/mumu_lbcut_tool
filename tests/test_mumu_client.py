@@ -10,7 +10,7 @@ from src.mvp.mumu_client import MuMuClient
 
 
 class TestMuMuClient(unittest.TestCase):
-    @patch("subprocess.run")
+    @patch("src.mvp.mumu_client.run_client")
     def test_get_player_info(self, mock_run):
         mock_run.return_value = MagicMock(
             returncode=0,
@@ -22,7 +22,7 @@ class TestMuMuClient(unittest.TestCase):
         self.assertEqual(info["name"], "lb1")
         self.assertTrue(info["is_android_started"])
 
-    @patch("subprocess.run")
+    @patch("src.mvp.mumu_client.run_client")
     def test_get_all_players(self, mock_run):
         mock_run.return_value = MagicMock(
             returncode=0,
@@ -34,7 +34,7 @@ class TestMuMuClient(unittest.TestCase):
         self.assertIn("2", players)
         self.assertIn("3", players)
 
-    @patch("subprocess.run")
+    @patch("src.mvp.mumu_client.run_client")
     def test_get_player_hwnd(self, mock_run):
         mock_run.return_value = MagicMock(
             returncode=0,
@@ -78,7 +78,7 @@ class TestMuMuClient(unittest.TestCase):
         client.apply_window_display_mode(2, "hidden")
         mock_hide.assert_called_with(2)
 
-    @patch("subprocess.run")
+    @patch("src.mvp.mumu_client.run_client")
     def test_optimize_performance_window_modes(self, mock_run):
         mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
         client = MuMuClient()
@@ -139,9 +139,9 @@ def test_instance_discovery_rejects_invalid_snapshot(output, monkeypatch):
 def test_discovery_distinguishes_empty_success_and_command_failure(monkeypatch):
     client = MuMuClient.__new__(MuMuClient)
     client.manager_exe = Path('synthetic-manager.exe')
-    monkeypatch.setattr(subprocess, 'run', lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, '{}', ''))
+    monkeypatch.setattr('src.mvp.mumu_client.run_client', lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, '{}', ''))
     assert client.list_available_instances() == []
-    monkeypatch.setattr(subprocess, 'run', lambda *args, **kwargs: subprocess.CompletedProcess(args, 1, '{}', 'failed'))
+    monkeypatch.setattr('src.mvp.mumu_client.run_client', lambda *args, **kwargs: subprocess.CompletedProcess(args, 1, '{}', 'failed'))
     with pytest.raises(RuntimeError, match='查询失败'):
         client.list_available_instances()
 
@@ -154,7 +154,7 @@ def test_launch_timeout_and_shutdown_cancel_are_bounded(monkeypatch):
     def hung_command(args, **kwargs):
         timeouts.append(kwargs['timeout'])
         raise subprocess.TimeoutExpired(args, kwargs['timeout'])
-    monkeypatch.setattr(subprocess, 'run', hung_command)
+    monkeypatch.setattr('src.mvp.mumu_client.run_client', hung_command)
     assert client.launch_player(1) is False
     assert len(timeouts) == 1 and 0 < timeouts[0] <= 10
 
@@ -179,7 +179,18 @@ def test_launch_cancel_during_retry_does_not_send_another_command(monkeypatch):
     assert len(commands) == 1
 
 
-@pytest.mark.parametrize('accept_on,expected_elapsed', [(1, 95), (4, 120)])
+def test_launch_request_timeout_checks_actual_android_state(monkeypatch):
+    client = MuMuClient.__new__(MuMuClient)
+    monkeypatch.setattr(client, 'ensure_main_process_running', lambda **kw: True)
+    states = iter([False, True])
+    monkeypatch.setattr(client, 'is_android_started', lambda *a, **kw: next(states))
+    launch = MagicMock(side_effect=subprocess.TimeoutExpired('launch', 5))
+    monkeypatch.setattr(client, '_run_manager', launch)
+    assert client.launch_player(2)
+    assert launch.call_count == 1
+
+
+@pytest.mark.parametrize('accept_on,expected_elapsed', [(1, 85), (6, 120)])
 def test_launch_uses_remaining_budget_for_overall_deadline(monkeypatch, accept_on, expected_elapsed):
     client = MuMuClient.__new__(MuMuClient)
     now = [0.0]

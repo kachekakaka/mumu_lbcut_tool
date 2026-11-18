@@ -109,7 +109,8 @@ def test_cleanup_resource_error_still_closes_app_and_unlocks(monkeypatch, tmp_pa
 def test_no_cleanup_before_lock_and_connection(monkeypatch, tmp_path, valid_media, unavailable):
     h = build_worker(monkeypatch, tmp_path, valid_media)
     monkeypatch.setattr('src.worker.controller.MuMuClient', lambda **kw: SimpleNamespace(
-        launch_player=lambda index: unavailable != 'launch', connect_adb=lambda index: None))
+        require_instance=lambda *a, **kw: {}, confirmed_serial=lambda *a, **kw: 'synthetic-device',
+        launch_player=lambda index, **kw: unavailable != 'launch', connect_adb=lambda index, **kw: None))
     owner = WorkerInstanceLock(h.controller.config.lock_dir, h.controller.config.vmindex)
     if unavailable == 'lock':
         owner.acquire()

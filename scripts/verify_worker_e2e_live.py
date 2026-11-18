@@ -1,310 +1,291 @@
-"""模拟器实机端到端验证脚本：
-验证 Worker 纯离线启动、推流录制、Windows 中断信号 (CTRL_BREAK_EVENT) 平滑封口、
-is_final: true 标记与退出码 0。
-"""
-from dataclasses import dataclass
-import json
-import logging
-import os
 from pathlib import Path
-import shutil
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+"""指定目标的短时 Worker 验证；默认只预览，结果按事件和媒体分别判定。"""
+import argparse
+import json
+import os
 import signal
 import subprocess
-import sys
 import threading
 import time
-import uuid
+from scripts._common import entry, nonnegative, positive, output_parent, preview, new_batch, write_json, media_tools, probe, media_summary
+from scripts._device import cancellation
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] %(levelname)s: %(message)s",
-    datefmt="%H:%M:%S",
-)
-logger = logging.getLogger("WorkerLiveE2E")
+# 覆盖客户端 5、采集停止 15、尾片校验 24、探针回收 30、映射/应用收尾 10、调度余量 6 秒。
+STOP_GRACE = 5 + 15 + 24 + 30 + 10 + 6
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-TMP_OUTPUT_DIR = (
-    REPO_ROOT.parent / "mumu_lbcut_tool_dev" / "mumu_lbcut_tool_tmp" / "e2e_live_verify"
-)
+def unique_events(events):
+    result, seen = [], {}
+    for event in events:
+        eid = event.get('event_id')
+        if not eid:
+            raise ValueError('事件缺少 event_id')
+        if eid in seen:
+            if seen[eid] != event:
+                raise ValueError('相同事件 ID 的内容冲突')
+            continue
+        seen[eid] = event
+        result.append(event)
+    return result
 
+def warning_event(e):
+    return (e.get('event') in {'stall_detected','stall_healed','segment_quality_warning','login_blocked','overlay_recovery'}
+            or e.get('event') == 'room_identity_check' and e.get('action') not in {'confirmed','sample','discarded'}
+            or e.get('event') == 'capture_startup' and e.get('action') in {'rejected','discarded'}
+            or e.get('event') == 'capture_session' and bool(e.get('reason')))
 
-FFPROBE_CANDIDATES = [
-    Path(r"C:\Users\73839\.agent-reach-venv\Scripts\ffprobe.EXE"),
-    Path(r"C:\ProgramData\chocolatey\bin\ffprobe.exe"),
-    Path(r"D:\soft\ffmpeg\bin\ffprobe.exe"),
-]
+def ready_to_stop(events):
+    finished = {e.get('segment_index') for e in events if e.get('event') in {'segment_finished','segment_aborted'}}
+    return (any(e.get('event') == 'segment_finished' and e.get('is_final') is False for e in events)
+            and any(e.get('event') == 'segment_started' and e.get('segment_index') not in finished for e in events)
+            and not any(e.get('event') in {'worker_stopped','worker_failed','stream_ended'} for e in events)
+            and not any(warning_event(e) for e in events))
 
-FFMPEG_CANDIDATES = [
-    Path(r"C:\Users\73839\.agent-reach-venv\Scripts\ffmpeg.EXE"),
-    Path(r"C:\ProgramData\chocolatey\bin\ffmpeg.exe"),
-    Path(r"D:\soft\ffmpeg\bin\ffmpeg.exe"),
-]
-
-
-def find_binary(candidates: list[Path], name: str) -> Path:
-    for c in candidates:
-        if c.exists():
-            return c
-    found = shutil.which(name)
-    if found:
-        return Path(found)
-    raise FileNotFoundError(f"未找到二进制文件: {name}")
-
-
-def probe_mp4(ffprobe_exe: Path, mp4_path: Path) -> dict:
-    """使用 ffprobe 深入探测 MP4 完整性与音画轨。"""
-    cmd = [
-        str(ffprobe_exe),
-        "-v", "error",
-        "-print_format", "json",
-        "-show_format",
-        "-show_streams",
-        str(mp4_path),
-    ]
-    res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-    if res.returncode != 0:
-        raise RuntimeError(f"ffprobe 检测失败 ({mp4_path.name}): {res.stderr}")
-    data = json.loads(res.stdout)
-    fmt = data.get("format", {})
-    streams = data.get("streams", [])
-    duration = float(fmt.get("duration", 0.0))
-    size_bytes = int(fmt.get("size", 0))
-    video_streams = [s for s in streams if s.get("codec_type") == "video"]
-    audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
-    return {
-        "file_name": mp4_path.name,
-        "duration": duration,
-        "size_mb": round(size_bytes / (1024 * 1024), 2),
-        "video_codec": video_streams[0].get("codec_name") if video_streams else None,
-        "audio_codec": audio_streams[0].get("codec_name") if audio_streams else None,
-        "width": video_streams[0].get("width") if video_streams else 0,
-        "height": video_streams[0].get("height") if video_streams else 0,
-        "has_video": len(video_streams) > 0,
-        "has_audio": len(audio_streams) > 0,
-    }
-
-
-def extract_preview_frame(ffmpeg_exe: Path, mp4_path: Path, output_jpg: Path, time_sec: int = 5):
-    """从 MP4 文件截取关键帧用于验证画面质量。"""
-    output_jpg.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        str(ffmpeg_exe),
-        "-y",
-        "-ss", str(time_sec),
-        "-i", str(mp4_path),
-        "-vframes", "1",
-        str(output_jpg),
-    ]
-    res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-    if res.returncode != 0:
-        logger.warning(f"提取关键帧失败: {res.stderr}")
-    else:
-        logger.info(f"成功保存预览帧: {output_jpg}")
-
-
-def run_e2e_test(
-    vmindex: int = 2,
-    target: str = "48859132415",
-    segment_duration: int = 40,
-    record_seconds: int = 65,
-    window_mode: str = "bottom",
-):
-    ffprobe_exe = find_binary(FFPROBE_CANDIDATES, "ffprobe")
-    ffmpeg_exe = find_binary(FFMPEG_CANDIDATES, "ffmpeg")
-    logger.info(f"依赖二进制检查通过: ffprobe={ffprobe_exe}, ffmpeg={ffmpeg_exe}")
-
-    # 每次验证独立目录，绝不删除以前的 run_* 录像或证据。
-    run_dir = TMP_OUTPUT_DIR / (time.strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex)
-    run_dir.mkdir(parents=True, exist_ok=False)
-    preview_dir = run_dir / "preview"
-
-    cmd = [
-        sys.executable,
-        "-m", "src.worker.cli",
-        "--vmindex", str(vmindex),
-        "--target", target,
-        "--output-dir", str(run_dir),
-        "--segment-duration", str(segment_duration),
-        "--window-mode", window_mode,
-        "--allow-unconfirmed-identity",
-    ]
-
-    env = dict(os.environ, PYTHONPATH=str(REPO_ROOT), PYTHONUNBUFFERED="1")
-    logger.info(f"启动 Worker CLI 进程: {' '.join(cmd)}")
-
-    # 在 Windows 下开启 CREATE_NEW_PROCESS_GROUP，以便 os.kill(pid, CTRL_BREAK_EVENT) 独立分发
-    creationflags = 0
-    if sys.platform == "win32":
-        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
-
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        env=env,
-        creationflags=creationflags,
-    )
-
-    stderr_lines: list[str] = []
-
-    def _drain_stderr():
-        for line in proc.stderr:
-            stderr_lines.append(line)
-            # 记录关键 worker 调试信息
-            stripped = line.strip()
-            if any(k in stripped for k in ("Stopping", "Signal", "Finalizing", "Cleaned", "Error", "Exception")):
-                logger.debug(f"[Worker Stderr] {stripped}")
-
-    t_err = threading.Thread(target=_drain_stderr, daemon=True)
-    t_err.start()
-
-    events: list[dict] = []
-    first_segment_started = threading.Event()
-
-    def _drain_stdout():
-        for line in proc.stdout:
-            stripped = line.strip()
-            if stripped.startswith("{") and stripped.endswith("}"):
-                try:
-                    data = json.loads(stripped)
-                    events.append(data)
-                    ev_type = data.get("event")
-                    if ev_type == "segment_finished":
-                        logger.info(
-                            f"[NDJSON Event] 🎬 segment_finished: {Path(data.get('file_path', '')).name} "
-                            f"(is_final={data.get('is_final')}, duration={data.get('duration_sec', 0):.1f}s)"
-                        )
-                    elif ev_type == "segment_started":
-                        logger.info(f"[NDJSON Event] 🚀 segment_started: {Path(data.get('file_path', '')).name}")
-                        first_segment_started.set()
-                    elif ev_type == "heartbeat":
-                        fps = data.get("fps", 0)
-                        bytes_rec = data.get("file_size_mb", 0)
-                        logger.info(f"[NDJSON Event] ❤️ heartbeat: fps={fps if fps is not None else 'unknown'}, size={bytes_rec:.2f}MB")
-                    elif ev_type in ("worker_started", "worker_stopped", "worker_aborted"):
-                        logger.info(f"[NDJSON Event] ℹ️ {ev_type}: {data}")
-                except Exception:
-                    pass
-
-    t_out = threading.Thread(target=_drain_stdout, daemon=True)
-    t_out.start()
-
-    logger.info(f"Worker PID={proc.pid} 已拉起，等待模拟器初始化与首次 segment_started...")
-    # 等待模拟器冷启动并启动首个切片（最多 90 秒）
-    if not first_segment_started.wait(timeout=90):
-        logger.error("超时未收到 segment_started 事件，模拟器或 Worker 启动可能异常！")
-        proc.kill()
-        raise TimeoutError("未收到首个切片启动事件")
-
-    logger.info(f"首个切片已开始录制，计时观察 {record_seconds} 秒...")
-    start_record_time = time.time()
-    signaled = False
+def assess(events, batch, exit_code, planned_stop, forced, *, signal_time=None):
+    reasons = []
     try:
-        while time.time() - start_record_time < record_seconds:
-            if proc.poll() is not None:
-                logger.error(f"Worker 异常提前退出，退出码: {proc.returncode}")
-                break
-            time.sleep(1)
+        events = unique_events(events)
+        starts = [e for e in events if e.get('event') == 'worker_started']
+        stops = [e for e in events if e.get('event') == 'worker_stopped']
+        if len(starts) != 1 or len(stops) != 1 or not starts[0].get('run_id'):
+            raise ValueError('任务启动/终态不唯一或缺少 run_id')
+        run_id = starts[0]['run_id']
+        if any(e.get('run_id') != run_id for e in events):
+            raise ValueError('事件混入其他运行')
+        opened = [e for e in events if e.get('event') == 'segment_started']
+        closed = [e for e in events if e.get('event') in {'segment_finished','segment_aborted'}]
+        if len({e['segment_index'] for e in opened}) != len(opened) or len(opened) != len(closed):
+            raise ValueError('切片启动与终态不配对')
+        task_dir = batch.resolve() / run_id
+        for start in opened:
+            matching = [e for e in closed if e.get('segment_index') == start['segment_index']]
+            if len(matching) != 1:
+                raise ValueError('切片终态冲突')
+            index = start['segment_index']
+            source = Path(start['file_path']).resolve()
+            path = Path(matching[0]['file_path']).resolve()
+            # 当前连续采集协议：临时 part 文件封口后移到任务目录并改为正式名称。
+            expected = task_dir / f"{starts[0]['target']}_{run_id}_{index:06d}.mp4"
+            if (batch.resolve() not in task_dir.parents or source.parent.parent != task_dir
+                    or not source.parent.name.startswith('capture_')
+                    or source.name != f'part_{index:06d}.mp4' or path != expected):
+                raise ValueError('切片文件映射不一致')
+            if not path.is_file():
+                raise ValueError('切片缺失或不属于本次批次')
+        finished = [e for e in closed if e['event'] == 'segment_finished']
+        finals = [e for e in finished if e.get('is_final') is True]
+        if forced or exit_code != 0 or stops[0].get('exit_code') != 0:
+            raise ValueError('进程异常退出或使用强制停止')
+        if any(e.get('event') in {'worker_failed','segment_aborted'} for e in events):
+            raise ValueError('发生任务失败或异常切片')
+        if not planned_stop or stops[0].get('reason') != 'stop_requested' or any(e.get('event') == 'stream_ended' for e in events):
+            return dict(status='验收条件未满足', reasons=['未完成计划内主动中断'], finished=finished)
+        if len(finished) < 2 or len(finals) != 1 or finals[0] != finished[-1] or any(e.get('is_final') is not False for e in finished[:-1]):
+            return dict(status='验收条件未满足', reasons=['缺少正常非最终片或唯一最终片'], finished=finished)
+        if signal_time is None or finals[0].get('timestamp', 0) < signal_time:
+            return dict(status='验收条件未满足', reasons=['最终片不是停止信号之后完成'], finished=finished)
+        if stops[0].get('had_segment_errors') is not False or any(warning_event(e) for e in events):
+            return dict(status='有恢复/质量告警', reasons=['发生过异常、恢复或质量风险'], finished=finished)
+        return dict(status='正常通过', reasons=[], finished=finished)
+    except (ValueError, KeyError, TypeError) as exc:
+        reasons.append(str(exc))
+        return dict(status='失败', reasons=reasons, finished=[])
 
-        # 录制达到预期时长，发送 CTRL_BREAK_EVENT 信号
-        if proc.poll() is None:
-            logger.info(f"达到计划录制时长 ({record_seconds}s)，向 Worker 发送 CTRL_BREAK_EVENT 优雅停机信号...")
-            if sys.platform == "win32":
-                os.kill(proc.pid, signal.CTRL_BREAK_EVENT)
-            else:
-                os.kill(proc.pid, signal.SIGINT)
-            signaled = True
+def track_children(proc, owned, allowed):
+    import psutil
+    try:
+        children = psutil.Process(proc.pid).children(recursive=True)
+    except psutil.Error:
+        return
+    for child in children:
+        try:
+            if Path(child.exe()).resolve() in allowed:
+                owned[child.pid] = (child.create_time(), child)
+        except (psutil.Error, OSError):
+            continue
 
-        # 等待平滑停机完成（最多 25 秒安全封口窗口）
-        logger.info("等待 Worker 平滑封口并正常退出...")
-        exit_code = proc.wait(timeout=30)
-        logger.info(f"Worker 进程已退出，退出码: {exit_code}")
-    except subprocess.TimeoutExpired:
-        logger.error("平滑停机超时，强制终止进程！")
+def force_owned(proc, owned):
+    import psutil
+    errors = []
+    for pid, (created, child) in owned.items():
+        try:
+            if child.is_running() and child.create_time() == created:
+                child.kill()
+                child.wait(timeout=1)
+        except psutil.NoSuchProcess:
+            pass
+        except psutil.Error as exc:
+            errors.append(f'{pid}: {exc}')
+    if proc.poll() is None:
         proc.kill()
-        exit_code = proc.wait()
-    except KeyboardInterrupt:
-        logger.warning("收到外部中断，正在终止 Worker...")
-        if proc.poll() is None:
-            proc.kill()
-        exit_code = proc.wait()
+        try:
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            errors.append('Worker 未在回收期限内退出')
+    return errors
+
+def run_worker(args, batch, target, uid, web_rid, tools, scrcpy):
+    from scripts._common import ROOT
+    from src.mvp.mumu_client import LAUNCH_BUDGET_SEC, CONNECT_BUDGET_SEC, SETTINGS_BUDGET_SEC
+    # 工具检查20、前后查询15、开录复核30与采集25、父进程余量15。
+    startup_budget = 20 + 15 + 20 + LAUNCH_BUDGET_SEC + CONNECT_BUDGET_SEC + SETTINGS_BUDGET_SEC + args.navigation_timeout + 30 + 25 + 15
+    cmd = [sys.executable, '-m', 'src.worker.cli', '--vmindex', str(args.vmindex),
+           '--target', target, '--target-kind', args.target_kind, '--output-dir', str(batch),
+           '--segment-duration', str(args.segment_duration), '--navigation-timeout', str(args.navigation_timeout),
+           '--window-mode', 'bottom', '--require-local-tools', '--event-log', str(batch/'fallback.ndjson')]
+    if uid: cmd += ['--expected-anchor-uid', uid]
+    if web_rid: cmd += ['--web-rid', web_rid]
+    if args.allow_unconfirmed_identity: cmd += ['--allow-unconfirmed-identity']
+    env = dict(os.environ, PYTHONPATH=str(ROOT), PYTHONUNBUFFERED='1',
+               SCRCPY_SERVER_PATH=str(scrcpy.parent/'scrcpy-server'))
+    events, errors, owned = [], [], {}
+    guard = threading.Lock()
+    proc = None
+    threads = []
+    planned, forced, signal_time = False, False, None
+    start = time.monotonic()
+    allowed = {Path(p).resolve() for p in (scrcpy, tools.ffmpeg, tools.ffprobe)}
+    raw = (batch/'events.ndjson').open('x', encoding='utf-8')
+    logs = (batch/'worker.log').open('x', encoding='utf-8')
+    def drain(stream, file, is_events):
+        try:
+            for line in stream:
+                file.write(line); file.flush()
+                if is_events:
+                    try:
+                        event = json.loads(line)
+                        if not isinstance(event, dict): raise ValueError('事件不是对象')
+                        with guard: events.append(event)
+                    except ValueError as exc:
+                        with guard: errors.append(f'事件解析失败：{exc}')
+        except Exception as exc:
+            with guard: errors.append(f'日志读取/写入失败：{exc}')
+        finally:
+            stream.close()
+    try:
+        with cancellation() as stop:
+            proc = subprocess.Popen(cmd, cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=True, encoding='utf-8', errors='replace',
+                                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name=='nt' else 0)
+            for stream, file, is_events in [(proc.stdout, raw, True), (proc.stderr, logs, False)]:
+                thread = threading.Thread(target=drain, args=(stream,file,is_events), daemon=True)
+                thread.start(); threads.append(thread)
+            first = None
+            try:
+                while proc.poll() is None:
+                    track_children(proc, owned, allowed)
+                    with guard: snapshot, bad = list(events), list(errors)
+                    now = time.monotonic()
+                    if first is None and any(e.get('event')=='segment_started' for e in snapshot):
+                        first = now
+                    if stop.is_set() or bad: break
+                    if first is None and now-start >= startup_budget:
+                        errors.append('开录总预算耗尽'); break
+                    if first is not None and now-first >= args.record_seconds:
+                        planned = ready_to_stop(snapshot); break
+                    stop.wait(.1)
+            finally:
+                if proc.poll() is None:
+                    signal_time = time.time()
+                    proc.send_signal(signal.CTRL_BREAK_EVENT if os.name=='nt' else signal.SIGINT)
+                    until = time.monotonic()+STOP_GRACE
+                    while proc.poll() is None and time.monotonic()<until:
+                        track_children(proc, owned, allowed); time.sleep(.1)
+                    if proc.poll() is None:
+                        forced = True
+                        errors.extend(force_owned(proc, owned))
+                for thread in threads: thread.join(timeout=1)
+                if any(thread.is_alive() for thread in threads):
+                    errors.append('日志管道未在期限内关闭')
+                remaining = []
+                for pid, (created, child) in owned.items():
+                    try:
+                        if child.is_running() and child.create_time() == created:
+                            remaining.append(pid)
+                    except Exception:
+                        continue
+                if remaining:
+                    forced = True
+                    errors.append(f'Worker 退出后仍有本次采集/分析进程：{remaining}')
+                    errors.extend(force_owned(proc, owned))
+            if stop.is_set():
+                planned = False
+    finally:
+        if proc is not None and proc.poll() is None:
+            forced = True; errors.extend(force_owned(proc, owned))
+        if not any(t.is_alive() for t in threads):
+            raw.close(); logs.close()
+    with guard: snapshot = list(events)
+    report = assess(snapshot, batch, proc.returncode if proc else None, planned, forced, signal_time=signal_time)
+    report.update(command=cmd, signal_time=signal_time, forced=forced, errors=errors,
+                  expected_room_id=target, expected_anchor_uid=uid,
+                  allow_unconfirmed_identity=args.allow_unconfirmed_identity,
+                  startup_budget_sec=startup_budget, stop_grace_sec=STOP_GRACE)
+    if errors:
+        report['status']='失败'
+    media = []
+    for event in report['finished']:
+        path = Path(event['file_path'])
+        try:
+            summary = media_summary(path, probe(path, tools))
+            if not summary['has_video'] or not summary['has_audio'] or not summary['duration_sec']:
+                raise ValueError('媒体缺轨或时长无效')
+            media.append(summary)
+        except Exception as exc:
+            report['status']='失败'; errors.append(str(exc))
+    report['media'] = media
+    write_json(batch/'result.json', report)
+    return 0 if report['status']=='正常通过' and not args.allow_unconfirmed_identity else 4
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description='指定实例和目标的 Worker 切片/中断验证，默认不执行')
+    p.add_argument('--vmindex', type=nonnegative, required=True)
+    p.add_argument('--target', required=True)
+    p.add_argument('--target-kind', choices=['room_id','web_rid'], default='web_rid')
+    p.add_argument('--expected-anchor-uid')
+    p.add_argument('--web-rid')
+    p.add_argument('--output-dir', required=True)
+    p.add_argument('--segment-duration', type=positive, default=20)
+    p.add_argument('--record-seconds', type=positive, default=50)
+    p.add_argument('--navigation-timeout', type=positive, default=300)
+    p.add_argument('--allow-unconfirmed-identity', action='store_true')
+    p.add_argument('--execute', action='store_true')
+    args = p.parse_args(argv)
+    if args.segment_duration < 5 or not 2*args.segment_duration+10 <= args.record_seconds <= 600:
+        p.error('要求切片>=5秒，2*切片+10 <= 观察时长 <=600秒')
+    if not 60 <= args.navigation_timeout <= 900 or not args.target.strip():
+        p.error('导航预算须为60～900秒，目标不能为空')
+    parent = output_parent(args.output_dir)
+    if args.target_kind=='room_id' and (not args.target.isdigit() or not args.expected_anchor_uid) and not args.allow_unconfirmed_identity:
+        p.error('内部 room_id 必须为数字，并明确提供独立主播 UID')
+    if not args.execute:
+        preview(args); return 0
+    from src.mvp.dep_manager import DependencyManager
+    dependency = DependencyManager()
+    tools = dependency.get_media_tools()
+    scrcpy = dependency.require_scrcpy()
+    target, uid, web_rid = args.target.strip(), args.expected_anchor_uid, args.web_rid
+    if args.target_kind == 'web_rid':
+        from src.mvp.room_resolver import RoomResolver, RoomStatus
+        resolver = RoomResolver(timeout=4)
+        try:
+            resolved = resolver.resolve(target)
+        finally:
+            resolver.session.close()
+        if resolved.status != RoomStatus.LIVE or not resolved.room_id or not resolved.anchor_uid:
+            raise ValueError('指定入口未确认在播或缺少身份，拒绝录制')
+        if uid and uid != resolved.anchor_uid:
+            raise ValueError('指定 UID 与独立查询冲突')
+        target, uid, web_rid = resolved.room_id, resolved.anchor_uid, resolved.web_rid
+        args.target_kind = 'room_id'
+    batch = new_batch(parent, 'worker-e2e')
+    print(f'本次材料：{batch}', flush=True)
+    try:
+        return run_worker(args, batch, target, uid, web_rid, tools, scrcpy)
+    except BaseException as exc:
+        write_json(batch/'failure.json', dict(error=str(exc)))
         raise
 
-    t_out.join(timeout=3)
-    t_err.join(timeout=3)
-
-    logger.info("==================== 验收断言与分析 ====================")
-    assert exit_code == 0, f"Worker 退出码必须为 0，实际为: {exit_code}"
-
-    # 验证事件序列
-    seg_finished_events = [e for e in events if e.get("event") == "segment_finished"]
-    assert len(seg_finished_events) >= 1, f"至少应产出一个 segment_finished 事件，实际产出: {len(seg_finished_events)}"
-
-    last_event = seg_finished_events[-1]
-    logger.info(f"最终切片事件: {last_event}")
-    assert last_event.get("is_final") is True, f"最后一个 segment_finished 事件的 is_final 必须为 True，实际为: {last_event.get('is_final')}"
-
-    # 如果有多个切片，前面的切片 is_final 应该为 False
-    if len(seg_finished_events) > 1:
-        for idx, prev_ev in enumerate(seg_finished_events[:-1]):
-            assert prev_ev.get("is_final") is False, f"中间切片 #{idx+1} 的 is_final 必须为 False，实际为: {prev_ev.get('is_final')}"
-        logger.info(f"中间切片 is_final=False 检验全部通过！")
-
-    # 验证 MP4 文件与 ffprobe
-    for idx, ev in enumerate(seg_finished_events, start=1):
-        mp4_path = Path(ev["file_path"])
-        assert mp4_path.exists(), f"切片文件不存在: {mp4_path}"
-        info = probe_mp4(ffprobe_exe, mp4_path)
-        logger.info(f"【切片 #{idx} ffprobe 检验】")
-        logger.info(f"  文件: {info['file_name']}")
-        logger.info(f"  时长: {info['duration']:.2f}s | 大小: {info['size_mb']}MB")
-        logger.info(f"  分辨率: {info['width']}x{info['height']}")
-        logger.info(f"  视频轨: {info['video_codec']} | 音频轨: {info['audio_codec']}")
-        assert info["has_video"], f"切片 #{idx} 缺失视频轨道！"
-        assert info["has_audio"], f"切片 #{idx} 缺失音频轨道！"
-        assert info["duration"] > 0, f"切片 #{idx} 时长无效！"
-
-        # 截取预览帧存到 artifacts
-        out_jpg = preview_dir / f"e2e_live_verify_seg{idx:02d}.jpg"
-        extract_preview_frame(ffmpeg_exe, mp4_path, out_jpg, time_sec=min(5, int(info["duration"] / 2)))
-        # 同步复制到根目录方便直接渲染
-        root_jpg = run_dir / f"seg{idx:02d}_05s.jpg"
-        extract_preview_frame(ffmpeg_exe, mp4_path, root_jpg, time_sec=min(5, int(info["duration"] / 2)))
-
-    logger.info("=======================================================")
-    logger.info("🎉 模拟器实机端到端测试 100% 验收通过！")
-    logger.info("=======================================================")
-
-
-if __name__ == "__main__":
-    from src.mvp.room_resolver import RoomResolver, RoomStatus
-    resolver = RoomResolver(timeout=4)
-    # 优先动态探测真实在播主播
-    candidates = ["852703780", "60829777", "TuiTui.888_", "82708528984"]
-    selected_target = None
-    for cand in candidates:
-        try:
-            r = resolver.resolve(cand)
-            if r.status == RoomStatus.LIVE and r.room_id:
-                selected_target = r.room_id
-                logger.info(f"探测到当前在播房间: {r.nickname} (web_rid: {cand}, room_id: {selected_target})")
-                break
-        except Exception as e:
-            logger.warning(f"探测候选房间 {cand} 异常: {e}")
-
-    if not selected_target:
-        selected_target = "7704666294802123554"  # 林思琪默认 room_id
-        logger.info(f"使用兜底 room_id: {selected_target}")
-
-    run_e2e_test(
-        vmindex=2,
-        target=selected_target,
-        segment_duration=40,
-        record_seconds=65,
-        window_mode="bottom",
-    )
+if __name__ == '__main__':
+    sys.exit(entry(main))

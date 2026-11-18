@@ -1,15 +1,11 @@
-import subprocess
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from scripts._common import entry
+from scripts._device import device_main
 
-adb = r"D:\soft\MuMuPlayer\nx_main\adb.exe"
-serial = "127.0.0.1:16448"
+def main(argv=None):
+    return device_main('screenshot', argv)
 
-subprocess.run([adb, "connect", serial], capture_output=True)
-
-# 抓取当前屏幕
-res = subprocess.run([adb, "-s", serial, "exec-out", "screencap", "-p"], capture_output=True)
-out_path = Path("scripts/current_screen.png")
-with open(out_path, "wb") as f:
-    f.write(res.stdout)
-
-print(f"截图保存成功: {out_path}, 大小: {out_path.stat().st_size} 字节")
+if __name__ == '__main__':
+    sys.exit(entry(main))

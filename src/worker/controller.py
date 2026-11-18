@@ -7,6 +7,7 @@ import os
 import sys
 import time
 import uuid
+import threading
 from collections import deque
 
 from src.mvp.dep_manager import DependencyManager
@@ -65,6 +66,7 @@ class WorkerConfig:
     job_id: str | None = None
     navigation_timeout_sec: float = 300.0  # 从目标定位到开录就绪的总时限
     event_log_path: Path | None = None     # 事件 stdout 断开（主控已退出）后改写到此日志
+    require_local_tools: bool = False
 
 
 class WorkerController:
@@ -82,6 +84,8 @@ class WorkerController:
         self.emitter = emitter or WorkerEventEmitter(stream=sys.stdout, fallback_path=config.event_log_path)
         self.emitter.on_stream_lost = lambda: self.request_stop("event_stream_lost")
         self.stop_requested = False
+        self.stop_event = threading.Event()
+        self._device_manager = None
         self._stop_reason = ""
         self._fatal_error = False
         self._exit_code = 0               # 录制期确认的专用退出码（如设备离线 20）
@@ -124,6 +128,7 @@ class WorkerController:
         if not self.stop_requested:
             self._stop_reason = reason
         self.stop_requested = True
+        self.stop_event.set()
         if self.state_machine.state in {WorkerState.RECORDING, WorkerState.RECOVERING}:
             try:
                 self.state_machine.transition_to(WorkerState.STOPPING)
@@ -196,19 +201,27 @@ class WorkerController:
 
             dep_mgr = DependencyManager()
             media_tools = dep_mgr.get_media_tools()
-            scrcpy_exe = dep_mgr.ensure_scrcpy()
+            scrcpy_exe = dep_mgr.require_scrcpy() if self.config.require_local_tools else dep_mgr.ensure_scrcpy()
             adb_exe = dep_mgr.get_adb_path()
 
             mumu = MuMuClient(adb_exe=adb_exe)
-            if not mumu.launch_player(self.config.vmindex):
+            self._device_manager = mumu
+            mumu.require_instance(self.config.vmindex, stop_event=self.stop_event, prepare_main=True)
+            launched = mumu.launch_player(self.config.vmindex, stop_event=self.stop_event)
+            if self.stop_requested:
+                return EXIT_SUCCESS
+            if not launched:
                 logger.error(f"启动 MuMu 实例 {self.config.vmindex} 失败！")
                 return EXIT_DEVICE_UNAVAILABLE
 
-            serial = mumu.connect_adb(self.config.vmindex)
+            serial = mumu.confirmed_serial(self.config.vmindex, stop_event=self.stop_event)
+            serial = mumu.connect_adb(self.config.vmindex, serial=serial, stop_event=self.stop_event)
+            if self.stop_requested:
+                return EXIT_SUCCESS
             if not serial:
                 logger.error("建立 ADB 连接失败！")
                 return EXIT_DEVICE_UNAVAILABLE
-            self._cleanup_device = AdbDeviceClient(serial, adb_exe=adb_exe)
+            mumu.verify_serial(self.config.vmindex, serial, stop_event=self.stop_event)
 
             # 录播底层调优：拦截 Windows 声卡外放静音 + 禁用后台动态降频 + 灵活窗口模式 (foreground/bottom/offscreen/hidden)
             try:
@@ -222,10 +235,16 @@ class WorkerController:
                     window_mode=eff_mode,
                     pos_x=self.config.window_pos_x,
                     pos_y=self.config.window_pos_y,
+                    stop_event=self.stop_event,
                 )
+            except InterruptedError:
+                raise
             except Exception as e:
                 logger.warning(f"设置模拟器录播环境调优异常 (不影响录制): {e}")
 
+            mumu.check_stop(self.stop_event)
+            mumu.verify_serial(self.config.vmindex, serial, stop_event=self.stop_event)
+            self._cleanup_device = AdbDeviceClient(serial, adb_exe=adb_exe)
             # 先找到实际目标画面，再开录；无 UI UID 时主动读取当前房间的资料跳转证据。
             self._navigator = WorkerNavigator(serial=serial, adb_exe=adb_exe)
             self._navigator.configure_target(self.config.target_kind, self.config.web_rid)
@@ -358,6 +377,8 @@ class WorkerController:
             try:
                 if self._cleanup_device:
                     try:
+                        if self._device_manager:
+                            self._device_manager.verify_serial(self.config.vmindex, self._cleanup_device.current_serial)
                         self._cleanup_device.force_stop_package(DOUYIN_PACKAGE)
                     except Exception as exc:
                         # 关闭抖音失败允许复用实例；保留原任务退出码及完整错误详情。

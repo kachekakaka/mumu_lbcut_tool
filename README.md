@@ -14,6 +14,7 @@
 | 文档结构、各类文档职责、方案创建与归档 | [docs/README.md](docs/README.md) |
 | 当前架构、职责及代码入口 | [设计说明](docs/设计说明.md) |
 | Git 忽略规则 | [.gitignore](.gitignore) |
+| 维护脚本及设备操作边界 | [scripts/README.md](scripts/README.md) |
 
 ## 项目目录与文件存放
 
@@ -38,6 +39,7 @@
 | 位置 | 存放内容与边界 |
 | --- | --- |
 | 本仓库 | `src/worker/`、`src/orchestrator/`、`web/`（网页控制台源码及其单元测试）、源码依赖、长期文档与可重复测试；不保存运行数据库、真实录像或网页构建结果 |
+| `scripts/`、`archive/scripts/` | 前者保存维护入口；后者保存已退役脚本的源码文本和用途说明，不作为可运行工具；既有现场产物的整理须另行确定 |
 | `../mumu_lbcut_tool_dev/mumu_lbcut_tool_tmp/` | 临时脚本、草稿、探针、构建中间文件、测试输入副本、输出、日志、截图、报告及验包解压副本 |
 | `../mumu_lbcut_tool_dev/mumu_lbcut_tool_dists/` | 打包生成的程序目录、安装包、便携包及发布压缩包；测试包同样放在这里，并在名称中注明测试用途 |
 | `../mumu_lbcut_tool_dev/runtime-console/` | v2 控制台默认长期调度数据库与事件日志；仅 `run --data-dir` 可指定其他独立目录 |

@@ -1,42 +1,65 @@
-"""并发扫描 31 个样本房间的开播状态与解析。"""
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import json
-import sys
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import argparse
+import json
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from scripts._common import entry, input_file, preview
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+def read_samples(path):
+    rows = json.loads(input_file(path).read_text(encoding='utf-8-sig'))
+    if not isinstance(rows, list) or not rows:
+        raise ValueError('样本必须为非空 JSON 数组')
+    ids, entries = set(), set()
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get('id'), int) or isinstance(row['id'], bool):
+            raise ValueError('样本缺少整数 id')
+        value = row.get('entry')
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError('样本缺少 entry')
+        value = value.strip()
+        match = re.fullmatch(r'https?://live\.douyin\.com/([\w.~-]+)/?(?:\?[^\s]*)?', value)
+        normalized = match.group(1) if match else value
+        if not re.fullmatch(r'[a-zA-Z0-9._~-]+', normalized):
+            raise ValueError('样本只接受 web_rid 或直播网页完整链接，不在输入检查时解析短链')
+        if row['id'] in ids or normalized in entries:
+            raise ValueError('样本 id 或规范化入口重复')
+        ids.add(row['id']); entries.add(normalized)
+        yield dict(row, entry=normalized)
 
-from src.mvp.room_resolver import RoomResolver as WorkerRoomResolver, RoomStatus
+def main(argv=None):
+    p = argparse.ArgumentParser(description='显式查询样本开播状态，不操作设备')
+    p.add_argument('--input', required=True)
+    p.add_argument('--workers', type=int, choices=range(1, 11), default=2)
+    p.add_argument('--execute', action='store_true')
+    args = p.parse_args(argv)
+    rows = list(read_samples(args.input))
+    if not args.execute:
+        preview(args, sample_count=len(rows))
+        return 0
+    from src.mvp.room_resolver import RoomResolver, RoomStatus
+    def query(row):
+        resolver = RoomResolver(timeout=4)
+        try:
+            r = resolver.resolve(row['entry'])
+            return dict(id=row['id'], entry=row['entry'], status=r.status.value,
+                        room_id=r.room_id, anchor_uid=r.anchor_uid), r.status == RoomStatus.UNKNOWN
+        finally:
+            resolver.session.close()
+    failed = False
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        jobs = {pool.submit(query, row): row for row in rows}
+        for future in as_completed(jobs):
+            row = jobs[future]
+            try:
+                result, unknown = future.result()
+                failed |= unknown
+            except Exception as exc:
+                result = dict(id=row['id'], entry=row['entry'], error=str(exc), status='unknown')
+                failed = True
+            print(json.dumps(result, ensure_ascii=False), flush=True)
+    return 4 if failed else 0
 
-
-def scan_single(r, resolver):
-    res = resolver.resolve(r["entry"])
-    return r, res
-
-
-def main():
-    resolver = WorkerRoomResolver(timeout=4)
-    fixtures_path = REPO_ROOT / "tests" / "fixtures" / "sample_rooms.json"
-    with open(fixtures_path, "r", encoding="utf-8") as f:
-        rooms = json.load(f)
-
-    print("=== 开始并发扫描用户提供的 31 个直播间 ===", flush=True)
-    live_rooms = []
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = [executor.submit(scan_single, r, resolver) for r in rooms]
-        for f in as_completed(futures):
-            r, res = f.result()
-            status_str = "🟢 直播中" if res.status == RoomStatus.LIVE else ("🔴 未开播" if res.status == RoomStatus.ENDED else "⚪ 未知")
-            print(f"[{r['id']:02d}] {r['nickname']} ({r['entry']}): {status_str} | room_id={res.room_id}", flush=True)
-            if res.status == RoomStatus.LIVE:
-                live_rooms.append((r, res))
-
-    print(f"\n扫描完成！当前在播主播数: {len(live_rooms)} / {len(rooms)}", flush=True)
-    for r, res in live_rooms:
-        print(f" -> {r['nickname']} ({r['url']}) | room_id={res.room_id}", flush=True)
-
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    sys.exit(entry(main))

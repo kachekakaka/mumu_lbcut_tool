@@ -103,9 +103,9 @@ def test_ui_dump_can_take_seven_seconds_with_explicit_probe_budget():
     class Adb:
         def run_adb(self,*args,timeout,**kwargs):
             observed.append((args,timeout))
-            if args[:3] == ("shell","uiautomator","dump"):
+            if len(args)==2 and 'com.android.commands.uiautomator.Launcher dump ' in args[1]:
                 if timeout<7:raise TimeoutError('slow fresh UI')
-                return SimpleNamespace(exit_code=139,stdout='',stderr='Segmentation fault')
+                return SimpleNamespace(exit_code=0,stdout='',stderr='')
             if args[:2] == ("shell","cat"):
                 return SimpleNamespace(exit_code=0,stdout='<hierarchy><node text="fresh"/></hierarchy>',stderr='')
             return SimpleNamespace(exit_code=0,stdout='',stderr='')

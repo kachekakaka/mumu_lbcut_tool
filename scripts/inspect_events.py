@@ -1,46 +1,37 @@
-import json
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import argparse
+import json
+from collections import Counter
+from scripts._common import entry, input_file
 
-def main():
-    events_file = Path(r"..\mumu_lbcut_tool_dev\mumu_lbcut_tool_tmp\20261104-e2e-30min-soak\events.ndjson")
-    if not events_file.exists():
-        print("events.ndjson 不存在")
-        return
+def read_events(path):
+    raw = input_file(path).read_bytes()
+    encoding = 'utf-16' if raw.startswith((b'\xff\xfe', b'\xfe\xff')) else 'utf-8-sig'
+    events, invalid = [], []
+    for index, line in enumerate(raw.decode(encoding).splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+            if not isinstance(event, dict) or not isinstance(event.get('event'), str):
+                raise ValueError('缺少 event 字段')
+            events.append(event)
+        except (ValueError, TypeError) as exc:
+            invalid.append(dict(line=index, error=str(exc)))
+    return events, invalid
 
-    # 支持 PowerShell UTF-16LE 重定向编码
-    raw_bytes = events_file.read_bytes()
-    if raw_bytes.startswith(b"\xff\xfe") or raw_bytes.startswith(b"\xfe\xff"):
-        text = raw_bytes.decode("utf-16")
-    else:
-        text = raw_bytes.decode("utf-8", errors="replace")
+def main(argv=None):
+    p = argparse.ArgumentParser(description='离线统计 NDJSON，不推导未记录的验收结论')
+    p.add_argument('--input', required=True)
+    args = p.parse_args(argv)
+    events, invalid = read_events(args.input)
+    keys = {'worker_started','worker_stopped','worker_failed','segment_started','segment_finished','segment_aborted'}
+    print(json.dumps(dict(count=len(events), types=dict(Counter(e['event'] for e in events)),
+                          invalid_lines=invalid, lifecycle=[e for e in events if e['event'] in keys]),
+                     ensure_ascii=False, indent=2))
+    return 4 if invalid or not events else 0
 
-    events = []
-    for line in text.splitlines():
-        line = line.strip()
-        if line:
-            try:
-                events.append(json.loads(line))
-            except Exception:
-                pass
-
-    print(f"总事件数: {len(events)}")
-    type_counts = {}
-    for ev in events:
-        t = ev.get("event")
-        type_counts[t] = type_counts.get(t, 0) + 1
-
-    print("\n事件类型分布:")
-    for t, c in sorted(type_counts.items()):
-        print(f"  {t}: {c}")
-
-    print("\n生命周期关键事件序列:")
-    for ev in events:
-        t = ev.get("event")
-        if t in ["worker_started", "segment_started", "segment_finished", "segment_aborted", "stream_ended"]:
-            idx = ev.get("segment_index", "-")
-            path = ev.get("file_path", "")
-            reason = ev.get("reason", "")
-            print(f"  [{ev.get('timestamp')}] {t} (segment #{idx}) reason={reason} path={Path(path).name if path else ''}")
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    sys.exit(entry(main))

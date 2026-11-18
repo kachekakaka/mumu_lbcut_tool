@@ -77,6 +77,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--web-rid", default=None, help="内部场次 ID 的网页入口备用值")
     parser.add_argument("--expected-anchor-uid", default=None, help="独立解析的主播 UID，不是 room_id")
     parser.add_argument("--job-id", default=None, help="调度任务关联标识")
+    parser.add_argument('--require-local-tools', action='store_true', help='仅使用已部署采集工具，缺失时拒绝自动下载')
     parser.add_argument("--event-log", default=None,
                         help="事件日志路径：stdout 断开（调度主控已退出）后事件改为追加到此文件，并平滑封口退出")
     parser.add_argument("--log-file", default=None,
@@ -154,6 +155,7 @@ def main(argv: list[str] | None = None) -> int:
         window_pos_x=args.window_pos_x,
         window_pos_y=args.window_pos_y,
         event_log_path=Path(args.event_log) if args.event_log else None,
+        require_local_tools=args.require_local_tools,
     )
 
     log_handler = None

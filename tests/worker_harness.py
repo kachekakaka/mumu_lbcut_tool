@@ -205,7 +205,9 @@ def build_worker(monkeypatch, tmp_path, valid_media, *, total=4, segment=2,
         ensure_scrcpy=lambda: Path("scrcpy.exe"), get_adb_path=lambda: adb_exe,
         get_media_tools=lambda: media_tools))
     monkeypatch.setattr(cm, "MuMuClient", lambda **kw: SimpleNamespace(
-        launch_player=lambda index: True, connect_adb=lambda index: "synthetic-device",
+        require_instance=lambda *a, **kw: {}, confirmed_serial=lambda *a, **kw: 'synthetic-device',
+        verify_serial=lambda *a, **kw: None, check_stop=lambda *a: None,
+        launch_player=lambda index, **kw: True, connect_adb=lambda index, **kw: "synthetic-device",
         optimize_performance_for_recording=lambda *args, **kw: None))
     original_init = cs.ContinuousSession.__init__
     def init(self, *args, **kwargs):

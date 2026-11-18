@@ -28,7 +28,7 @@ def test_pinned_pair_ignores_path_and_uses_matching_build(monkeypatch, tmp_path)
     directory = installed(tmp_path)
     monkeypatch.setenv('PATH', str(tmp_path / 'untrusted PATH tools'))
     run = Mock(side_effect=version_result)
-    monkeypatch.setattr('src.mvp.dep_manager.subprocess.run', run)
+    monkeypatch.setattr('src.mvp.dep_manager.run_client', run)
     tools = DependencyManager(ffmpeg_dir=directory).get_media_tools()
     assert tools.ffmpeg == directory.resolve() / 'bin' / 'ffmpeg.exe'
     assert tools.ffprobe == directory.resolve() / 'bin' / 'ffprobe.exe'
@@ -53,7 +53,7 @@ def test_invalid_pair_is_not_replaced_from_path(monkeypatch, tmp_path, problem):
             if problem == 'failed':
                 result.returncode = 1
         return result
-    monkeypatch.setattr('src.mvp.dep_manager.subprocess.run', run)
+    monkeypatch.setattr('src.mvp.dep_manager.run_client', run)
     with pytest.raises((FileNotFoundError, RuntimeError)):
         DependencyManager(ffmpeg_dir=directory).get_media_tools()
 

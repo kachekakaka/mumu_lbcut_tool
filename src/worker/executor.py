@@ -163,12 +163,14 @@ def run_command(
         if kill_tree_on_timeout:
             _kill_process_tree(proc.pid)
         try:
-            stdout_data, stderr_data = proc.communicate(timeout=.2 if not kill_tree_on_timeout else None)
+            stdout_data, stderr_data = proc.communicate(timeout=.2 if not kill_tree_on_timeout else 1)
         except subprocess.TimeoutExpired:
             # 只读客户端不等待其他进程持有的管道；本次观察仍按超时处理。
             stdout_data, stderr_data = '', ''
-            proc.stdout.close()
-            proc.stderr.close()
+            for name in ('stdout', 'stderr'):
+                reader = getattr(proc, name + '_thread', None)
+                if reader is None or not reader.is_alive():
+                    getattr(proc, name).close()
         raise CommandTimeoutError(
             cmd=cmd,
             timeout=timeout or 0.0,

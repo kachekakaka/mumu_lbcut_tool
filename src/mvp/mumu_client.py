@@ -9,12 +9,16 @@ import re
 import threading
 
 from src.mvp.config import get_mumu_manager_exe, get_adb_exe
+from src.mvp.command import run_client
 
 logger = logging.getLogger(__name__)
 
 LAUNCH_RETRY_WINDOW_SEC = 45
 LAUNCH_RETRY_INTERVAL_SEC = 3
-MANAGER_TIMEOUT_SEC = 10
+MANAGER_TIMEOUT_SEC = 5
+LAUNCH_BUDGET_SEC = 120
+CONNECT_BUDGET_SEC = 20
+SETTINGS_BUDGET_SEC = 45
 
 
 class MuMuClient:
@@ -33,15 +37,7 @@ class MuMuClient:
     def _run_manager(self, *args: str, timeout: float = MANAGER_TIMEOUT_SEC, check: bool = False) -> str:
         """执行 MuMuManager 命令并返回 stdout。"""
         cmd = [str(self.manager_exe), *args]
-        res = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            cwd=self.manager_exe.parent,
-        )
+        res = run_client(cmd, timeout=timeout, cwd=self.manager_exe.parent)
         if res.returncode != 0:
             logger.warning(f"MuMuManager 执行返回码 {res.returncode}: {res.stderr.strip() or res.stdout.strip()}")
             if check:
@@ -110,6 +106,60 @@ class MuMuClient:
             logger.error(f"解析实例 {vmindex} 信息失败: {out}")
             return {}
 
+    @staticmethod
+    def check_stop(stop_event=None):
+        if stop_event is not None and stop_event.is_set():
+            raise InterruptedError('操作已取消')
+
+    def require_instance(self, vmindex: int, *, stop_event=None, prepare_main=False) -> dict:
+        self.check_stop(stop_event)
+        if vmindex < 0:
+            raise ValueError('实例索引必须非负')
+        try:
+            players = self.get_all_players()
+        except (subprocess.TimeoutExpired, RuntimeError):
+            if not prepare_main:
+                raise
+            # 冷启动时管理服务可能尚不可查询。安装目录仅证明实例配置存在，绝不用来猜端口。
+            vms = self.manager_exe.parent.parent / 'vms'
+            installed = [p for p in vms.glob('MuMuPlayer-*')
+                         if re.fullmatch(r'MuMuPlayer-[0-9.]+-' + str(vmindex), p.name)
+                         and (p/'configs'/'vm_config.json').is_file()]
+            if len(installed) != 1:
+                raise ValueError(f'冷启动前无法确认实例 {vmindex} 的本地配置')
+            self.check_stop(stop_event)
+            if not self.ensure_main_process_running(stop_event=stop_event):
+                self.check_stop(stop_event)
+                raise RuntimeError('管理主程序未就绪')
+            players = self.get_all_players()
+        self.check_stop(stop_event)
+        info = players.get(str(vmindex))
+        if not isinstance(info, dict) or int(info.get('index', vmindex)) != vmindex:
+            raise ValueError(f'管理信息不能确认实例 {vmindex}')
+        return info
+
+    def confirmed_serial(self, vmindex: int, *, stop_event=None) -> str:
+        self.check_stop(stop_event)
+        players = self.get_all_players()
+        self.check_stop(stop_event)
+        info = players.get(str(vmindex))
+        if not isinstance(info, dict) or int(info.get('index', vmindex)) != vmindex:
+            raise ValueError(f'管理信息不能确认实例 {vmindex}')
+        host, port = info.get('adb_host_ip'), info.get('adb_port')
+        if not info.get('is_android_started') or not host or isinstance(port, bool):
+            raise ValueError('实例未就绪或缺少可信 ADB 映射')
+        if not str(port).isdigit() or not 1 <= int(port) <= 65535:
+            raise ValueError('管理信息缺少有效 ADB 端口')
+        serial = f'{host}:{int(port)}'
+        for key, other in players.items():
+            if key != str(vmindex) and other.get('adb_host_ip') == host and str(other.get('adb_port')) == str(port):
+                raise ValueError('多个实例指向同一 ADB 地址')
+        return serial
+
+    def verify_serial(self, vmindex, serial, *, stop_event=None):
+        if self.confirmed_serial(vmindex, stop_event=stop_event) != serial:
+            raise ValueError('实例 ADB 映射已变化，拒绝继续操作')
+
     def is_android_started(self, vmindex: int, *, timeout: float = MANAGER_TIMEOUT_SEC) -> bool:
         """检查 Android 系统是否已完全启动。"""
         info = self.get_player_info(vmindex, timeout=timeout)
@@ -126,11 +176,8 @@ class MuMuClient:
         if not main_exe.exists():
             return True
 
-        res = subprocess.run(
+        res = run_client(
             ["tasklist", "/fi", "IMAGENAME eq MuMuNxMain.exe"],
-            capture_output=True,
-            encoding="utf-8",
-            errors="replace",
             timeout=min(MANAGER_TIMEOUT_SEC, timeout_sec),
         )
         stdout_text = res.stdout or ""
@@ -178,7 +225,13 @@ class MuMuClient:
             logger.info("正在启动 MuMu 实例 %s...", vmindex)
             retry_until = min(deadline, time.monotonic() + LAUNCH_RETRY_WINDOW_SEC)
             while True:
-                output = self._run_manager("control", "-v", str(vmindex), "launch", timeout=remaining(retry_until))
+                try:
+                    output = self._run_manager("control", "-v", str(vmindex), "launch", timeout=remaining(retry_until))
+                except subprocess.TimeoutExpired:
+                    # 客户端超时不代表 MuMu 撤销了已受理的请求；先核对实际状态。
+                    if self.is_android_started(vmindex, timeout=remaining()):
+                        return True
+                    output = ''
                 if self._manager_errcode(output) == 0:
                     break
                 pause(LAUNCH_RETRY_INTERVAL_SEC, retry_until)
@@ -377,21 +430,24 @@ class MuMuClient:
         window_mode: str = "foreground",
         pos_x: int | None = None,
         pos_y: int | None = None,
+        stop_event=None,
     ) -> bool:
         """为录播环境执行模拟器底层调优：
         1. 拦截 Windows 声卡外放静音，避免杂音干扰电脑；
         2. 禁用动态省电降频 (dynamic_adjust_frame_rate: false)，杜绝掉帧卡顿；
         3. 视口控制：支持 foreground / bottom / offscreen / hidden 多种模式。
         """
+        self.check_stop(stop_event)
         if mute:
             self.mute_player(vmindex, mute=True)
         if disable_dynamic_fps:
             logger.info(f"设置实例 {vmindex} 禁用省电降频: dynamic_adjust_frame_rate = false, max_frame_rate = 60")
-            self._run_manager("setting", "-v", str(vmindex), "-k", "dynamic_adjust_frame_rate", "-val", "false")
-            self._run_manager("setting", "-v", str(vmindex), "-k", "dynamic_low_frame_rate_limit", "-val", "30")
-            self._run_manager("setting", "-v", str(vmindex), "-k", "max_frame_rate", "-val", "60")
-            self._run_manager("setting", "-v", str(vmindex), "-k", "renderer_strategy", "-val", "perf")
+            for key, value in [('dynamic_adjust_frame_rate', 'false'), ('dynamic_low_frame_rate_limit', '30'),
+                               ('max_frame_rate', '60'), ('renderer_strategy', 'perf')]:
+                self.check_stop(stop_event)
+                self._run_manager('setting', '-v', str(vmindex), '-k', key, '-val', value)
         # MuMu 把 dx 存为“稳定”渲染（OpenGL）；Vulkan 下两路录制曾多次显卡驱动崩溃。下次开机生效。
+        self.check_stop(stop_event)
         self._run_manager("setting", "-v", str(vmindex), "-k", "renderer_mode", "-val", "dx")
 
         # 兼容旧代码显式传入 show_window 的情况
@@ -401,57 +457,32 @@ class MuMuClient:
         elif show_window is True and effective_mode == "hidden":
             effective_mode = "foreground"
 
+        self.check_stop(stop_event)
         self.apply_window_display_mode(vmindex, window_mode=effective_mode, pos_x=pos_x, pos_y=pos_y)
+        self.check_stop(stop_event)
         return True
 
     def get_adb_serial(self, vmindex: int) -> str:
-        """获取实例对应的 ADB 地址与端口（如 127.0.0.1:16448）。"""
-        info = self.get_player_info(vmindex)
-        host = info.get("adb_host_ip") or "127.0.0.1"
-        port = info.get("adb_port")
-        if port:
-            return f"{host}:{port}"
+        """只接受管理查询确认的地址，不计算默认端口。"""
+        return self.confirmed_serial(vmindex)
 
-        # 尝试从 vm_config.json 读取
-        config_path = self.manager_exe.parent.parent / "vms" / f"MuMuPlayer-15.0-{vmindex}" / "configs" / "vm_config.json"
-        if config_path.exists():
-            try:
-                with open(config_path, "r", encoding="utf-8") as f:
-                    cfg = json.load(f)
-                    cfg_port = cfg.get("vm", {}).get("nat", {}).get("port_forward", {}).get("adb", {}).get("host_port")
-                    if cfg_port:
-                        return f"{host}:{cfg_port}"
-            except Exception:
-                pass
-
-        # 官方规则默认计算
-        calc_port = 16384 + 32 * int(vmindex)
-        return f"{host}:{calc_port}"
-
-    def connect_adb(self, vmindex: int, retries: int = 5, retry_interval_sec: float = 1.5) -> str | None:
-        """建立 ADB 连接并返回设备 serial。"""
-        serial = self.get_adb_serial(vmindex)
-        logger.info(f"正在连接实例 {vmindex} 的 ADB: {serial}")
-
-        for attempt in range(1, retries + 1):
-            # 先通过 manager 触发连接
-            self._run_manager("adb", "-v", str(vmindex), "-c", "connect")
-
-            # 显式执行 adb connect
-            subprocess.run([str(self.adb_exe), "connect", serial], capture_output=True, text=True, cwd=self.adb_exe.parent)
-
-            # 检查 devices
-            res = subprocess.run([str(self.adb_exe), "devices"], capture_output=True, text=True, cwd=self.adb_exe.parent)
-            lines = [line.strip() for line in res.stdout.strip().splitlines() if line.strip()]
-
-            for line in lines[1:]:
-                parts = line.split()
-                if len(parts) >= 2 and parts[0] == serial and parts[1] == "device":
-                    return serial
-
-            if attempt < retries:
-                time.sleep(retry_interval_sec)
-
-        # 严禁模糊匹配或串绑其他在线设备
-        logger.warning(f"实例 {vmindex} 的目标设备 {serial} 未处于 device 状态")
+    def connect_adb(self, vmindex: int, *, serial: str, stop_event=None,
+                    timeout_sec: float = CONNECT_BUDGET_SEC) -> str | None:
+        """连接已确认的地址；全部重试共享同一个截止时间。"""
+        stop_event = stop_event or threading.Event()
+        deadline = time.monotonic() + timeout_sec
+        def remaining(limit):
+            self.check_stop(stop_event)
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError('ADB 连接预算耗尽')
+            return min(limit, left)
+        for attempt in range(5):
+            run_client([str(self.adb_exe), 'connect', serial], timeout=remaining(5), cwd=self.adb_exe.parent)
+            res = run_client([str(self.adb_exe), 'devices'], timeout=remaining(3), cwd=self.adb_exe.parent)
+            self.check_stop(stop_event)
+            if res.returncode == 0 and any(line.split()[:2] == [serial, 'device'] for line in res.stdout.splitlines()):
+                return serial
+            if attempt < 4:
+                stop_event.wait(remaining(1.5))
         return None

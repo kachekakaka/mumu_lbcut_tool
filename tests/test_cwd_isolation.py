@@ -62,7 +62,7 @@ def test_mumu_client_cwd_isolation(fake_mumu_env):
         return mock_res
 
     # 1. 验证 _run_manager 传入 cwd=manager_exe.parent
-    with patch("subprocess.run", side_effect=mock_run):
+    with patch("src.mvp.mumu_client.run_client", side_effect=mock_run):
         client._run_manager("info", "-v", "all")
         assert len(captured_runs) == 1
         cmd, cwd = captured_runs[0]
@@ -82,10 +82,10 @@ def test_mumu_client_cwd_isolation(fake_mumu_env):
         mock_res.stderr = ""
         return mock_res
 
-    with patch("subprocess.run", side_effect=mock_run_connect):
-        serial = client.connect_adb(0, retries=1)
+    with patch("src.mvp.mumu_client.run_client", side_effect=mock_run_connect):
+        serial = client.connect_adb(0, serial='127.0.0.1:16384')
         assert serial == "127.0.0.1:16384"
-        assert len(captured_runs) >= 3
+        assert len(captured_runs) == 2
         connect_call = next(c for c in captured_runs if "connect" in c[0] and Path(c[0][0]) == adb_exe)
         assert Path(connect_call[1]) == adb_exe.parent
         devices_call = next(c for c in captured_runs if "devices" in c[0] and Path(c[0][0]) == adb_exe)
@@ -98,7 +98,7 @@ def test_mumu_client_cwd_isolation(fake_mumu_env):
         captured_popens.append((list(cmd), kwargs.get("cwd")))
         return MagicMock()
 
-    with patch("subprocess.run", return_value=MagicMock(stdout="no main process", return_value=0)), \
+    with patch("src.mvp.mumu_client.run_client", return_value=MagicMock(stdout="no main process", returncode=0)), \
          patch("subprocess.Popen", side_effect=mock_popen):
         client.ensure_main_process_running(timeout_sec=0.1)
         assert len(captured_popens) == 1

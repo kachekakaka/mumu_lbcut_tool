@@ -7,6 +7,7 @@ import threading
 from typing import Optional
 
 from src.mvp.config import get_adb_exe
+from src.mvp.ui_dump import UI_DUMP_COMMAND
 from src.worker.executor import (
     run_command,
     CommandResult,
@@ -47,7 +48,7 @@ class AdbDeviceClient:
     @staticmethod
     def _command_kind(args: tuple[str, ...]) -> str:
         joined = " ".join(args).lower()
-        if "uiautomator dump" in joined:
+        if len(args) == 2 and args[0] == 'shell' and args[1].startswith(UI_DUMP_COMMAND):
             return "ui_dump"
         if args[:2] == ("shell", "cat"):
             return "ui_xml_read"

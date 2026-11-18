@@ -7,6 +7,7 @@ import xml.etree.ElementTree as ET
 from typing import Optional
 
 from src.worker.adb_client import AdbDeviceClient
+from src.mvp.ui_dump import ui_dump_args
 
 logger = logging.getLogger("PopupBypasser")
 
@@ -38,25 +39,18 @@ class PopupBypasser:
         return min(maximum, remaining)
 
     def get_ui_dump(self) -> str:
-        """直接执行 UIAutomator，再独立读取其输出文件。
-
-        MuMu Android 15 上 UIAutomator 可能在 XML 已落盘后以 139 退出；
-        不能把进程退出码直接当成 dump 失败。也不能把 uiautomator 放进
-        adb shell sh -c：该启动方式在部分 MuMu 镜像中无法正确初始化。
-        """
+        """通过系统 32 位入口导出；正常退出后才读取本次唯一 XML。"""
         remote = '/sdcard/wp_ui_' + uuid.uuid4().hex + '.xml'
         try:
-            # UUID 路径确保不会误读历史文件；直接调用 wrapper 保留 Android 环境。
+            # UUID 路径确保不会误读历史文件；不回退到会在退出阶段崩溃的默认入口。
             result = self.adb.run_adb(
-                'shell', 'uiautomator', 'dump', remote,
+                *ui_dump_args(remote),
                 timeout=self._budget(self.dump_timeout_sec + 2.0),
                 check=False,
             )
             if result.exit_code != 0:
-                logger.debug(
-                    'UIAutomator returned %s; checking whether a complete XML was written',
-                    result.exit_code,
-                )
+                logger.debug('32 位 UI 导出失败，exit=%s：%s', result.exit_code, result.stderr)
+                return ''
 
             read_result = self.adb.run_adb(
                 'shell', 'cat', remote,
