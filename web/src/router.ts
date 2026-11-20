@@ -13,7 +13,9 @@ export const router = createRouter({
     { path: '/targets', component: TargetsView },
     { path: '/jobs', component: JobsView },
     { path: '/segments', component: SegmentsView },
-    { path: '/accounts', component: () => import('./views/AccountsView.vue') },
+    { path: '/accounts', component: () => import('./views/UploadsView.vue'), meta: { uploadPage: 'accounts' } },
+    { path: '/uploads/works', component: () => import('./views/UploadsView.vue'), meta: { uploadPage: 'works' } },
+    { path: '/uploads/tasks/:taskId?', component: () => import('./views/UploadsView.vue'), meta: { uploadPage: 'tasks' } },
     { path: '/:rest(.*)', redirect: '/' },
   ],
 })

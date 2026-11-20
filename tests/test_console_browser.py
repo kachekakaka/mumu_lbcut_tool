@@ -147,12 +147,13 @@ def test_cli_browser_defaults_and_forwarding(tmp_path, monkeypatch, enabled):
     monkeypatch.chdir(tmp_path)
     configs = []
     monkeypatch.setattr(server, 'run_server', lambda config: configs.append(config) or 0)
-    argv = ['run', '--output-dir', '录像 目录'] + (['--open-browser'] if enabled else [])
+    argv = ['run', '--output-dir', '录像 目录'] + (['--open-browser', '--static-root', '候选网页'] if enabled else [])
     assert cli.main(argv) == 0
     config = configs[0]
     assert config.open_browser is enabled
     assert config.data_dir == cli.DEFAULT_DATA_DIR.resolve()
     assert config.output_dir == (tmp_path / '录像 目录').resolve()
+    assert config.static_root == (tmp_path / '候选网页' if enabled else server.REPO_ROOT / 'web' / 'dist')
     assert (config.host, config.port) == ('127.0.0.1', 8000)
     with pytest.raises(SystemExit) as exc:
         cli.build_parser().parse_args(['run'])

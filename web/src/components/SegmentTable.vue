@@ -86,7 +86,7 @@ async function handleOpenFolder(row: Segment) {
     <el-table-column label="中止原因" min-width="110">
       <template #default="{ row }">{{ row.status === 'aborted' ? reasonLabel(row.reason) : '—' }}</template>
     </el-table-column>
-    <el-table-column v-if="uploadEnabled || $slots.upload" label="上传状态" :min-width="$slots.upload ? 172 : 100">
+  <el-table-column v-if="uploadEnabled" label="上传状态" :min-width="$slots.upload ? 172 : 100">
       <template #default="{ row }"><slot name="upload" :row="row"><UploadStatus :upload="row.upload" /></slot></template>
     </el-table-column>
     <el-table-column label="文件路径" min-width="280">

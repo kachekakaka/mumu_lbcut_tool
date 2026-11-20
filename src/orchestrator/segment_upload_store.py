@@ -1,42 +1,33 @@
-"""手动与整场安排，以及每个步骤的派发权。"""
+"""与录制台账共用 SQLite 写事务的交付关联和切片归属。"""
 
-from contextlib import closing, contextmanager, nullcontext
 import json
-import sqlite3
-from threading import Lock
-import time
 from uuid import uuid4
 
-from .upload_core_client import BridgeError
+from .session_ledger import gather_evidence
+from .upload_platform import BridgeError
 
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS arrangements (
- id TEXT PRIMARY KEY, job_id TEXT NOT NULL, segment_index INTEGER NOT NULL,
- deployment TEXT NOT NULL, account_id TEXT NOT NULL, revision INTEGER NOT NULL,
- frozen TEXT NOT NULL, work_id TEXT NOT NULL, register_key TEXT NOT NULL, submit_key TEXT NOT NULL,
- stage TEXT NOT NULL DEFAULT 'register', attempts INTEGER NOT NULL DEFAULT 0,
- generation INTEGER NOT NULL DEFAULT 0, lease_until REAL NOT NULL DEFAULT 0,
- rejected INTEGER NOT NULL DEFAULT 0, problem TEXT, problem_detail TEXT, task_id TEXT,
- observed TEXT, observed_at REAL, next_check REAL NOT NULL DEFAULT 0,
- auto_target TEXT, auto_session TEXT, follow_session INTEGER NOT NULL DEFAULT 0,
- UNIQUE(auto_target, auto_session)
+CREATE TABLE IF NOT EXISTS deliveries (
+ id TEXT PRIMARY KEY, work_id TEXT NOT NULL, deployment TEXT NOT NULL, account_id TEXT NOT NULL,
+ frozen TEXT NOT NULL, auto_target TEXT, auto_session TEXT, manifest_path TEXT, config_version TEXT,
+ request_key TEXT NOT NULL UNIQUE, request TEXT, sent INTEGER NOT NULL DEFAULT 0,
+ stopped INTEGER NOT NULL DEFAULT 0, rejected INTEGER NOT NULL DEFAULT 0,
+ task_id TEXT, observed TEXT, problem TEXT, problem_code TEXT, retry_at REAL NOT NULL DEFAULT 0,
+ FOREIGN KEY(auto_target, auto_session) REFERENCES recording_sessions(target_id, session_key)
 );
-CREATE TABLE IF NOT EXISTS arrangement_segments (
- arrangement_id TEXT NOT NULL REFERENCES arrangements(id), position INTEGER NOT NULL,
+CREATE INDEX IF NOT EXISTS deliveries_task ON deliveries(task_id);
+CREATE TABLE IF NOT EXISTS delivery_segments (
+ delivery_id TEXT NOT NULL REFERENCES deliveries(id), position INTEGER NOT NULL,
  job_id TEXT NOT NULL, segment_index INTEGER NOT NULL,
- PRIMARY KEY(arrangement_id, position), UNIQUE(arrangement_id, job_id, segment_index)
+ PRIMARY KEY(delivery_id, position),
+ FOREIGN KEY(job_id, segment_index) REFERENCES segments(job_id, segment_index)
 );
-CREATE INDEX IF NOT EXISTS arrangement_segments_lookup ON arrangement_segments(job_id, segment_index);
-CREATE TABLE IF NOT EXISTS confirmations (
- key TEXT PRIMARY KEY, arrangement_id TEXT NOT NULL REFERENCES arrangements(id),
- revision INTEGER NOT NULL, intent TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS revisions (
- arrangement_id TEXT NOT NULL REFERENCES arrangements(id), revision INTEGER NOT NULL,
- frozen TEXT NOT NULL, register_key TEXT NOT NULL, submit_key TEXT NOT NULL,
- stage TEXT NOT NULL, attempts INTEGER NOT NULL, rejected INTEGER NOT NULL, problem TEXT,
- PRIMARY KEY(arrangement_id, revision)
+CREATE INDEX IF NOT EXISTS delivery_segments_lookup ON delivery_segments(job_id, segment_index);
+CREATE TABLE IF NOT EXISTS upload_drafts (
+ job_id TEXT NOT NULL, segment_index INTEGER NOT NULL, deployment TEXT NOT NULL,
+ account_id TEXT NOT NULL, work_id TEXT NOT NULL, config_version TEXT,
+ PRIMARY KEY(job_id, segment_index, deployment, account_id)
 );
 """
 
@@ -45,241 +36,144 @@ def encode(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def confirmed_input(frozen):
-    return {k: frozen[k] for k in ("parameters", "file", "quality_flags")} | {
-        "mid": frozen["account"]["remote_user_id"],
-    }
+def same_intent(first, second):
+    def intent(frozen):
+        return (
+            frozen["root"], frozen["parameters"], frozen["account"]["id"], frozen["account"]["remote_user_id"],
+            [{k: clip[k] for k in ("job_id", "segment_index", "file", "quality_flags")} for clip in frozen["clips"]],
+        )
+    return intent(first) == intent(second)
 
 
-def stale():
-    return BridgeError("stale_dialog", "安排内容已修订，请重新打开弹窗核对")
+def for_segments(db, parts):
+    if not parts:
+        return []
+    values = ",".join("(?,?)" for _ in parts)
+    return db.execute(f"""SELECT d.*, s.job_id, s.segment_index,
+        EXISTS (SELECT 1 FROM recording_sessions r WHERE r.arrangement_id=d.id AND d.rejected=0) AS session_attached
+        FROM delivery_segments s
+        JOIN deliveries d ON d.id=s.delivery_id
+        WHERE (s.job_id,s.segment_index) IN (VALUES {values})
+        ORDER BY s.job_id,s.segment_index,d.id""", [v for part in parts for v in part])
 
 
-def revisable(row, now):
-    return (
-        not row["auto_target"] and row["stage"] != "task" and row["lease_until"] <= now
-        and (row["rejected"] or row["attempts"] == 0)
-    )
+def check_session(db, key, evidence):
+    session = db.execute("SELECT * FROM recording_sessions WHERE target_id=? AND session_key=?", key).fetchone()
+    if not session or session["status"] not in ("checking", "pending") or session["stopped"]:
+        raise BridgeError("posting_stopped", "本场自动投稿已停止")
+    clips, problem = gather_evidence(db, session)
+    active = db.execute("""SELECT 1 FROM jobs WHERE target_id=? AND session_key=?
+        AND status IN ('pending','starting','running','stopping','needs_reconcile')""", key).fetchone()
+    if active or problem or clips != evidence:
+        raise BridgeError("segment_changed", problem or "本场切片台账发生变化")
+    return session
 
 
-class ArrangementStore:
-    def __init__(self, path, clock=time.time):
-        self.path, self.clock = path, clock
-        self._lock = Lock()
-        self._initialized = False
+class DeliveryStore:
+    def __init__(self, runtime):
+        self.runtime = runtime
 
-    @contextmanager
-    def connect(self, write=False, guard=nullcontext):
-        with self._lock:
-            if not self._initialized:
-                self.path.parent.mkdir(parents=True, exist_ok=True)
-                with closing(sqlite3.connect(self.path, timeout=2)) as db:
-                    version = db.execute("PRAGMA user_version").fetchone()[0]
-                    has_tables = db.execute("SELECT 1 FROM sqlite_master WHERE type='table'").fetchone()
-                    if has_tables and version != 1:
-                        raise BridgeError("upload_db_version", "投递库格式已变更，请使用新的独立数据目录", 503)
-                    db.execute("PRAGMA journal_mode=WAL")
-                    db.executescript(SCHEMA)
-                    db.execute("PRAGMA user_version=1")
-                self._initialized = True
-        with closing(sqlite3.connect(self.path, timeout=2)) as db:
-            db.row_factory = sqlite3.Row
-            db.execute("PRAGMA foreign_keys=ON")
-            if write:
-                db.execute("BEGIN IMMEDIATE")
-            with guard(), db:
-                yield db
+    @property
+    def ledger(self):
+        if self.runtime.store is None:
+            raise BridgeError("service_unavailable", "录制服务尚未就绪", 503)
+        return self.runtime.store
 
     def get(self, record_id):
-        with self.connect() as db:
-            return self._get(db, record_id)
-
-    @staticmethod
-    def _get(db, record_id):
-        row = db.execute("SELECT * FROM arrangements WHERE id=?", (record_id,)).fetchone()
+        row = self.ledger.row("SELECT * FROM deliveries WHERE id=?", (record_id,))
         if row is None:
             raise BridgeError("arrangement_not_found", "找不到本机安排记录", 404)
-        return dict(row)
+        return row
 
-    def for_segments(self, segments):
-        if not segments:
-            return []
-        values = ",".join(["(?,?)"] * len(segments))
-        with self.connect() as db:
-            return [dict(row) for row in db.execute(
-                f"""SELECT a.*,s.job_id AS member_job_id,s.segment_index AS member_index
-                FROM arrangement_segments s JOIN arrangements a ON a.id=s.arrangement_id
-                WHERE (s.job_id,s.segment_index) IN (VALUES {values})
-                ORDER BY s.job_id,s.segment_index,a.id""",
-                [value for pair in segments for value in pair],
-            )]
+    def for_segments(self, parts):
+        with self.ledger.read_snapshot() as db:
+            return [dict(row) for row in for_segments(db, parts)]
 
-    def confirm(self, key, job, index, deployment, frozen, expected, revise, freeze_requests, *, guard=nullcontext):
-        account = frozen["account"]["id"]
-        intent = encode({"job": job, "index": index, "deployment": deployment,
-                         "account": account, "input": confirmed_input(frozen), "revise": revise})
-        with self.connect(write=True, guard=guard) as db:
-            old = db.execute(
-                """SELECT a.* FROM arrangements a JOIN arrangement_segments s ON s.arrangement_id=a.id
-                   WHERE s.job_id=? AND s.segment_index=? AND a.deployment=? AND a.account_id=?""",
-                (job, index, deployment, account),
-            ).fetchone()
-            auto = db.execute("""SELECT a.* FROM arrangements a JOIN arrangement_segments s ON s.arrangement_id=a.id
-                WHERE s.job_id=? AND s.segment_index=? AND a.auto_target IS NOT NULL""", (job, index)).fetchone()
-            if auto and (old is None or old["id"] != auto["id"]):
-                raise BridgeError("arrangement_conflict", "该切片已纳入整场安排，请查看原单")
-            prior = db.execute("SELECT * FROM confirmations WHERE key=?", (key,)).fetchone()
-            if prior:
-                if prior["intent"] != intent:
-                    raise BridgeError("confirmation_conflict", "该操作编号已绑定另一份确认内容")
-                if old is None or prior["revision"] != old["revision"]:
-                    raise stale()
-                if old["revision"] not in (expected, expected + 1):
-                    raise stale()
-                return dict(old), False
+    def update(self, record_id, **values):
+        assignment = ",".join(f"{column}=?" for column in values)
+        with self.ledger.transaction() as db:
+            db.execute(f"UPDATE deliveries SET {assignment} WHERE id=?", (*values.values(), record_id))
 
-            if old and old["auto_target"]:
-                saved = json.loads(old["frozen"])
-                if (revise or len(saved["clips"]) != 1 or saved["parameters"] != frozen["parameters"]
-                    or saved["account"]["remote_user_id"] != frozen["account"]["remote_user_id"]
-                    or saved["file"] != frozen["file"] or saved["quality_flags"] != frozen["quality_flags"]):
-                    raise BridgeError("arrangement_conflict", "该切片已纳入整场安排，请查看原单")
-                record_id, revision, created = old["id"], old["revision"], False
-            elif revise:
-                if old is None or old["id"] != revise or old["revision"] != expected:
-                    raise stale()
-                if not revisable(old, self.clock()):
-                    raise BridgeError("revision_forbidden", "原请求结果仍待确认，暂不能修订")
-                db.execute(
-                    """INSERT INTO revisions SELECT id,revision,frozen,register_key,submit_key,
-                       stage,attempts,rejected,problem FROM arrangements WHERE id=?""", (revise,),
-                )
-                revised = freeze_requests(frozen, old["work_id"])
-                db.execute(
-                    """UPDATE arrangements SET revision=revision+1, frozen=?, register_key=?, submit_key=?,
-                       stage='register', attempts=0, rejected=0, problem=NULL, problem_detail=NULL, lease_until=0, next_check=0
-                       WHERE id=?""",
-                    (encode(revised), str(uuid4()), str(uuid4()), revise),
-                )
-                record_id, revision, created = revise, expected + 1, True
-            elif old is not None:
-                if old["revision"] != expected and not (expected == 0 and old["revision"] == 1):
-                    raise stale()
-                if confirmed_input(frozen) != confirmed_input(json.loads(old["frozen"])):
-                    raise BridgeError("arrangement_conflict", "该账号已有安排，请查看原单")
-                record_id, revision, created = old["id"], old["revision"], False
-            else:
-                if expected:
-                    raise stale()
-                record_id, revision, created = str(uuid4()), 1, True
-                work_id = str(uuid4())
-                saved = freeze_requests(frozen, work_id)
-                db.execute(
-                    """INSERT INTO arrangements
-                       (id,job_id,segment_index,deployment,account_id,revision,frozen,work_id,register_key,submit_key)
-                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                    (record_id, job, index, deployment, account, revision, encode(saved),
-                     work_id, str(uuid4()), str(uuid4())),
-                )
-                db.execute("INSERT INTO arrangement_segments VALUES (?,1,?,?)", (record_id, job, index))
-            db.execute("INSERT INTO confirmations VALUES (?,?,?,?)", (key, record_id, revision, intent))
-            return self._get(db, record_id), created
+    @staticmethod
+    def insert(db, deployment, work_id, frozen, *, session=(None, None), path=None, revision=None, request=None):
+        record_id = str(uuid4())
+        db.execute("""INSERT INTO deliveries
+            (id,work_id,deployment,account_id,frozen,auto_target,auto_session,manifest_path,config_version,request_key,request)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                   (record_id, work_id, deployment, frozen["account"]["id"], encode(frozen), *session,
+                    path, revision, str(uuid4()), encode(request) if request else None))
+        db.executemany("INSERT INTO delivery_segments VALUES (?,?,?,?)", [
+            (record_id, pos, clip["job_id"], clip["segment_index"]) for pos, clip in enumerate(frozen["clips"], 1)
+        ])
+        return record_id
 
-    def arrange_session(self, session_key, deployment, frozen, freeze_requests, *, guard):
-        clips, account = frozen["clips"], frozen["account"]
-        with self.connect(write=True, guard=guard) as db:
-            old = db.execute("SELECT * FROM arrangements WHERE auto_target=? AND auto_session=?",
-                             session_key).fetchone()
-            if old:
-                return dict(old)
-            # 与手动确认共用写事务。任何重叠安排都在这里看到。
-            pairs = [(clip["job_id"], clip["segment_index"]) for clip in clips]
-            overlaps = {}
-            for job, index in pairs:
-                for row in db.execute("""SELECT a.* FROM arrangements a
-                    JOIN arrangement_segments s ON s.arrangement_id=a.id
-                    WHERE s.job_id=? AND s.segment_index=?""", (job, index)):
-                    overlaps[row["id"]] = row
+    def freeze_session(self, key, deployment, frozen):
+        parts = [(clip["job_id"], clip["segment_index"]) for clip in frozen["clips"]]
+        with self.ledger.transaction() as db:
+            session = check_session(db, key, frozen["evidence"])
+            if session["arrangement_id"]:
+                return session["arrangement_id"]
+            # 每次查询只绑定少量参数，长场次的分片数不受 SQLite 参数上限影响。
+            overlaps = [row for part in parts for row in for_segments(db, [part])]
             if overlaps:
-                if len(pairs) == len(overlaps) == 1:
-                    row = next(iter(overlaps.values()))
-                    if (not row["auto_target"] and row["deployment"] == deployment
-                        and row["account_id"] == account["id"]
-                        and confirmed_input(json.loads(row["frozen"])) == confirmed_input(frozen)):
-                        db.execute("UPDATE arrangements SET follow_session=1 WHERE id=?", (row["id"],))
-                        return dict(row)
-                raise BridgeError("arrangement_conflict", "切片已有安排，与整场清单冲突，请查看切片页原单")
-            record_id, work_id = str(uuid4()), str(uuid4())
-            db.execute("""INSERT INTO arrangements
-                (id,job_id,segment_index,deployment,account_id,revision,frozen,work_id,
-                 register_key,submit_key,auto_target,auto_session) VALUES (?,?,?,?,?,1,?,?,?,?,?,?)""",
-                       (record_id, *pairs[0], deployment, account["id"], encode(freeze_requests(frozen, work_id)),
-                        work_id, str(uuid4()), str(uuid4()), *session_key))
-            db.executemany("INSERT INTO arrangement_segments VALUES (?,?,?,?)",
-                           [(record_id, pos, *pair) for pos, pair in enumerate(pairs, 1)])
-            return self._get(db, record_id)
+                original = overlaps[0]
+                if (len(parts) != 1 or len(overlaps) != 1 or original["auto_target"]
+                    or original["rejected"] or original["deployment"] != deployment
+                    or not same_intent(json.loads(original["frozen"]), frozen)):
+                    conflict = "、".join(dict.fromkeys(
+                        f"任务 {row['job_id']} 第 {row['segment_index']} 片" for row in overlaps
+                    ))
+                    raise BridgeError("arrangement_conflict", f"{conflict} 已有安排，请查看原单")
+                record_id = original["id"]
+                status = "delivered" if original["task_id"] else "pending"
+            else:
+                record_id = self.insert(db, deployment, str(uuid4()), frozen, session=key)
+                status = "checking"
+            db.execute("""UPDATE recording_sessions SET arrangement_id=?, status=?, problem=NULL
+                WHERE target_id=? AND session_key=?""", (record_id, status, *key))
+            return record_id
 
-    def stop_session(self, record_id):
-        with self.connect(write=True) as db:
-            stopped = db.execute("""UPDATE arrangements SET stage='stopped',lease_until=0
-                WHERE id=? AND auto_target IS NOT NULL AND (stage='register' OR (stage='submit' AND attempts=0))""",
-                                 (record_id,)).rowcount
-            if stopped:
-                db.execute("DELETE FROM arrangement_segments WHERE arrangement_id=?", (record_id,))
+    def save_session_manifest(self, row, path, revision, request):
+        with self.ledger.transaction() as db:
+            current = db.execute("SELECT stopped FROM deliveries WHERE id=?", (row["id"],)).fetchone()
+            if not current["stopped"]:
+                db.execute("""UPDATE deliveries SET manifest_path=?, config_version=?, request=?
+                    WHERE id=? AND request IS NULL""", (path, revision, encode(request), row["id"]))
+                db.execute("""UPDATE recording_sessions SET status='pending'
+                    WHERE arrangement_id=? AND status='checking' AND stopped=0""", (row["id"],))
 
-    def find_session(self, key):
-        with self.connect() as db:
-            row = db.execute("SELECT id FROM arrangements WHERE auto_target=? AND auto_session=?", key).fetchone()
-            return row["id"] if row else None
+    def confirm(self, preview, current_clip, check_version):
+        frozen = preview["frozen"]
+        job, index = preview["part"]
+        with self.ledger.transaction() as db:
+            if current_clip(job, index) != frozen["clips"][0]:
+                raise BridgeError("segment_changed", "录像或质量提示已变化，请重新预览")
+            for old in for_segments(db, [(job, index)]):
+                if old["auto_target"] or old["session_attached"]:
+                    return old["id"], False
+                if old["deployment"] == preview["deployment"] and old["account_id"] == frozen["account"]["id"]:
+                    if old["rejected"] and preview["revise"] == old["id"]:
+                        db.execute("DELETE FROM delivery_segments WHERE delivery_id=?", (old["id"],))
+                        continue
+                    return old["id"], False
+            check_version(preview["path"], preview["version"])
+            record_id = self.insert(db, preview["deployment"], preview["work_id"], frozen,
+                                    path=preview["path"], revision=preview["version"], request=preview["request"])
+            db.execute("""DELETE FROM upload_drafts WHERE job_id=? AND segment_index=?
+                AND deployment=? AND account_id=?""", (job, index, preview["deployment"], frozen["account"]["id"]))
+            return record_id, True
 
-    def due_tasks(self):
-        if not self.path.is_file():
-            return []
-        now = self.clock()
-        with self.connect() as db:
-            return [row[0] for row in db.execute("""SELECT id FROM arrangements
-                WHERE (auto_target IS NOT NULL OR follow_session=1)
-                  AND stage='task' AND lease_until<=? AND next_check<=?
-                ORDER BY next_check LIMIT 4""", (now, now))]
-
-    def claim(self, record_id, *, dispatch, revision=None, force=False):
-        with self.connect(write=True) as db:
-            row, now = self._get(db, record_id), self.clock()
-            if revision is not None and row["revision"] != revision:
-                raise stale()
-            if row["stage"] == "stopped" or row["lease_until"] > now or row["rejected"]:
-                return None
-            if not dispatch or row["stage"] == "task":
-                needs_lookup = row["stage"] == "task" or row["stage"] == "submit" and row["attempts"]
-                if not needs_lookup or not force and row["next_check"] > now:
-                    return None
-            db.execute(
-                "UPDATE arrangements SET generation=generation+1, lease_until=? WHERE id=?",
-                (now + 18, record_id),
-            )
-            return self._get(db, record_id)
-
-    def _fence(self, row, *, live=True):
-        sql = "id=? AND stage=? AND generation=? AND revision=?"
-        args = (row["id"], row["stage"], row["generation"], row["revision"])
-        return (sql + " AND lease_until>?", (*args, self.clock())) if live else (sql, args)
-
-    def mark_sent(self, row, *, guard=nullcontext):
-        with self.connect(write=True, guard=guard) as db:
-            where, args = self._fence(row)
-            return db.execute(
-                f"UPDATE arrangements SET attempts=attempts+1 WHERE {where}", args
-            ).rowcount == 1
-
-    def finish(self, row, **changes):
-        assignment = ",".join(f"{name}=?" for name in changes)
-        with self.connect(write=True) as db:
-            where, args = self._fence(row)
-            return db.execute(
-                f"UPDATE arrangements SET {assignment} WHERE {where}", (*changes.values(), *args)
-            ).rowcount == 1
-
-    def release(self, row):
-        where, args = self._fence(row, live=False)
-        with self.connect(write=True) as db:
-            db.execute(f"UPDATE arrangements SET lease_until=0 WHERE {where}", args)
+    def mark_sent(self, row, current_clip):
+        frozen = json.loads(row["frozen"])
+        with self.ledger.transaction() as db:
+            current = db.execute("SELECT * FROM deliveries WHERE id=?", (row["id"],)).fetchone()
+            if current["stopped"] or current["rejected"] or current["task_id"]:
+                return False
+            if row["auto_target"]:
+                check_session(db, (row["auto_target"], row["auto_session"]), frozen["evidence"])
+            else:
+                clip = frozen["clips"][0]
+                if current_clip(clip["job_id"], clip["segment_index"]) != clip:
+                    raise BridgeError("segment_changed", "录像或质量提示已变化，请重新预览")
+            db.execute("UPDATE deliveries SET sent=1 WHERE id=?", (row["id"],))
+            return True

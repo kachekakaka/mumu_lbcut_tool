@@ -2,7 +2,9 @@
 
 本项目包含 MuMu 单路录播 Worker、SQLite 持久化调度器、控制台 HTTP 后端和网页控制台。调度 CLI 与网页通过 HTTP 查询和控制；调度层负责开下播查询、去重排队和实例分配，Worker 负责本地准入、采集、有限恢复与切片封口。
 
-本机控制台支持[按主播启用整场自动投稿](docs/最小调度运行说明.md#在主播页启用自动投稿)，也可在切片页[手动安排外部 Core 上传](docs/最小调度运行说明.md#在切片页手动安排上传)。网页控制台已完成台式机真实录制联调。操作入口与网页构建见 [调度运行说明](docs/最小调度运行说明.md)，后端接口见 [控制台接口契约](docs/控制台接口契约.md)，剩余工作与验收见 [待办](docs/待办.md)，页面行为见 [控制台页面与交互](docs/设计说明.md#控制台页面与交互)。
+本机控制台支持[按主播启用整场自动投稿](docs/最小调度运行说明.md#在主播页启用自动投稿)，也可在切片页[预览并确认手动上传](docs/最小调度运行说明.md#在切片页手动安排上传)。日常版已切换到统一上传平台。台式机已完成一场真实自动投稿，用户在 B 站创作中心确认原稿为「仅自己可见」。[整场投稿实测记录](docs/证据/验证/20261120-MuMu整场自动投稿真实使用测试记录.md#2026-11-21-归档复核) · [待验事项](docs/待办.md#t16-投稿实测)
+
+网页控制台已完成台式机真实录制联调。操作与构建见[调度运行说明](docs/最小调度运行说明.md)，接口见[控制台接口契约](docs/控制台接口契约.md)，页面行为见[控制台页面与交互](docs/设计说明.md#控制台页面与交互)。
 
 运行环境：Windows、Python 3.11、MuMu、scrcpy，以及固定的 Gyan FFmpeg/ffprobe 9.0.2 full build。媒体工具部署见 [运行说明](docs/最小调度运行说明.md#固定媒体工具部署)。Python 运行依赖见 `requirements.txt`，测试依赖见 `requirements-test.txt` 和 [测试入口](tests/README.md)。
 
@@ -42,7 +44,8 @@
 | `scripts/`、`archive/scripts/` | 前者保存维护入口；后者保存已退役脚本的源码文本和用途说明，不作为可运行工具；既有现场产物的整理须另行确定 |
 | `../mumu_lbcut_tool_dev/mumu_lbcut_tool_tmp/` | 临时脚本、草稿、探针、构建中间文件、测试输入副本、输出、日志、截图、报告及验包解压副本 |
 | `../mumu_lbcut_tool_dev/mumu_lbcut_tool_dists/` | 打包生成的程序目录、安装包、便携包及发布压缩包；测试包同样放在这里，并在名称中注明测试用途 |
-| `../mumu_lbcut_tool_dev/runtime-console/` | v2 控制台默认长期调度数据库与事件日志；仅 `run --data-dir` 可指定其他独立目录 |
+| `../mumu_lbcut_tool_dev/runtime-console-unified/` | 统一投稿版默认调度数据库、交付关联与事件日志。用 `run --data-dir` 可指定其他独立目录 |
+| `../mumu_lbcut_tool_dev/runtime-console/` | 旧版调度与安排数据，保留原目录 |
 | `../mumu_lbcut_tool_dev/runtime/` | 保留旧运行数据及共享实例锁；新服务不读取旧库、不迁移或覆盖已有数据库 |
 | 用户指定的 `--output-dir` | 正式录像目录；按调度任务与 Worker run_id 分层，禁止覆盖已有录像 |
 | `../mumu_lbcut_tool_dev/tools/` | scrcpy 与固定媒体工具；ffmpeg/ffprobe 成套放入 `ffmpeg-9.0.2-full_build/bin/`，二进制不进 Git，具体部署见运行说明 |

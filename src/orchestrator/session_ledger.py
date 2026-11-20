@@ -17,9 +17,9 @@ CREATE TABLE IF NOT EXISTS recording_sessions (
  room_id TEXT NOT NULL, anchor_uid TEXT NOT NULL, nickname TEXT, web_rid TEXT NOT NULL,
  title TEXT, title_observed_at REAL, title_step TEXT NOT NULL, title_deadline REAL,
  close_reason TEXT, status TEXT NOT NULL DEFAULT 'recording', stopped INTEGER NOT NULL DEFAULT 0,
- submit_started INTEGER NOT NULL DEFAULT 0, binding TEXT, evidence TEXT, prepared TEXT,
+ binding TEXT, evidence TEXT,
  problem TEXT, retry_at REAL NOT NULL DEFAULT 0,
- arrangement_id TEXT, task_id TEXT,
+ arrangement_id TEXT REFERENCES deliveries(id),
  PRIMARY KEY(target_id, session_key)
 );
 CREATE INDEX IF NOT EXISTS recording_sessions_status ON recording_sessions(status, started_at);

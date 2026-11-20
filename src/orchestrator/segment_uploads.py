@@ -1,498 +1,328 @@
-"""切片安排、原单恢复和安全状态投影。"""
+"""手动预览与确认，以及手动和自动共用的原单恢复。"""
 
 import asyncio
-from contextlib import contextmanager, nullcontext
-import logging
 import json
-import os
 from pathlib import Path
 import re
-import stat
 import time
 from uuid import uuid4
 
-from .segment_upload_core import identifier, protocol
-from .segment_upload_store import encode, revisable
+from .queries import Queries
+from .segment_upload_store import DeliveryStore, for_segments
 from .storage import ControlError
-from .upload_core_client import BridgeError
+from .upload_manifest import file_snapshot, manifest_for, read_yaml, save_manifest, version
+from .upload_platform import BridgeError, DEFINITE_REJECTIONS, identifier, protocol
 
 
-DEFINITE_REJECTIONS = {
-    "invalid_request", "invalid_metadata", "invalid_manifest", "invalid_path",
-    "invalid_account", "duplicate_target", "unsupported_option", "engine_not_configured",
-    "engine_incompatible", "work_id_mismatch", "no_targets", "b18_not_permitted",
-}
-FINAL = {"SUCCEEDED", "FAILED", "CANCELLED", "EXPIRED"}
-logger = logging.getLogger(__name__)
-
-
-def file_snapshot(path, root):
-    try:
-        resolved = Path(path).resolve(strict=True)
-        if (
-            not Path(path).is_absolute() or resolved.drive.startswith("\\\\")
-            or resolved != Path(os.path.normpath(path))
-            or not resolved.is_relative_to(root.resolve())
-            or resolved.suffix.lower() != ".mp4"
-            or not resolved.is_file()
-        ):
-            raise ValueError
-        with resolved.open("rb") as handle:
-            info = os.fstat(handle.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_size <= 0:
-            raise ValueError
-        return {"path": str(resolved), "size": info.st_size, "mtime_ns": info.st_mtime_ns}
-    except (OSError, ValueError, RuntimeError, TypeError):
-        raise BridgeError("segment_file_unavailable", "正式录像不存在、不可读或不在录像输出目录内") from None
-
-
-def form_errors(values, modes, limits, filename):
-    if values["publish_mode"] not in modes:
-        return "当前部署不支持所选发布范围"
-    if (values["copyright"] == 2) != bool(values["source"]):
-        return "转载需填写来源，自制请留空"
-    if not values["title"] or len(values["title"]) > limits["title"]:
-        return "请填写符合部署字数限制的标题"
-    if len(Path(filename).stem) > limits["part_title"] or len(values["description"]) > limits["description"]:
-        return "分 P 标题或简介超出部署字数限制"
-    tags = values["tags"]
-    if not 1 <= len(tags) <= limits["tag_count"] or any(
-        not tag or "," in tag or len(tag) > limits["tag"] for tag in tags
-    ):
-        return "请填写符合部署数量和字数限制的标签"
-    return None
-
-
-def freeze_requests(frozen, work_id):
-    params = frozen["parameters"]
-    path = Path(frozen["file"]["path"])
-    directory = Path(frozen["directory"]) if "clips" in frozen else path.parent
-    videos = ([{"id": f"p{position}", "path": Path(clip["file"]["path"]).relative_to(directory).as_posix()}
-               for position, clip in enumerate(frozen["clips"], 1)] if "clips" in frozen else
-              [{"id": "video", "path": path.name}])
-    registration = {
-        "directory": str(directory),
-        "manifest": {
-            "version": 1,
-            "work": {"id": work_id, "ready": True,
-                     **{k: params[k] for k in ("title", "description", "tags")}},
-            "assets": {"videos": videos},
-            "upload_units": [{
-                "id": "session" if "clips" in frozen else "segment",
-                "mode": "multipart" if len(videos) > 1 else "independent",
-                "videos": [video["id"] for video in videos],
-                "targets": [{
-                    "platform": "bilibili", "account": frozen["account"]["id"], "enabled": True,
-                    "options": {k: params[k] for k in ("category_id", "copyright", "source", "publish_mode")},
-                }],
-            }],
-        },
-    }
-    submit = {**registration, "execution_type": "immediate", "retry_policy": {
-        "max_attempts": 3, "retry_delays_seconds": [30, 120],
-    }}
-    return {**frozen, "registration": registration, "submission": submit}
-
-
-def matches(row, snapshot):
-    frozen = json.loads(row["frozen"])
-    registration = frozen["registration"]
-    manifest = registration["manifest"]
-    unit = manifest["upload_units"][0]
-    item = "group" if unit["mode"] == "multipart" else unit["videos"][0]
-    return (
-        snapshot.get("unit_id") == unit["id"] and snapshot.get("item_key") == item
-        and snapshot.get("mode") == unit["mode"]
-        and snapshot["target"]["account_id"] == row["account_id"]
-        and snapshot["target"]["platform"] == "bilibili"
-        and snapshot["target"].get("expected_mid") == frozen["account"]["remote_user_id"]
-        and [p["video_id"] for p in snapshot["parts"]] == unit["videos"]
-        and snapshot["assets"] == [
-            {"asset_id": video["id"], "role": "video", "video_id": video["id"], "relative_path": video["path"]}
-            for video in manifest["assets"]["videos"]
-        ]
-        and isinstance(dir_value := snapshot.get("directory"), str)
-        and os.path.normcase(dir_value) == os.path.normcase(registration["directory"])
-        and "b18_run_id" not in snapshot
-    )
-
-
-def task_matches(row, task):
-    if task["work_id"] != row["work_id"]:
-        raise protocol()
-    task_id = identifier(task["id"])
-    return task_id if task["account_id"] == row["account_id"] and matches(row, task["snapshot"]) else None
-
-
-def observation(task, worker):
-    status = task["status"]
-    if not isinstance(status, str) or not re.fullmatch(r"[A-Z][A-Z0-9_]{0,47}", status):
-        raise protocol()
-    result = {"status": status, "worker_online": worker}
-    attempt = task.get("attempt")
-    if isinstance(attempt, dict) and status in {"RETRY_WAIT", "RECOVERY_PENDING", "UNCERTAIN", "FAILED", "CANCELLED"}:
-        reason = attempt.get("error")
-        if isinstance(reason, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", reason):
-            result["reason"] = reason
-    receipt = task.get("receipt")
-    if isinstance(receipt, dict) and isinstance(evidence := receipt.get("evidence"), dict):
-        bvid, aid = evidence.get("bvid"), evidence.get("aid")
-        if isinstance(bvid, str) and re.fullmatch(r"BV[A-Za-z0-9]{1,30}", bvid):
-            result["bvid"] = bvid
-        if type(aid) is int and aid > 0:
-            result["aid"] = aid
-    return result
+def public(row):
+    data = {k: row[k] for k in ("id", "work_id", "task_id", "problem")}
+    data.update(automatic=bool(row["auto_target"] or row.get("session_attached")), rejected=bool(row["rejected"]),
+                observed=row["observed"],
+                can_continue=not any(row[k] for k in ("auto_target", "task_id", "rejected", "stopped")),
+                can_revise=not row["auto_target"] and bool(row["rejected"]))
+    if "job_id" in row:
+        data.update(job_id=row["job_id"], segment_index=row["segment_index"])
+    return data
 
 
 class SegmentUploads:
-    def __init__(self, store, core, segment, output_dir, *, writable=lambda: True, guard=None, session_guard=None):
-        self.store, self.core, self.segment, self.output_dir = store, core, segment, output_dir
-        self.writable = writable
-        self.dialogs = {}
-        self.poll_limit = asyncio.Semaphore(4)
-        self.guard = guard
-        self.session_guard = session_guard
-        self.claim_cleanups = set()
+    def __init__(self, runtime, core, output_dir):
+        self.runtime, self.core, self.output_dir = runtime, core, output_dir
+        self.store = DeliveryStore(runtime)
+        self.previews = {}
+        self.in_flight = set()
 
-    @contextmanager
-    def send_guard(self, job, index):
-        self.require_writable()
-        try:
-            with self.guard(job, index) if self.guard else nullcontext():
-                self.require_writable()
-                yield
-        except ControlError as exc:
-            raise BridgeError(exc.code, str(exc), exc.status) from None
-
-    async def claim(self, record_id, **options):
-        pending = asyncio.create_task(asyncio.to_thread(self.store.claim, record_id, **options))
-        try:
-            return await asyncio.shield(pending)
-        except asyncio.CancelledError:
-            async def release_late():
-                try:
-                    if row := await pending:
-                        await asyncio.to_thread(self.store.release, row)
-                except Exception:
-                    logger.exception("取消后回收投稿领取失败，原租期到期后可重试")
-            cleanup = asyncio.create_task(release_late())
-            self.claim_cleanups.add(cleanup)
-            cleanup.add_done_callback(self.claim_cleanups.discard)
-            raise
-
-    async def finish_cleanups(self):
-        await asyncio.gather(*self.claim_cleanups, return_exceptions=True)
-
-    def current_segment(self, job, index):
-        try:
-            segment = self.segment(job, index)
-        except ControlError as exc:
-            raise BridgeError(exc.code, str(exc), exc.status) from None
-        if segment["status"] != "finished" or segment["started_at"] is None:
-            raise BridgeError("segment_unfinished", "只有已开始且已封口的正式切片可安排")
-        current = {
-            "file": file_snapshot(segment["file_path"], self.output_dir),
-            "quality_flags": segment["quality_flags"],
-        }
-        return segment, current
-
-    def public(self, row, *, detail=False):
-        state = json.loads(row["observed"]) if row["observed"] else {}
-        value = {k: row[k] for k in (
-            "id", "job_id", "segment_index", "stage", "revision", "task_id", "observed_at", "problem",
-        )} | {
-            "status": state.get("status"), "worker_online": state.get("worker_online"),
-            "automatic": row["auto_target"] is not None,
-            "rejected": bool(row["rejected"]), "can_revise": bool(revisable(row, self.store.clock())),
-            "can_continue": not row["auto_target"] and row["stage"] != "task" and not row["rejected"]
-                            and row["lease_until"] <= self.store.clock(),
-        }
-        if detail:
-            frozen = json.loads(row["frozen"])
-            value.update({k: state[k] for k in ("bvid", "aid", "reason") if k in state},
-                         deployment=row["deployment"], work_id=row["work_id"],
-                         account=frozen["account"], parameters=frozen["parameters"],
-                         filename=Path(frozen["file"]["path"]).name)
-            if row["auto_target"]:
-                value["parts"] = [video["path"] for video in frozen["registration"]["manifest"]["assets"]["videos"]]
-        return value
+    def writable(self):
+        return self.runtime.state == "running"
 
     def require_writable(self):
         if not self.writable():
-            raise BridgeError("upload_paused", "控制台正在关闭，仍可查看已保存安排", 503)
+            raise BridgeError("upload_paused", "控制台尚未就绪或正在关闭", 503)
+
+    def current_clip(self, job, index):
+        try:
+            row = Queries(self.store.ledger).segment(job, index)
+        except ControlError as exc:
+            raise BridgeError(exc.code, str(exc), exc.status) from None
+        if row["status"] != "finished" or row["started_at"] is None:
+            raise BridgeError("segment_unfinished", "只有已开录且已封口的正式切片可安排")
+        root = self.output_dir.resolve()
+        file = file_snapshot(row["file_path"], root)
+        if not Path(file["path"]).is_relative_to(root / job):
+            raise BridgeError("invalid_path", "正式录像位于其他录制任务目录")
+        return row, {"job_id": job, "segment_index": index, "file": file, "quality_flags": row["quality_flags"]}
+
+    def clip(self, job, index):
+        return self.current_clip(job, index)[1]
 
     async def context(self, job, index, revise=None):
         self.require_writable()
-        segment, source = await asyncio.to_thread(self.current_segment, job, index)
-        binding = await self.core.binding()
-        modes, limits = await self.core.capabilities(binding)
-        worker = await self.core.health(binding)
-        accounts = await self.core.accounts(binding)
-        present = await asyncio.to_thread(self.store.for_segments, [(job, index)])
-        rows = {r["account_id"]: r for r in present if r["deployment"] == binding["deployment"]}
-        if revise:
-            row = await asyncio.to_thread(self.store.get, revise)
-            if (row["job_id"], row["segment_index"], row["deployment"]) != (job, index, binding["deployment"]):
-                raise BridgeError("binding", "请连接这条安排的原部署后再修订")
-            if not revisable(row, self.store.clock()):
-                raise BridgeError("revision_forbidden", "原请求结果仍待确认，暂不能修订")
-            accounts = [a for a in accounts if a.id == row["account_id"]]
+        row, clip = await asyncio.to_thread(self.current_clip, job, index)
+        deployment = await self.core.binding()
+        accounts = await self.core.accounts(deployment)
+        records = await asyncio.to_thread(self.store.for_segments, [(job, index)])
+        original = self.original(records, deployment, revise)
+        occupied = {r["account_id"] for r in records if r["deployment"] == deployment}
+        saved = json.loads(original["frozen"]) if original else None
+        if saved:
+            accounts = [a for a in accounts if (a["id"], a["remote_user_id"]) == (
+                original["account_id"], saved["account"]["remote_user_id"]
+            )]
+            self.check_revision_source(original, saved, clip)
         else:
-            accounts = [a for a in accounts if a.id not in rows and not any(r["auto_target"] for r in present)]
-        now = time.monotonic()
-        self.dialogs = {key: ctx for key, ctx in self.dialogs.items() if ctx["expires"] > now}
-        if len(self.dialogs) >= 256:
-            raise BridgeError("busy", "打开的确认页过多，请稍后重试", 429)
-        ticket, filename = str(uuid4()), Path(source["file"]["path"]).name
-        allowed = {a.id: {"id": a.id, "remote_user_id": a.remote_user_id, "display_name": a.display_name}
-                   for a in accounts}
-        self.dialogs[ticket] = dict(
-            expires=now + 600, job=job, index=index, binding=binding, source=source,
-            allowed=allowed, revisions={a: rows[a]["revision"] if a in rows else 0 for a in allowed},
-            revise=revise,
-        )
-        defaults = (json.loads(row["frozen"])["parameters"] if revise else {
-            "title": Path(filename).stem[:limits["title"]], "description": "", "tags": [],
-        })
-        return {
-            "ticket": ticket, "deployment": binding["deployment"], "port": binding["port"],
-            "accounts": list(allowed.values()),
-            "worker_online": worker, "publish_modes": modes, "limits": limits,
-            "nickname": segment["nickname"] or segment["target_raw"],
-            "filename": filename, "duration_sec": segment["duration_sec"],
-            "quality_flags": source["quality_flags"], "defaults": defaults,
+            accounts = [a for a in accounts if a["id"] not in occupied]
+        filename = Path(clip["file"]["path"]).name
+        defaults = saved["parameters"] if saved else {
+            "title": Path(filename).stem, "description": "", "tags": ["直播回放"],
+            "source": "转载", "copyright": 2, "publish_mode": "self_only",
         }
+        account_id = original["account_id"] if original else None
+        if not original:
+            setting = await asyncio.to_thread(self.store.ledger.row,
+                "SELECT binding FROM posting_settings WHERE target_id=?", (row["target_id"],))
+            if setting and setting["binding"]:
+                saved = json.loads(setting["binding"])
+                defaults["category_id"] = saved["category_id"]
+                if saved["deployment"] == deployment and any(a["id"] == saved["account"]["id"]
+                    and a["remote_user_id"] == saved["account"]["remote_user_id"] for a in accounts):
+                    account_id = saved["account"]["id"]
+        return {"deployment": deployment, "accounts": accounts, "filename": filename,
+                "duration_sec": row["duration_sec"], "quality_flags": clip["quality_flags"],
+                "defaults": defaults, "account_id": account_id}
 
-    async def confirm(self, key, ticket, account_id, parameters, quality_confirmed):
+    @staticmethod
+    def original(records, deployment, revise):
+        if any(r["auto_target"] or r["session_attached"] for r in records):
+            raise BridgeError("arrangement_conflict", "该切片已有整场安排，请查看原单")
+        if revise:
+            original = next((r for r in records if r["id"] == revise and r["rejected"]
+                             and r["deployment"] == deployment), None)
+            if original is None:
+                raise BridgeError("revision_forbidden", "原单已变化或未明确拒绝，请查看原单")
+            return original
+        return None
+
+    def check_revision_source(self, original, saved, clip):
+        if original["problem_code"] == "preview_expired" and (
+            saved["root"] != str(self.output_dir.resolve()) or saved["clips"][0]["file"] != clip["file"]
+        ):
+            raise BridgeError("segment_changed", "原安排的录像已变化，请核对")
+
+    def draft(self, job, index, deployment, frozen, revise):
+        root = Path(frozen["root"])
+        slot = (job, index, deployment, frozen["account"]["id"])
+        with self.store.ledger.transaction() as db:
+            records = list(for_segments(db, [(job, index)]))
+            original = self.original(records, deployment, revise)
+            if any(r["deployment"] == deployment and r["account_id"] == slot[3]
+                   and (not original or original["id"] != r["id"]) for r in records):
+                raise BridgeError("arrangement_conflict", "该账号已有安排，请查看原单")
+            clip = self.clip(job, index)
+            if clip != frozen["clips"][0]:
+                raise BridgeError("segment_changed", "切片已变化，请重新打开安排窗口")
+            work_id, revision = str(uuid4()), None
+            if original:
+                saved = json.loads(original["frozen"])
+                if (slot[3], frozen["account"]["remote_user_id"]) != (
+                    original["account_id"], saved["account"]["remote_user_id"]
+                ):
+                    raise BridgeError("invalid_account", "请使用原安排的账号和 MID")
+                self.check_revision_source(original, saved, clip)
+                work_id, revision = original["work_id"], original["config_version"]
+            db.execute("INSERT OR IGNORE INTO upload_drafts VALUES (?,?,?,?,?,?)", (*slot, work_id, revision))
+            row = db.execute("""SELECT work_id,config_version FROM upload_drafts WHERE
+                job_id=? AND segment_index=? AND deployment=? AND account_id=?""", slot).fetchone()
+        return self.write_draft(slot, row, root, frozen)
+
+    def write_draft(self, slot, row, root, frozen):
+        with self.store.ledger.transaction() as db:
+            self.require_writable()
+            live = db.execute("""SELECT work_id,config_version FROM upload_drafts WHERE
+                job_id=? AND segment_index=? AND deployment=? AND account_id=?""", slot).fetchone()
+            if live != row:
+                raise BridgeError("stale_preview", "该切片的预览已变化，请重新预览")
+            work_id = row["work_id"]
+            manifest = manifest_for(root, work_id, frozen)
+            path, revision = save_manifest(root, work_id, manifest, row["config_version"])
+            db.execute("""UPDATE upload_drafts SET config_version=? WHERE
+                job_id=? AND segment_index=? AND deployment=? AND account_id=?""", (revision, *slot))
+        return work_id, path, revision, manifest
+
+    async def preview(self, job, index, deployment, account, params, revise=None):
         self.require_writable()
-        ctx = self.dialogs.get(ticket)
-        if not ctx or ctx["expires"] <= time.monotonic():
-            raise BridgeError("stale_dialog", "确认页已失效，请重新打开弹窗核对")
-        binding = ctx["binding"]
-        await self.core.verify(binding)
-        account = ctx["allowed"].get(account_id)
-        if account is None:
-            raise BridgeError("invalid_account", "请重新打开弹窗选择可用账号", 422)
-        expected = ctx["revisions"][account_id]
-        job, index, revise = ctx["job"], ctx["index"], ctx["revise"]
-        source = ctx["source"]
-        present = await asyncio.to_thread(self.store.for_segments, [(job, index)])
-        existing = next((r for r in present
-                         if r["deployment"] == binding["deployment"] and r["account_id"] == account_id), None)
-        if not existing or (revise and existing["revision"] == expected):
-            modes, limits = await self.core.capabilities(binding)
-            if problem := form_errors(parameters, modes, limits, Path(source["file"]["path"]).name):
-                raise BridgeError("invalid_submission", problem, 422)
-            accounts = await self.core.accounts(binding)
-            if not any(a.id == account_id and a.remote_user_id == account["remote_user_id"] for a in accounts):
-                raise BridgeError("invalid_account", "账号已停用、阻塞或身份变化，请重新核对")
-            _, current = await asyncio.to_thread(self.current_segment, job, index)
-            if current != source or source["quality_flags"] and not quality_confirmed:
-                raise BridgeError("segment_changed", "录像或质量提示需重新核对后确认")
-        await self.core.verify(binding)
+        if not params["title"] or any(not tag or "," in tag for tag in params["tags"]):
+            raise BridgeError("invalid_metadata", "请填写标题和有效标签", 422)
+        if (params["copyright"] == 2) != bool(params["source"]):
+            raise BridgeError("invalid_metadata", "转载需填写来源，自制请留空", 422)
+        account = await self.core.check_account(deployment, account)
+        clip = await asyncio.to_thread(self.clip, job, index)
+        frozen = {"root": str(self.output_dir.resolve()), "clips": [clip], "account": account, "parameters": params}
+        try:
+            work_id, path, revision, manifest = await asyncio.to_thread(
+                self.draft, job, index, deployment, frozen, revise
+            )
+        except OSError:
+            raise BridgeError("manifest_write", "无法保存作品 YAML", 503) from None
+        data = await self.core.preview(deployment, {"manifest_path": path, "asset_root": frozen["root"]})
+        platform_preview = identifier(data.get("preview_id"))
+        warnings = data.get("warnings")
+        if (data.get("work_id") != work_id or data.get("config_version") != revision
+            or not isinstance(data.get("expires_at"), str) or not isinstance(warnings, list)
+            or not all(isinstance(w, str) for w in warnings) or not self.matches_preview(data.get("manifest"), manifest)):
+            raise protocol()
+        now = time.monotonic()
+        self.previews = {key: item for key, item in self.previews.items() if item["expires"] > now}
+        if len(self.previews) >= 256:
+            self.previews.pop(next(iter(self.previews)))
+        ticket = str(uuid4())
+        self.previews[ticket] = {
+            "expires": now + 600, "part": (job, index), "deployment": deployment, "work_id": work_id,
+            "path": path, "version": revision, "frozen": frozen, "revise": revise,
+            "request": {"preview_id": platform_preview, "execution": {"type": "immediate"},
+                        "source": {"application": "mumu", "kind": "manual", "external_reference": f"{job}:{index}"}},
+        }
+        return {"ticket": ticket, "expires_at": data["expires_at"], "warnings": warnings,
+                "work": data["manifest"]["work"], "video": data["manifest"]["assets"]["videos"][0]["path"],
+                "options": data["manifest"]["upload_units"][0]["targets"][0]["options"],
+                "account": account, "quality_flags": clip["quality_flags"],
+                "media_url": f"/api/uploads/preview/{ticket}/media"}
+
+    @staticmethod
+    def matches_preview(actual, expected):
+        try:
+            unit, = actual["upload_units"]
+            target, = unit["targets"]
+            video, = actual["assets"]["videos"]
+            original = expected["upload_units"][0]
+            return (
+                actual["version"] == 1
+                and all(actual["work"][k] == v for k, v in expected["work"].items())
+                and all(video[k] == v for k, v in expected["assets"]["videos"][0].items())
+                and all(unit[k] == original[k] for k in ("id", "mode", "videos"))
+                and all(target[k] == original["targets"][0][k] for k in ("platform", "account", "enabled"))
+                and all(target["options"][k] == v for k, v in original["targets"][0]["options"].items())
+            )
+        except (KeyError, TypeError, ValueError):
+            return False
+
+    def ticket(self, key):
+        preview = self.previews.get(key)
+        if not preview or preview["expires"] <= time.monotonic():
+            raise BridgeError("stale_preview", "预览已失效，请重新预览")
+        return preview
+
+    def preview_media(self, key):
+        preview = self.ticket(key)
+        clip = self.clip(*preview["part"])
+        if clip != preview["frozen"]["clips"][0]:
+            raise BridgeError("segment_changed", "录像或质量提示已变化，请重新预览")
+        return clip["file"]["path"]
+
+    async def confirm(self, key, quality_confirmed):
         self.require_writable()
-        frozen = {**source, "parameters": parameters, "account": account}
-        row, dispatch = await asyncio.to_thread(self.store.confirm,
-            key, job, index, binding["deployment"], frozen, expected, revise, freeze_requests,
-            guard=lambda: self.send_guard(job, index),
-        )
-        if dispatch:
-            return await self.drive(row["id"], row["revision"], binding)
-        return self.public(row, detail=True)
+        preview = self.ticket(key)
+        if record := preview.get("record"):
+            return public(await asyncio.to_thread(self.store.get, record))
+        frozen = preview["frozen"]
+        if frozen["clips"][0]["quality_flags"] and not quality_confirmed:
+            raise BridgeError("quality_confirmation", "请先核对切片质量提示")
+        original = await asyncio.to_thread(self.store.for_segments, [preview["part"]])
+        automatic = next((r for r in original if r["auto_target"] or r["session_attached"]), None)
+        if automatic:
+            return public(automatic)
+        await self.core.check_account(preview["deployment"], frozen["account"])
+        self.require_writable()
+        record, created = await asyncio.to_thread(self.store.confirm, preview, self.clip, self.check_version)
+        preview["record"] = record
+        return public(await self.drive(record, replay=True) if created else await asyncio.to_thread(self.store.get, record))
 
-    async def lookup(self, binding, row):
-        cursor, found = None, set()
-        conflict = False
-        unit = json.loads(row["frozen"])["registration"]["manifest"]["upload_units"][0]
-        while True:
-            page = await self.core.work_tasks(binding, row["work_id"], cursor)
-            items, next_cursor = page["items"], page["next_cursor"]
-            if not isinstance(items, list):
-                raise protocol()
-            for task in items:
-                if task_id := task_matches(row, task):
-                    if task_id in found:
-                        raise protocol()
-                    found.add(task_id)
-                else:
-                    snapshot = task["snapshot"]
-                    if row["auto_target"] or (
-                        task["account_id"] == row["account_id"]
-                        and snapshot.get("unit_id") == unit["id"]
-                        and snapshot.get("item_key") == unit["videos"][0]
-                        and snapshot.get("mode") == unit["mode"]
-                    ):
-                        conflict = True
-            if next_cursor is None:
-                break
-            if (cursor and identifier(next_cursor) <= cursor) or not items or next_cursor != items[-1]["id"]:
-                raise protocol()
-            cursor = identifier(next_cursor)
-        if conflict:
-            raise BridgeError("task_mismatch", "作品下有身份冲突的任务")
-        if len(found) > 1:
-            raise BridgeError("task_ambiguous", "作品下有多条匹配任务，请核对原单")
-        return next(iter(found), None)
+    @staticmethod
+    def check_version(path, expected):
+        try:
+            if version(read_yaml(Path(path))) == expected:
+                return
+        except OSError:
+            pass
+        raise BridgeError("version_conflict", "作品 YAML 已变化或不可读，请重新预览")
 
-    async def link(self, row, task_id):
-        return await asyncio.to_thread(self.store.finish, row, stage="task", task_id=task_id, attempts=0,
-                                       lease_until=0, problem=None, problem_detail=None, next_check=0)
+    def preflight(self, row):
+        frozen = json.loads(row["frozen"])
+        root = self.output_dir.resolve()
+        if str(root) != frozen["root"]:
+            raise BridgeError("segment_changed", "录像输出目录已变化")
+        for clip in frozen["clips"]:
+            if file_snapshot(clip["file"]["path"], root) != clip["file"]:
+                raise BridgeError("segment_changed", f"任务 {clip['job_id']} 第 {clip['segment_index']} 片已变化")
+        self.check_version(row["manifest_path"], row["config_version"])
 
-    def check_frozen_files(self, row, frozen):
-        if row["auto_target"]:
-            if str(self.output_dir.resolve()) != frozen["registration"]["directory"]:
-                raise BridgeError("segment_changed", "录像输出目录已变更")
-            for clip in frozen["clips"]:
+    async def link(self, row, result):
+        tasks = result.get("task_ids")
+        if (result.get("work_id") != row["work_id"] or result.get("config_version") != row["config_version"]
+            or result.get("status") != "accepted" or not isinstance(tasks, list) or len(tasks) != 1):
+            raise protocol()
+        await asyncio.to_thread(self.store.update, row["id"], task_id=identifier(tasks[0]), problem=None,
+                                problem_code=None, retry_at=0)
+
+    async def drive(self, record_id, *, replay=False):
+        row = await asyncio.to_thread(self.store.get, record_id)
+        if record_id in self.in_flight or row["task_id"] or row["rejected"] or row["stopped"] or not row["request"]:
+            return row
+        self.in_flight.add(record_id)
+        sent_now = False
+        expired_unaccepted = False
+        try:
+            if row["sent"]:
+                result = await self.core.result(row)
+                if result:
+                    await self.link(row, result)
+                    return await asyncio.to_thread(self.store.get, record_id)
+                if not replay:
+                    raise BridgeError("submission_not_found", "暂未查到原任务，请核对原安排")
+            if not replay:
+                return row
+            self.require_writable()
+            await asyncio.to_thread(self.preflight, row)
+            await self.core.check_account(row["deployment"], json.loads(row["frozen"])["account"])
+            self.require_writable()
+            if await asyncio.to_thread(self.store.mark_sent, row, self.clip):
+                sent_now = True
                 try:
-                    current = file_snapshot(clip["file"]["path"], self.output_dir)
-                except BridgeError:
-                    current = None
-                if current != clip["file"]:
-                    raise BridgeError("segment_changed", f"任务 {clip['job_id']} 第 {clip['segment_index']} 片已变化或不可读")
-        else:
-            _, current = self.current_segment(row["job_id"], row["segment_index"])
-            if current != {k: frozen[k] for k in ("file", "quality_flags")}:
-                raise BridgeError("segment_changed", "录像或质量提示已变化，请核对原安排")
-
-    @contextmanager
-    def request_guard(self, row, frozen):
-        if not row["auto_target"]:
-            with self.send_guard(row["job_id"], row["segment_index"]):
-                yield
-            return
-        self.require_writable()
-        try:
-            key = row["auto_target"], row["auto_session"]
-            with self.session_guard(key, frozen["evidence"], submitting=row["stage"] == "submit"):
-                self.require_writable()
-                yield
-        except ControlError as exc:
-            raise BridgeError(exc.code, str(exc), exc.status) from None
-
-    async def drive(self, record_id, revision, binding=None, *, automatic=False, lookup_only=False):
-        self.require_writable()
-        saved = await asyncio.to_thread(self.store.get, record_id)
-        if saved["auto_target"] and not automatic:
-            raise BridgeError("automatic_arrangement", "整场安排由后台继续，请在主播页查看")
-        while row := await self.claim(record_id, dispatch=not lookup_only, revision=revision, force=True):
-            if row["stage"] == "task":
-                await self.refresh_claim(row, binding)
-                break
-            sent = False
-            try:
-                async with asyncio.timeout(14):
-                    original = binding or await self.core.binding(row["deployment"])
-                    if row["stage"] == "submit" and row["attempts"]:
-                        if task_id := await self.lookup(original, row):
-                            if await self.link(row, task_id):
-                                continue
-                            break
-                    if lookup_only:
-                        await asyncio.to_thread(self.store.finish, row, problem="submission_not_found", problem_detail=None,
-                                                next_check=self.store.clock() + 15)
-                        break
-                    frozen = json.loads(row["frozen"])
-                    modes, limits = await self.core.capabilities(original)
-                    files = [clip["file"] for clip in frozen["clips"]] if row["auto_target"] else [frozen["file"]]
-                    if row["auto_target"] and len(files) > limits["part_count"]:
-                        raise BridgeError("too_many_parts", "整场切片数量超过原部署的分 P 上限", 422)
-                    for file in files:
-                        if problem := form_errors(frozen["parameters"], modes, limits, Path(file["path"]).name):
-                            raise BridgeError("invalid_submission", problem, 422)
-                    accounts = await self.core.accounts(original)
-                    if not any(a.id == row["account_id"] and a.remote_user_id == frozen["account"]["remote_user_id"] for a in accounts):
-                        raise BridgeError("invalid_account", "原账号目前不可用，请核对原部署")
-                    await asyncio.to_thread(self.check_frozen_files, row, frozen)
-                    sent = await asyncio.to_thread(self.store.mark_sent, row,
-                        guard=lambda: self.request_guard(row, frozen))
-                    if not sent:
-                        break
-                    if row["stage"] == "register":
-                        result = await self.core.register(original, frozen["registration"], row["register_key"])
-                        if result["work_id"] != row["work_id"]:
-                            raise protocol()
-                        if await asyncio.to_thread(self.store.finish, row, stage="submit", attempts=0,
-                                                   lease_until=0, problem=None, problem_detail=None):
-                            continue
-                    else:
-                        result = await self.core.submit(original, row["work_id"], frozen["submission"], row["submit_key"])
-                        if result["work_id"] != row["work_id"] or len(result["tasks"]) != 1:
-                            raise protocol()
-                        task = result["tasks"][0]
-                        if type(task["created"]) is not bool or not matches(row, task["snapshot"]):
-                            raise protocol()
-                        if await self.link(row, identifier(task["task_id"])):
-                            continue
-            except (BridgeError, TimeoutError, KeyError, TypeError, AttributeError, ValueError) as exc:
-                code = exc.code if isinstance(exc, BridgeError) else "core_timeout" if isinstance(exc, TimeoutError) else "protocol"
-                rejected = (
-                    sent and row["attempts"] == 0 and isinstance(exc, BridgeError)
-                    and exc.status in (400, 409, 422) and code in DEFINITE_REJECTIONS
-                )
-                message = exc.message if isinstance(exc, BridgeError) and code in (
-                    "segment_changed", "invalid_submission", "too_many_parts", "posting_unavailable", "invalid_account",
-                ) else None
-                await asyncio.to_thread(self.store.finish, row, problem=code, problem_detail=message, rejected=int(rejected),
-                                        next_check=self.store.clock() + 5)
-            finally:
-                await asyncio.to_thread(self.store.release, row)
-            break
-        return self.public(await asyncio.to_thread(self.store.get, record_id), detail=True)
-
-    async def refresh_claim(self, row, binding=None):
-        try:
-            async with asyncio.timeout(12):
-                original = binding or await self.core.binding(row["deployment"])
-                if row["stage"] != "task":
-                    task_id = await self.lookup(original, row)
-                    if task_id is None:
-                        await asyncio.to_thread(self.store.finish, row, next_check=self.store.clock() + 10)
-                        return
-                    if await self.link(row, task_id):
-                        await self.refresh(row["id"], force=True)
-                    return
-                task = await self.core.task(original, row["task_id"])
-                if task_matches(row, task) != row["task_id"]:
-                    raise protocol()
-                worker = None
-                if task.get("status") == "QUEUED":
-                    try:
-                        worker = await self.core.health(original)
-                    except BridgeError as exc:
-                        if exc.code == "binding":
-                            raise
-                value = observation(task, worker)
-                current = json.loads(row["observed"]) if row["observed"] else {}
-                version = task["version"]
-                if type(version) is not int or version < current.get("version", 0):
-                    raise protocol()
-                now = self.store.clock()
-                next_check = float("inf") if value["status"] in FINAL else now + 4
-                await asyncio.to_thread(self.store.finish, row, observed=encode(value | {"version": version}),
-                                        observed_at=now, problem=None, next_check=next_check)
-        except (BridgeError, TimeoutError, KeyError, TypeError, AttributeError) as exc:
-            code = exc.code if isinstance(exc, BridgeError) else "core_timeout" if isinstance(exc, TimeoutError) else "protocol"
-            await asyncio.to_thread(self.store.finish, row, problem=code, next_check=self.store.clock() + 15)
+                    receipt = await self.core.submit(row)
+                except BridgeError as exc:
+                    if not (row["sent"] and not row["auto_target"]
+                            and exc.status == 409 and exc.code == "preview_expired"):
+                        raise
+                    # 已查回为空并重放原请求。再查一次，优先关联可能在此期间写入的回执。
+                    receipt = await self.core.result(row)
+                    if receipt is None:
+                        expired_unaccepted = True
+                        raise
+                await self.link(row, receipt)
+        except BridgeError as exc:
+            rejected = expired_unaccepted or (
+                not row["sent"] and ((not sent_now and exc.code in {
+                    "invalid_account", "version_conflict", "segment_changed", "segment_file_unavailable", "invalid_path",
+                }) or (sent_now and exc.code in DEFINITE_REJECTIONS and 400 <= exc.status < 500))
+            )
+            if exc.code != "posting_stopped":
+                await asyncio.to_thread(self.store.update, record_id, rejected=int(rejected),
+                                        problem=exc.message, problem_code=exc.code, retry_at=time.time() + 5)
         finally:
-            await asyncio.to_thread(self.store.release, row)
-
-    async def refresh(self, record_id, *, force=False):
-        if row := await self.claim(record_id, dispatch=False, force=force):
-            await self.refresh_claim(row)
+            self.in_flight.discard(record_id)
         return await asyncio.to_thread(self.store.get, record_id)
 
-    async def summaries(self, segments):
-        rows = await asyncio.to_thread(self.store.for_segments, segments)
-        now = self.store.clock()
-        due = {row["id"]: row for row in rows if row["lease_until"] <= now and row["next_check"] <= now
-               and not row["rejected"] and (row["stage"] == "task" or row["stage"] == "submit" and row["attempts"])}
-
-        async def poll(row):
-            async with self.poll_limit:
-                return await self.refresh(row["id"])
-
-        updated = await asyncio.gather(*(poll(row) for row in sorted(due.values(), key=lambda r: r["next_check"])[:4]))
-        by_id = {r["id"]: r for r in updated}
-        return [self.public(by_id.get(r["id"], r)) | {
-            "job_id": r["member_job_id"], "segment_index": r["member_index"],
-        } for r in rows]
+    async def detail(self, record_id):
+        row = await self.drive(record_id)
+        if not row["task_id"]:
+            return public(row)
+        try:
+            task = await self.core.task(row["deployment"], row["task_id"])
+            status = task.get("status")
+            if (task.get("id") != row["task_id"] or task.get("work_id") != row["work_id"]
+                or not isinstance(status, str) or not re.fullmatch(r"[A-Z][A-Z0-9_]{0,47}", status)):
+                raise protocol()
+            await asyncio.to_thread(self.store.update, record_id, observed=status)
+            row["observed"] = status
+        except BridgeError as exc:
+            row["problem"] = exc.message
+        return public(row)

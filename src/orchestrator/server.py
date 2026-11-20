@@ -21,7 +21,7 @@ from src.orchestrator.scheduler import Scheduler
 from src.orchestrator.storage import ControlError, Store
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_DATA_DIR = REPO_ROOT.parent / "mumu_lbcut_tool_dev" / "runtime-console"
+DEFAULT_DATA_DIR = REPO_ROOT.parent / "mumu_lbcut_tool_dev" / "runtime-console-unified"
 SERVICE_VERSION = "0.2.0"
 logger = logging.getLogger(__name__)
 
@@ -39,7 +39,6 @@ class ServerConfig:
     max_runtime: float = 0.0
     static_root: Path = REPO_ROOT / "web" / "dist"
     open_browser: bool = False
-    core_profile: Path | None = None
 
     def validate(self):
         from src.worker.room_locator import validate_navigation_timeout
@@ -141,7 +140,7 @@ class Runtime:
                     statistics_timezone="Asia/Shanghai", frontend_available=(self.config.static_root / "index.html").is_file())
 
 
-def create_app(config, runtime=None):
+def create_app(config, runtime=None, *, platform=None):
     runtime = runtime or Runtime(config)
     if not hasattr(runtime, "config"):
         runtime.config = config
@@ -159,15 +158,14 @@ def create_app(config, runtime=None):
             try:
                 if deliveries:
                     await deliveries
-                await app.state.finish_login_actions()
             finally:
                 await asyncio.to_thread(runtime.close)
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.runtime = runtime
     install_api(app, runtime)
-    from src.orchestrator.bilibili_api import install_accounts
-    install_accounts(app, config, runtime)
+    from src.orchestrator.segment_upload_api import install_uploads
+    install_uploads(app, config, runtime, platform)
 
     @app.get("/{path:path}")
     def static(path: str):

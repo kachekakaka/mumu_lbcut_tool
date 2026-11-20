@@ -1,673 +1,279 @@
-"""切片投递的本地事务、跨代次写回及只读恢复。"""
+"""本机实际 HTTP 入口、YAML 与平台回执恢复。"""
 
 import asyncio
-from copy import deepcopy
 import json
+import os
+from pathlib import Path
 import sqlite3
-import threading
+import subprocess
 from types import SimpleNamespace
 from uuid import uuid4
 
-from fastapi import FastAPI
+from fastapi.testclient import TestClient
 import httpx
 import pytest
 
-from src.orchestrator.bilibili_api import install_accounts
-from src.orchestrator.segment_upload_core import posting_capabilities
-from src.orchestrator.segment_upload_store import ArrangementStore
-from src.orchestrator.segment_uploads import SegmentUploads
-from src.orchestrator.upload_core_client import Account, BridgeError
+from src.orchestrator.server import ServerConfig, create_app
+from src.orchestrator.storage import Store
+from src.orchestrator.upload_manifest import manifest_path, version
+from src.orchestrator.upload_platform import BridgeError
+from test_session_deliveries import FIELDS, STARTED, add_job, finish_clip, room, start_clip
+from upload_platform_fixture import Platform
 
 
-PARAMETERS = dict(title="切片测试", description="", tags=["测试"], category_id=171,
-                  copyright=1, source="", publish_mode="self_only")
-ACCOUNT = Account(id="account", display_name="测试账号", platform="bilibili", reference="bilibili:42",
-                  remote_user_id="42", enabled=True, availability="ready", block_reasons=[])
-
-
-@pytest.mark.parametrize(("verified", "supports_private", "settings", "expected"), [
-    (["public"], True, {"allow_self_only": True}, ["public", "self_only"]),
-    (["public"], True, {"allow_self_only": False}, ["public"]),
-    (["public"], True, {}, ["public"]),
-    (["public", "self_only"], True, {}, ["public", "self_only"]),
-    (["public", "self_only"], False, {"allow_self_only": True}, ["public"]),
-    (["self_only"], True, {}, ["self_only"]),
-    (["public"], True, {"allow_self_only": "true"}, None),
-])
-def test_posting_modes_follow_engine_support_and_deployment(tmp_path, verified, supports_private, settings, expected):
-    engine = tmp_path / "engine.json"
-    capabilities = tmp_path / "capabilities.json"
-    limits = dict(title=80, part_title=80, description=2000, tag=20, tag_count=10, part_count=100)
-    engine.write_text(json.dumps(settings), encoding="utf-8")
-    capabilities.write_text(json.dumps({
-        "engine_build_id": "dev6", "protocol_version": 1, "submit_api": "web", "upload_ready": True,
-        "verified_publish_modes": verified, "supports_self_only": supports_private, "metadata_limits": limits,
-    }), encoding="utf-8")
-    config = {"engine_config": engine, "engine": {"capabilities_file": capabilities, "build_id": "dev6"}}
-    if expected is None:
-        with pytest.raises(BridgeError) as failure:
-            posting_capabilities(config)
-        assert failure.value.code == "posting_unavailable"
-    else:
-        assert posting_capabilities(config) == (expected, limits)
-
-
-class Core:
-    def __init__(self):
-        self.deployment = "A"
-        self.trace = []
-        self.tasks = {}
-        self.register_action = None
-        self.submit_action = None
-        self.extra_pages = []
-
-    async def binding(self, deployment=None):
-        if deployment and deployment != self.deployment:
-            raise BridgeError("binding", "部署已变")
-        return {"deployment": self.deployment, "port": 8765}
-
-    async def verify(self, binding):
-        await self.binding(binding["deployment"])
-
-    async def capabilities(self, binding):
-        return ["self_only"], dict(title=80, part_title=80, description=500, tag=20, tag_count=10, part_count=100)
-
-    async def health(self, binding):
-        return False
-
-    async def accounts(self, binding):
-        return [ACCOUNT]
-
-    async def register(self, binding, body, key):
-        self.trace.append(("POST register", key, deepcopy(body)))
-        if self.register_action:
-            await self.register_action()
-        return {"work_id": body["manifest"]["work"]["id"]}
-
-    async def submit(self, binding, work, body, key):
-        self.trace.append(("POST submit", key, deepcopy(body)))
-        videos = body["manifest"]["assets"]["videos"]
-        unit = body["manifest"]["upload_units"][0]
-        if work not in self.tasks:
-            self.tasks[work] = {
-                "work_id": work, "id": str(uuid4()), "account_id": ACCOUNT.id, "version": 1,
-                "status": "QUEUED", "snapshot": {
-                    "mode": unit["mode"], "unit_id": unit["id"],
-                    "item_key": "group" if unit["mode"] == "multipart" else unit["videos"][0],
-                    "directory": body["directory"],
-                    "target": {"account_id": ACCOUNT.id, "expected_mid": "42", "platform": "bilibili"},
-                    "parts": [{"video_id": video} for video in unit["videos"]],
-                    "assets": [{"asset_id": video["id"], "role": "video", "video_id": video["id"],
-                                "relative_path": video["path"]} for video in videos],
-                },
-            }
-        if self.submit_action:
-            await self.submit_action()
-        current = self.tasks[work]
-        return {"work_id": work, "tasks": [
-            {"task_id": current["id"], "created": False, "status": "QUEUED", "snapshot": current["snapshot"]}
-        ]}
-
-    async def work_tasks(self, binding, work, cursor):
-        self.trace.append(("GET work tasks", work, cursor))
-        if self.extra_pages and not cursor:
-            return {"items": self.extra_pages, "next_cursor": self.extra_pages[-1]["id"]}
-        task = self.tasks.get(work)
-        return {"items": [task] if task else [], "next_cursor": None}
-
-    async def task(self, binding, task_id):
-        self.trace.append(("GET task", task_id))
-        return next(t for t in self.tasks.values() if t["id"] == task_id)
+ORIGIN = "http://127.0.0.1:8000"
+UPLOADS = "/api/uploads"
+BASE = UPLOADS + "/segment-uploads"
 
 
 @pytest.fixture
-def setup(tmp_path):
-    core = Core()
-    output = tmp_path / "output"
-    output.mkdir()
-    media = output / "000001.mp4"
-    media.write_bytes(b"test video")
-    source = dict(status="finished", started_at=1, file_path=str(media), quality_flags=[],
-                  nickname="测试", target_raw="room", duration_sec=2)
-    now = [100.]
-
-    def new_mumu():
-        store = ArrangementStore(tmp_path / "arrangements.sqlite3", clock=lambda: now[0])
-        return SegmentUploads(store, core, lambda job, index: source, output)
-
-    return new_mumu, core, media, source, now
-
-
-async def confirm(mumu, ctx, *, values=PARAMETERS, key=None, quality=False):
-    return await mumu.confirm(key or str(uuid4()), ctx["ticket"], ACCOUNT.id, values, quality)
-
-
-def test_old_dialog_cannot_place_order_on_other_deployment(setup):
-    new_mumu, core, _, _, _ = setup
-
-    async def scenario():
-        mumu = new_mumu()
-        dialog = await mumu.context("job", 1)
-        core.deployment = "B"
-        with pytest.raises(BridgeError, match="部署已变"):
-            await confirm(mumu, dialog)
-        assert not core.trace and not mumu.store.for_segments([("job", 1)])
-
-    asyncio.run(scenario())
-
-
-def test_concurrent_confirm_conflict_and_restart_preserve_one_order(setup):
-    new_mumu, core, _, _, _ = setup
-
-    async def scenario():
-        mumu = new_mumu()
-        first, second = await mumu.context("job", 1), await mumu.context("job", 1)
-        registered, release = asyncio.Event(), asyncio.Event()
-
-        async def in_flight():
-            registered.set()
-            await release.wait()
-
-        core.register_action = in_flight
-        key = str(uuid4())
-        pending = asyncio.create_task(confirm(mumu, first, key=key))
-        await registered.wait()
-        duplicate = await confirm(mumu, second)
-        assert duplicate["task_id"] is None
-        for candidate in (key, str(uuid4())):
-            with pytest.raises(BridgeError) as exc:
-                await confirm(mumu, first, key=candidate, values=PARAMETERS | {"title": "其他"})
-            assert exc.value.code in ("confirmation_conflict", "arrangement_conflict")
-        release.set()
-        original = await pending
-        row = await new_mumu().refresh(original["id"], force=True)
-        assert row["id"] == duplicate["id"] == original["id"]
-        assert row["task_id"] == original["task_id"] == core.tasks[original["work_id"]]["id"]
-        assert [r[0] for r in core.trace].count("POST register") == 1
-        assert [r[0] for r in core.trace].count("POST submit") == 1
-
-    asyncio.run(scenario())
-
-
-def test_submit_commit_lost_after_video_moved_checks_every_page_without_post(setup):
-    new_mumu, core, media, _, _ = setup
-
-    async def scenario():
-        async def drop():
-            raise BridgeError("core_unreachable", "超时", 503)
-
-        core.submit_action = drop
-        mumu = new_mumu()
-        original = await confirm(mumu, await mumu.context("job", 1))
-        assert original["task_id"] is None
-        work = original["work_id"]
-        actual = core.tasks[work]
-        actual.update(status="SUCCEEDED", version=2)
-        other = deepcopy(actual)
-        other["id"] = "00000000-0000-0000-0000-000000000001"
-        other["snapshot"]["item_key"] = "another-video"
-        core.extra_pages = [other]
-        media.rename(media.with_name("moved.mp4"))
-        original_writes = list(core.trace)
-        reopened = new_mumu()
-        recovered = await reopened.drive(original["id"], original["revision"])
-        assert recovered["task_id"] == actual["id"] and recovered["status"] == "SUCCEEDED"
-        assert recovered["work_id"] == work and len(core.tasks) == 1
-        assert core.trace[len(original_writes):] == [
-            ("GET work tasks", work, None), ("GET work tasks", work, other["id"]), ("GET task", actual["id"]),
-        ]
-
-    asyncio.run(scenario())
-
-
-@pytest.mark.parametrize("fault", ["timeout", "cancel", "expired"])
-def test_same_process_can_continue_original_and_late_generation_cannot_write(setup, fault):
-    new_mumu, core, _, _, now = setup
-
-    async def scenario():
-        mumu = new_mumu()
-        first_dispatch, late = asyncio.Event(), asyncio.Event()
-
-        async def delay():
-            first_dispatch.set()
-            if fault == "timeout":
-                raise TimeoutError()
-            await late.wait()
-            return None
-
-        core.register_action = delay
-        initial = asyncio.create_task(confirm(mumu, await mumu.context("job", 1)))
-        await first_dispatch.wait()
-        original = mumu.store.for_segments([("job", 1)])[0]
-        if fault == "cancel":
-            initial.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await initial
-        elif fault == "timeout":
-            assert (await initial)["problem"] == "core_timeout"
-        else:
-            now[0] += 19
-        core.register_action = None
-        linked = await mumu.drive(original["id"], original["revision"])
-        assert linked["task_id"] and linked["problem"] is None
-        if fault == "expired":
-            late.set()
-            assert (await initial)["task_id"] == linked["task_id"]
-        assert core.trace[0] == core.trace[1]  # 同一个登记 Key 和正文。
-        current = mumu.store.get(original["id"])
-        assert current["generation"] > original["generation"]
-        assert current["task_id"] == linked["task_id"] and current["problem"] is None
-
-    asyncio.run(scenario())
-
-
-def test_first_definite_rejection_allows_revision_and_stales_old_context(setup):
-    new_mumu, core, _, _, _ = setup
-
-    async def scenario():
-        mumu = new_mumu()
-        old, duplicate = await mumu.context("job", 1), await mumu.context("job", 1)
-
-        async def reject():
-            raise BridgeError("invalid_path", "首次参数被拒绝", 409)
-
-        core.register_action = reject
-        key = str(uuid4())
-        initial = await confirm(mumu, old, key=key)
-        assert initial["rejected"] and initial["can_revise"]
-        revise = await mumu.context("job", 1, initial["id"])
-        core.register_action = None
-        updated = await confirm(mumu, revise, values=PARAMETERS | {"title": "新标题"})
-        assert updated["id"] == initial["id"] and updated["work_id"] == initial["work_id"]
-        assert updated["revision"] == 2 and updated["task_id"]
-        for ctx in (old, duplicate):
-            with pytest.raises(BridgeError) as exc:
-                await confirm(mumu, ctx, key=key)
-            assert exc.value.code == "stale_dialog"
-        assert core.trace[0][1] != core.trace[1][1]
-        with mumu.store.connect() as db:
-            history = db.execute("SELECT * FROM revisions WHERE arrangement_id=?", (initial["id"],)).fetchone()
-        assert json.loads(history["frozen"])["parameters"]["title"] == PARAMETERS["title"]
-
-    asyncio.run(scenario())
-
-
-def test_replay_rejection_stays_uncertain_and_replayed_receipt_gets_current_status(setup):
-    new_mumu, core, _, _, _ = setup
-
-    async def scenario():
-        async def drop():
-            raise TimeoutError
-
-        async def reject():
-            raise BridgeError("invalid_path", "后来拒绝", 409)
-
-        mumu = new_mumu()
-        core.submit_action = drop
-        initial = await confirm(mumu, await mumu.context("job", 1))
-        task = core.tasks[initial["work_id"]]
-        task.update(status="SUCCEEDED", version=3)
-        # 模拟 Core 的只读页还未见到原任务，下一次重放先拒绝，再拿到原始回执。
-        async def empty(binding, work, cursor):
-            core.trace.append(("GET work tasks", work, cursor))
-            return {"items": [], "next_cursor": None}
-
-        core.work_tasks = empty
-        core.submit_action = reject
-        replay = await mumu.drive(initial["id"], initial["revision"])
-        assert replay["problem"] == "invalid_path" and not replay["can_revise"] and not replay["rejected"]
-        with pytest.raises(BridgeError) as exc:
-            await mumu.context("job", 1, initial["id"])
-        assert exc.value.code == "revision_forbidden"
-        core.submit_action = None
-        recovered = await mumu.drive(initial["id"], initial["revision"])
-        assert recovered["task_id"] == task["id"] and recovered["status"] == "SUCCEEDED"
-        writes = [r for r in core.trace if r[0] == "POST submit"]
-        assert len(writes) == 3 and writes[0] == writes[1] == writes[2]
-        assert core.trace[-1] == ("GET task", task["id"])
-
-    asyncio.run(scenario())
-
-
-@pytest.mark.parametrize("failure", ["unfinished", "aborted", "outside", "missing", "quality_changed"])
-def test_preflight_blocks_unsuitable_media_and_changed_quality(setup, tmp_path, failure):
-    new_mumu, core, media, source, _ = setup
-
-    async def scenario():
-        mumu = new_mumu()
-        if failure == "quality_changed":
-            dialog = await mumu.context("job", 1)
-            source["quality_flags"] = [{"flag": "low_frame_rate", "suspected_start_time": 1}]
-            with pytest.raises(BridgeError) as exc:
-                await confirm(mumu, dialog, quality=True)
-            assert exc.value.code == "segment_changed"
-        else:
-            if failure == "unfinished":
-                source["status"] = "started"
-            elif failure == "aborted":
-                source["status"] = "aborted"
-            elif failure == "outside":
-                destination = tmp_path / media.name
-                media.rename(destination)
-                source["file_path"] = str(destination)
-            else:
-                media.rename(media.with_name("missing.mp4"))
-            with pytest.raises(BridgeError) as exc:
-                await mumu.context("job", 1)
-            assert exc.value.code == ("segment_unfinished" if failure in ("unfinished", "aborted")
-                                      else "segment_file_unavailable")
-        assert not core.trace
-
-    asyncio.run(scenario())
-
-
-@pytest.mark.parametrize("second_page", ["ambiguous", "failed", "conflict"])
-def test_lookup_never_associates_partial_or_ambiguous_pagination(setup, second_page):
-    new_mumu, core, _, _, _ = setup
-
-    async def scenario():
-        async def drop():
-            raise TimeoutError
-
-        core.submit_action = drop
-        mumu = new_mumu()
-        initial = await confirm(mumu, await mumu.context("job", 1))
-        work = initial["work_id"]
-        task = core.tasks[work]
-        first = deepcopy(task)
-        first["id"] = "00000000-0000-0000-0000-000000000001"
-        if second_page == "conflict":
-            first["snapshot"]["target"]["expected_mid"] = "99"
-
-        async def pages(binding, work_id, cursor):
-            core.trace.append(("GET work tasks", work_id, cursor))
-            if not cursor:
-                return {"items": [first], "next_cursor": first["id"]}
-            if second_page == "failed":
-                raise BridgeError("core_unreachable", "第 2 页超时", 503)
-            return {"items": [task], "next_cursor": None}
-
-        core.work_tasks = pages
-        since = len(core.trace)
-        result = await mumu.drive(initial["id"], initial["revision"])
-        assert result["task_id"] is None and not result["can_revise"]
-        assert result["problem"] == {
-            "ambiguous": "task_ambiguous", "failed": "core_unreachable", "conflict": "task_mismatch",
-        }[second_page]
-        assert core.trace[since:] == [("GET work tasks", work, None), ("GET work tasks", work, first["id"])]
-
-    asyncio.run(scenario())
-
-
-def test_late_read_does_not_replace_latest_observation(setup):
-    new_mumu, core, _, _, now = setup
-
-    async def scenario():
-        mumu = new_mumu()
-        submitted = await confirm(mumu, await mumu.context("job", 1))
-        early, release = asyncio.Event(), asyncio.Event()
-        actual = core.tasks[submitted["work_id"]]
-
-        async def delayed_get(binding, task_id):
-            old = deepcopy(actual)
-            early.set()
-            await release.wait()
-            return old
-
-        normal = core.task
-        core.task = delayed_get
-        slow = asyncio.create_task(mumu.refresh(submitted["id"], force=True))
-        await early.wait()
-        now[0] += 19
-        actual.update(status="SUCCEEDED", version=2)
-        core.task = normal
-        latest = await mumu.refresh(submitted["id"], force=True)
-        release.set()
-        assert (await slow)["observed"] == latest["observed"]
-        assert json.loads(latest["observed"])["status"] == "SUCCEEDED"
-
-    asyncio.run(scenario())
-
-
-def test_linked_uncertain_task_keeps_id_and_status_if_core_no_longer_finds_it(setup):
-    new_mumu, core, _, _, _ = setup
-
-    async def scenario():
-        mumu = new_mumu()
-        original = await confirm(mumu, await mumu.context("job", 1))
-        task = core.tasks[original["work_id"]]
-        task.update(status="UNCERTAIN", version=2)
-        uncertain = await mumu.drive(original["id"], original["revision"])
-        assert uncertain["status"] == "UNCERTAIN" and not uncertain["can_continue"]
-
-        async def missing(binding, task_id):
-            core.trace.append(("GET task", task_id))
-            raise BridgeError("not_found", "原任务找不到", 404)
-
-        core.task = missing
-        since = len(core.trace)
-        queried = await mumu.drive(original["id"], original["revision"])
-        assert queried["task_id"] == uncertain["task_id"] and queried["status"] == "UNCERTAIN"
-        assert queried["problem"] == "not_found" and queried["observed_at"] == uncertain["observed_at"]
-        assert not queried["can_revise"]
-        assert core.trace[since:] == [("GET task", original["task_id"])]
-
-    asyncio.run(scenario())
-
-
-def test_upload_endpoints_share_local_only_and_page_credentials(tmp_path):
-    app = FastAPI()
-    install_accounts(app, SimpleNamespace(data_dir=tmp_path, core_profile=None, port=8000, output_dir=tmp_path),
-                     SimpleNamespace(state="running"))
-    root = "/api/v1/bilibili"
-    params = {"keys": "a" * 32 + ":1"}
-
-    async def scenario():
-        for peer in ("192.168.0.10", "127.0.0.1"):
-            transport = httpx.ASGITransport(app=app, client=(peer, 50000))
-            async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:8000") as c:
-                summary = await c.get(root + "/segment-uploads", params=params)
-                assert summary.status_code == (401 if peer.startswith("127") else 403)
-                if summary.status_code == 401:
-                    token = (await c.get(root + "/bootstrap")).json()["token"]
-                    headers = {"X-Mumu-Page": token}
-                    assert (await c.get(root + "/segment-uploads", params=params, headers=headers)).json() == {"items": []}
-                    assert (await c.post(root + "/segment-uploads", json={}, headers=headers)).status_code == 400
-                    assert (await c.get(root + "/segment-uploads", params=params,
-                                        headers=headers | {"Origin": "http://other"})).status_code == 403
-
-    asyncio.run(scenario())
-
-
-@pytest.fixture
-def routed_upload(tmp_path, monkeypatch):
-    from src.orchestrator import segment_upload_api
-    from src.orchestrator.storage import Store
-
-    core = Core()
-    monkeypatch.setattr(segment_upload_api, 'PostingCore', lambda _: core)
-    store = Store(tmp_path / 'scheduler.sqlite3')
-    job = 'a' * 32
-    target = store.add_target('fixture', now=1)
-    with store.transaction() as db:
-        db.execute("INSERT INTO jobs(id,target_id,session_key,status,created_at) VALUES(?,?,'s','finished',1)",
-                   (job, target))
-    for index in (1, 2):
-        clip = tmp_path / f'clip-{index}.mp4'
-        clip.write_bytes(b'synthetic mp4')
-        store.record_event(job, dict(event='segment_started', segment_index=index, file_path=str(clip)), 1)
-        store.record_event(job, dict(event='segment_finished', segment_index=index, file_path=str(clip)), 2)
-    app = FastAPI()
-    @app.get('/test-light')
-    async def light():
-        return {'ready': True}
-    install_accounts(app, SimpleNamespace(data_dir=tmp_path, core_profile=None, port=8000, output_dir=tmp_path),
-                     SimpleNamespace(state='running', store=store))
-    uploads = ArrangementStore(tmp_path / 'upload-core' / 'segment-uploads.sqlite3')
-    transport = httpx.ASGITransport(app=app, client=('127.0.0.1', 50000))
-    yield store, job, core, uploads, transport
+def host(tmp_path):
+    data = tmp_path / "runtime"
+    root = tmp_path / "videos"
+    store = Store(data / "orchestrator.sqlite3")
+    target = store.add_target("live-a")
+    job = add_job(store, target, room("测试"), STARTED - 1)
+    clip = root / job / "000001.mp4"
+    start_clip(store, job, 1, clip, STARTED)
+    finish_clip(store, job, 1, clip, STARTED + 2)
+    platform = Platform()
+
+    def app():
+        runtime = SimpleNamespace(store=store, state="running", start=lambda: None, close=lambda: None)
+        return create_app(ServerConfig(data, root), runtime,
+                          platform=platform.client)
+
+    def client():
+        return TestClient(app(), base_url=ORIGIN, client=("127.0.0.1", 50000))
+
+    yield client, platform, store, job, clip
     store.close()
 
 
-UPLOAD_BASE = '/api/v1/bilibili'
-UPLOAD = UPLOAD_BASE + '/segment-uploads'
+def preview(client, platform, job, fields=FIELDS, **extra):
+    response = client.post(f"{BASE}/preview/{job}/1", json={
+        "deployment": platform.deployment, "account_id": platform.account["id"],
+        "remote_user_id": platform.account["remote_user_id"], "parameters": fields, **extra,
+    })
+    return response
 
 
-async def upload_client_ready(client):
-    client.headers['X-Mumu-Page'] = (await client.get(UPLOAD_BASE + '/bootstrap')).json()['token']
+def confirm(client, stage):
+    return client.post(BASE + "/confirm/" + stage["ticket"], json={"quality_confirmed": True})
 
 
-@pytest.mark.parametrize('boundary', ['confirm', 'register', 'submit', 'already_sent'])
-def test_http_conflict_fences_new_sends_and_keeps_original_query(routed_upload, monkeypatch, boundary):
-    store, job, core, uploads, transport = routed_upload
-    entered, release = threading.Event(), threading.Event()
-    mark = ArrangementStore.mark_sent
-    def fenced(self, row, **kwargs):
-        if row['segment_index'] == 1 and row['stage'] == boundary:
-            entered.set()
-            assert release.wait(5)
-        return mark(self, row, **kwargs)
-    monkeypatch.setattr(ArrangementStore, 'mark_sent', fenced)
-
-    def conflict():
-        store.record_event(job, dict(event='segment_aborted', segment_index=1, file_path='second.mp4'), 3)
-
-    async def scenario():
-        async with httpx.AsyncClient(transport=transport, base_url='http://127.0.0.1:8000') as c:
-            await upload_client_ready(c)
-            async def context(index):
-                return (await c.get(UPLOAD + f'/context/{job}/{index}')).json()
-            def send(dialog):
-                return c.post(UPLOAD, json=dict(ticket=dialog['ticket'], account_id=ACCOUNT.id,
-                    parameters=PARAMETERS, quality_confirmed=False), headers={'Idempotency-Key': str(uuid4())})
-            dialog = await context(1)
-            if boundary == 'confirm':
-                conflict()
-                assert (await send(dialog)).status_code == 409
-            elif boundary == 'already_sent':
-                first = (await send(dialog)).json()
-                conflict()
-                details = await c.get(UPLOAD + '/' + first['id'])
-                assert details.json()['task_id'] == first['task_id']
-            else:
-                submit = asyncio.create_task(send(dialog))
-                try:
-                    assert await asyncio.to_thread(entered.wait, 3)
-                    assert len(uploads.for_segments([(job, 1)])) == 1
-                    conflict()
-                finally:
-                    release.set()
-                result = (await submit).json()
-                assert result['problem'] == 'segment_unfinished' and result['task_id'] is None
-            assert (await c.get(UPLOAD + f'/context/{job}/1')).status_code == 409
-            posts = [item[0] for item in core.trace if item[0].startswith('POST')]
-            assert posts == {'confirm': [], 'register': [], 'submit': ['POST register'],
-                             'already_sent': ['POST register', 'POST submit']}[boundary]
-            rows = uploads.for_segments([(job, 1)])
-            assert len(rows) == (0 if boundary == 'confirm' else 1)
-            second = await send(await context(2))
-            assert second.status_code == 200 and second.json()['task_id']
-            assert [item[0] for item in core.trace if item[0].startswith('POST')][len(posts):] == [
-                'POST register', 'POST submit']
-    asyncio.run(scenario())
+def test_preview_only_writes_yaml_and_repeat_confirmation_links_one_task(host):
+    client, platform, store, job, clip = host
+    with client() as browser:
+        data = browser.get(f"{BASE}/context/{job}/1").json()
+        assert data["filename"] == clip.name
+        first = preview(browser, platform, job).json()
+        second = preview(browser, platform, job, FIELDS | {"description": "同一安排重新预览"}).json()
+        assert first["work"]["id"] == second["work"]["id"]
+        assert not platform.tasks
+        assert store.rows("SELECT * FROM delivery_segments") == []
+        assert browser.get(second["media_url"], headers={"Range": "bytes=0-3"}).content == clip.read_bytes()[:4]
+        assert confirm(browser, first).json()["code"] == "version_conflict"
+        accepted = confirm(browser, second).json()
+        again = confirm(browser, second).json()
+        assert accepted["task_id"] == again["task_id"]
+        assert len(platform.tasks) == 1
+        assert accepted["work_id"] == second["work"]["id"]
+        path = platform.trace[1][2]
+        assert Path(path["manifest_path"]).is_file()
+        saved = store.row("SELECT * FROM deliveries")
+        assert saved["config_version"] == version(Path(saved["manifest_path"]).read_bytes())
+        result = browser.get(UPLOADS + "/panel", params={"page": "tasks", "task_id": accepted["task_id"]})
+        assert result.status_code == 200
+    with client() as restarted:
+        records = restarted.get(BASE, params={"keys": job + ":1"}).json()["items"]
+        assert [item["task_id"] for item in records] == [accepted["task_id"]]
+        assert restarted.get(UPLOADS + "/tasks/" + accepted["task_id"]).json()["observed"] == "QUEUED"
+    assert len(platform.tasks) == 1
 
 
-def test_upload_sqlite_lock_does_not_block_asgi_or_timer(routed_upload, monkeypatch):
-    _, job, core, uploads, transport = routed_upload
-    entered = threading.Event()
-    confirm_original = ArrangementStore.confirm
-    def confirm_seen(self, *args, **kwargs):
-        entered.set()
-        return confirm_original(self, *args, **kwargs)
-    monkeypatch.setattr(ArrangementStore, 'confirm', confirm_seen)
-
-    async def scenario():
-        async with httpx.AsyncClient(transport=transport, base_url='http://127.0.0.1:8000') as c:
-            await upload_client_ready(c)
-            dialog = (await c.get(UPLOAD + f'/context/{job}/1')).json()
-            lock = sqlite3.connect(uploads.path)
-            lock.execute('BEGIN IMMEDIATE')
-            try:
-                request = asyncio.create_task(c.post(UPLOAD, json=dict(
-                    ticket=dialog['ticket'], account_id=ACCOUNT.id, parameters=PARAMETERS, quality_confirmed=False),
-                    headers={'Idempotency-Key': str(uuid4())}))
-                assert await asyncio.to_thread(entered.wait, 2)
-                timer = asyncio.create_task(asyncio.sleep(.025))
-                response = await c.get('/test-light')
-                await timer
-                assert response.json() == {'ready': True} and not request.done() and not core.trace
-                await asyncio.sleep(.32)
-            finally:
-                lock.rollback()
-                lock.close()
-            assert (await request).json()['task_id']
-            assert len(core.tasks) == 1
-    asyncio.run(scenario())
+def test_loopback_gate_and_offline_panel(host):
+    client, platform, _, job, _ = host
+    with client() as browser:
+        path = f"{BASE}/context/{job}/1"
+        for headers in ({"Host": "localhost:8000"}, {"Host": "127.0.0.1:8001"}, {"Origin": "http://example.test"},
+                        {"X-Forwarded-For": "127.0.0.1"}, {"Sec-Fetch-Site": "cross-site"}):
+            assert browser.get(path, headers=headers).status_code == 403
+        assert browser.post(f"{BASE}/preview/{job}/1", data={"category": "171"}).status_code == 415
+        platform.available = False
+        assert browser.get(UPLOADS + "/panel?page=accounts").json()["code"] == "platform_offline"
 
 
-@pytest.mark.parametrize('position', ['before_claim', 'after_claim'])
-def test_cancelled_http_claim_releases_only_its_generation(routed_upload, monkeypatch, position):
-    _, job, core, uploads, transport = routed_upload
-    original = ArrangementStore.claim
-    entered, release, cleaned = threading.Event(), threading.Event(), threading.Event()
-    now = [100.0]
-    abandoned = []
+@pytest.mark.parametrize("change,code", [
+    ("mid", "invalid_account"), ("deployment", "binding"), ("file", "segment_changed"),
+])
+def test_confirmation_needs_original_deployment_mid_and_file(host, change, code):
+    client, platform, _, job, clip = host
+    with client() as browser:
+        stage = preview(browser, platform, job).json()
+        if change == "mid":
+            platform.account["remote_user_id"] = "123"
+        elif change == "deployment":
+            platform.deployment = "B"
+        else:
+            clip.write_bytes(b"changed")
+        assert confirm(browser, stage).json()["code"] == code
+        assert not platform.tasks
 
-    def delayed(store, record, **kwargs):
-        store.clock = lambda: now[0]
-        if abandoned or not kwargs['dispatch']:
-            return original(store, record, **kwargs)
-        abandoned.append(None)
-        if position == 'before_claim':
-            entered.set()
-            assert release.wait(4)
-        row = original(store, record, **kwargs)
-        abandoned[0] = row['generation']
-        if position == 'after_claim':
-            entered.set()
-            assert release.wait(4)
-        return row
 
-    original_release = ArrangementStore.release
-    def release_claim(store, row):
-        try:
-            return original_release(store, row)
-        finally:
-            if row['generation'] == abandoned[0]:
-                cleaned.set()
-    monkeypatch.setattr(ArrangementStore, 'claim', delayed)
-    monkeypatch.setattr(ArrangementStore, 'release', release_claim)
+@pytest.mark.parametrize("category,private,code", [(999, True, "invalid_metadata"), (171, False, "unsupported_option")])
+def test_platform_previews_reject_invalid_options(host, category, private, code):
+    client, platform, _, job, _ = host
+    platform.private = private
+    with client() as browser:
+        assert preview(browser, platform, job, FIELDS | {"category_id": category}).json()["code"] == code
+    assert not platform.tasks
 
-    async def scenario():
-        async with httpx.AsyncClient(transport=transport, base_url='http://127.0.0.1:8000') as c:
-            await upload_client_ready(c)
-            dialog = (await c.get(UPLOAD + f'/context/{job}/1')).json()
-            request = asyncio.create_task(c.post(UPLOAD, json=dict(ticket=dialog['ticket'],
-                account_id=ACCOUNT.id, parameters=PARAMETERS, quality_confirmed=False),
-                headers={'Idempotency-Key': str(uuid4())}))
-            try:
-                assert await asyncio.to_thread(entered.wait, 3)
-                request.cancel()
-                with pytest.raises(asyncio.CancelledError):
-                    await request
-                original_row, = uploads.for_segments([(job, 1)])
-                assert not core.trace
-                if position == 'before_claim':
-                    release.set()
-                    assert await asyncio.to_thread(cleaned.wait, 2)
-                else:
-                    now[0] += 19
-                response = await c.post(UPLOAD + '/' + original_row['id'] + '/continue',
-                    json={'revision': original_row['revision']}, headers={'Idempotency-Key': str(uuid4())})
-                linked = response.json()
-                assert linked['task_id'] and linked['id'] == original_row['id']
-                fresh = uploads.get(linked['id'])
-                assert fresh['generation'] > abandoned[0]
-                release.set()
-                assert await asyncio.to_thread(cleaned.wait, 2)
-                assert uploads.get(linked['id']) == fresh
-                assert [entry[0] for entry in core.trace if entry[0].startswith('POST')] == [
-                    'POST register', 'POST submit']
-            finally:
-                release.set()
-    asyncio.run(scenario())
+
+@pytest.mark.parametrize("change", ["duplicate", "unknown", "asset_escape"])
+def test_tampered_yaml_invalidates_preview_without_rewriting_file(host, change):
+    client, platform, store, job, _ = host
+    with client() as browser:
+        stage = preview(browser, platform, job).json()
+        path = Path(platform.trace[0][2]["manifest_path"])
+        content = path.read_bytes()
+        if change == "duplicate":
+            modified = content + b"version: 1\n"
+        elif change == "unknown":
+            modified = content + b"unknown_option: true\n"
+        else:
+            relative = f"{job}/000001.mp4".encode()
+            assert relative in content
+            modified = content.replace(relative, b"../outside.mp4")
+        path.write_bytes(modified)
+        assert confirm(browser, stage).json()["code"] == "version_conflict"
+        assert preview(browser, platform, job).json()["code"] == "version_conflict"
+        assert path.read_bytes() == modified
+    assert not platform.tasks and not store.rows("SELECT * FROM deliveries")
+
+
+def test_accepted_manual_request_recovers_without_yaml_or_resubmit(host):
+    client, platform, store, job, _ = host
+
+    async def lose_response(request):
+        raise httpx.ReadError("已受理但连接断开", request=request)
+
+    platform.after_accept = lose_response
+    with client() as browser:
+        accepted = confirm(browser, preview(browser, platform, job).json()).json()
+        assert accepted["task_id"] is None
+    row = store.row("SELECT * FROM deliveries")
+    Path(row["manifest_path"]).unlink()
+    platform.previews.clear()
+    with client() as restarted:
+        current = restarted.get(BASE + "/" + accepted["id"]).json()
+        assert current["task_id"] == platform.tasks[row["request_key"]][1]["task_ids"][0]
+        assert [entry[0] for entry in platform.trace] == ["PREVIEW", "POST", "GET"]
+        with pytest.raises(BridgeError, match="未完成"):
+            asyncio.run(platform.client.bound_request("A", "/submissions", body={"preview_id": current["task_id"]},
+                                                      key=row["request_key"]))
+
+
+@pytest.mark.parametrize("edit", [False, True])
+def test_expired_unaccepted_manual_request_reuses_work_and_requires_confirmation(host, edit):
+    client, platform, store, job, _ = host
+
+    async def lose_request(request):
+        raise httpx.ConnectError("首次请求未到达", request=request)
+
+    platform.on_submit = lose_request
+    with client() as browser:
+        stage = preview(browser, platform, job).json()
+        original = confirm(browser, stage).json()
+    row = store.row("SELECT * FROM deliveries")
+    path = Path(row["manifest_path"])
+    original_yaml = path.read_bytes()
+    original_mtime = path.stat().st_mtime_ns
+    assert row["sent"] and not row["rejected"] and not platform.tasks
+    platform.on_submit = None
+    platform.previews.clear()
+    route = BASE + "/" + original["id"]
+    with client() as browser:
+        # 只读查不到回执时仍须保留原请求。
+        assert not browser.get(route).json()["can_revise"]
+        recovered = browser.post(route + "/continue", json={}).json()
+        assert recovered["can_revise"] and not recovered["can_continue"]
+        assert [item[0] for item in platform.trace[-3:]] == ["GET", "POST", "GET"]
+        assert platform.trace[-2] == ("POST", row["request_key"], json.loads(row["request"]))
+        assert not platform.tasks
+        fields = browser.get(f"{BASE}/context/{job}/1", params={"revise": original["id"]}).json()["defaults"]
+        assert fields == FIELDS
+        if edit:
+            fields["description"] = "用户明确修改的简介"
+        first = preview(browser, platform, job, fields, revise=original["id"]).json()
+        updated = preview(browser, platform, job, fields, revise=original["id"]).json()
+        assert first["work"]["id"] == updated["work"]["id"] == row["work_id"]
+        assert len(store.rows("SELECT id FROM deliveries")) == 1 and not platform.tasks
+        if not edit:
+            assert path.read_bytes() == original_yaml and path.stat().st_mtime_ns == original_mtime
+        accepted = confirm(browser, updated).json()
+        assert confirm(browser, updated).json()["task_id"] == accepted["task_id"]
+        assert confirm(browser, first).json()["task_id"] == accepted["task_id"]
+    with client() as restarted:
+        current = restarted.get(BASE, params={"keys": f"{job}:1"}).json()["items"]
+        assert [item["task_id"] for item in current] == [accepted["task_id"]]
+    new = store.row("SELECT * FROM deliveries WHERE task_id IS NOT NULL")
+    assert new["manifest_path"] == row["manifest_path"]
+    assert (new["config_version"] != row["config_version"]) == edit
+    assert new["request_key"] != row["request_key"] and new["request"] != row["request"]
+    assert len(platform.tasks) == 1
+
+
+def test_receipt_found_after_expired_replay_keeps_original_task(host):
+    client, platform, store, job, _ = host
+
+    async def lose_request(request):
+        raise httpx.ConnectError("首次请求未到达", request=request)
+
+    platform.on_submit = lose_request
+    with client() as browser:
+        original = confirm(browser, preview(browser, platform, job).json()).json()
+        row = store.row("SELECT * FROM deliveries")
+        platform.previews.clear()
+        task = str(uuid4())
+
+        async def late_acceptance(request):
+            platform.tasks[row["request_key"]] = (json.loads(row["request"]), {
+                "work_id": row["work_id"], "config_version": row["config_version"],
+                "status": "accepted", "task_ids": [task],
+            })
+
+        platform.on_submit = late_acceptance
+        current = browser.post(BASE + "/" + original["id"] + "/continue", json={}).json()
+        assert current["task_id"] == task and not current["can_revise"]
+        assert [item[0] for item in platform.trace[-3:]] == ["GET", "POST", "GET"]
+        assert len(store.rows("SELECT id FROM deliveries")) == 1
+
+
+def test_prior_data_is_never_opened_as_current_or_rewritten(tmp_path):
+    old = tmp_path / "orchestrator.sqlite3"
+    with sqlite3.connect(old) as db:
+        db.executescript("CREATE TABLE old_records (value); INSERT INTO old_records VALUES (123); PRAGMA user_version=5;")
+    original = old.read_bytes()
+    with pytest.raises(ValueError, match="拒绝覆盖"):
+        Store(old)
+    new = Store(tmp_path / "independent" / old.name)
+    try:
+        assert new.rows("SELECT * FROM deliveries") == []
+    finally:
+        new.close()
+    assert old.read_bytes() == original
+
+
+def test_manifest_directory_cannot_point_outside_output_root(tmp_path):
+    root, other = tmp_path / "recordings", tmp_path / "outside"
+    root.mkdir()
+    other.mkdir()
+    if os.name == "nt":
+        subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-CommandWithArgs",
+                        "New-Item -ItemType Junction -Path $args[0] -Target $args[1] | Out-Null",
+                        str(root / "sessions"), str(other)], check=True)
+    else:
+        (root / "sessions").symlink_to(other, target_is_directory=True)
+    with pytest.raises(BridgeError, match="越界"):
+        manifest_path(root, "id")

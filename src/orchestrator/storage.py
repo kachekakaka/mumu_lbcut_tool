@@ -31,7 +31,7 @@ ACTIVE = ("pending", "starting", "running", "stopping", "needs_reconcile")
 NEEDS_FIX = "needs_fix: "          # 目标无效，直到显式 record 查询确认 LIVE 后解除
 RETRY_BASE_SEC, RETRY_MAX_SEC = 5, 300
 BOOT_RETRY_BASE_SEC, BOOT_RETRY_MAX_SEC = 30, 300
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 # 这些停止原因已由目标状态决定后续（移除、确认下播、换场、主控正常退出），无需退避。
 SETTLED_STOPS = ("target_removed", "anchor_offline", "live_session_changed", "scheduler_shutdown")
 SCHEMA = """
@@ -170,7 +170,8 @@ class Store:
             raise ValueError("数据库不是当前调度器格式；拒绝覆盖或自动迁移，请使用新的独立数据目录")
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
-        self.db.executescript(SCHEMA + session_ledger.SCHEMA)
+        from .segment_upload_store import SCHEMA as DELIVERY_SCHEMA
+        self.db.executescript(SCHEMA + session_ledger.SCHEMA + DELIVERY_SCHEMA)
         self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
     @contextmanager
@@ -216,16 +217,6 @@ class Store:
         rows = self.rows(sql, params)
         return rows[0] if rows else None
 
-    @contextmanager
-    def segment_send_guard(self, job_id, index):
-        """切片事件提交与安排登记共用同一把锁。"""
-        with self._lock:
-            row = self.db.execute("SELECT status FROM segments WHERE job_id=? AND segment_index=?",
-                                  (job_id, index)).fetchone()
-            if not row or row["status"] != "finished":
-                raise ControlError("segment_unfinished", "切片已不能用于安排或发送")
-            yield
-
     def save_posting_settings(self, target_id, enabled, binding=None):
         with self.transaction() as db:
             if not db.execute("SELECT 1 FROM targets WHERE id=? AND enabled=1", (target_id,)).fetchone():
@@ -235,27 +226,16 @@ class Store:
                 binding=COALESCE(excluded.binding,posting_settings.binding)""",
                        (target_id, int(enabled), json.dumps(binding) if binding else None))
             if not enabled:
+                db.execute("""UPDATE deliveries SET stopped=1
+                    WHERE auto_target=? AND sent=0 AND task_id IS NULL""", (target_id,))
+                db.execute("""DELETE FROM delivery_segments WHERE delivery_id IN
+                    (SELECT id FROM deliveries WHERE auto_target=? AND stopped=1)""", (target_id,))
                 db.execute("""UPDATE recording_sessions SET stopped=1,
-                    status=CASE WHEN submit_started=0 AND status!='recording' THEN 'only_record' ELSE status END
-                    WHERE target_id=? AND status IN ('recording','checking','pending','review')""", (target_id,))
-
-    @contextmanager
-    def session_send_guard(self, session_key, evidence, *, submitting=False):
-        with self._lock:
-            with self.transaction() as db:
-                session = db.execute("SELECT * FROM recording_sessions WHERE target_id=? AND session_key=?",
-                                     session_key).fetchone()
-                if not session or session['status'] != 'pending' or session['stopped']:
-                    raise ControlError("posting_stopped", "本场自动投稿已停止")
-                clips, problem = session_ledger.gather_evidence(db, session)
-                active = db.execute("""SELECT 1 FROM jobs WHERE target_id=? AND session_key=?
-                    AND status IN ('pending','starting','running','stopping','needs_reconcile')""", session_key).fetchone()
-                if active or problem or clips != evidence:
-                    raise ControlError("segment_changed", problem or "本场切片台账发生变化")
-                if submitting:
-                    db.execute("""UPDATE recording_sessions SET submit_started=1
-                        WHERE target_id=? AND session_key=?""", session_key)
-            yield
+                    status=CASE WHEN status!='recording' AND (arrangement_id IS NULL OR arrangement_id IN
+                       (SELECT id FROM deliveries WHERE auto_target=? AND stopped=1))
+                       THEN 'only_record' ELSE status END
+                    WHERE target_id=? AND status IN ('recording','checking','pending','review')""",
+                           (target_id, target_id))
 
     def add_target(self, raw: str, auto_record=True, allow_unconfirmed=False, now=None) -> str:
         raw = raw.strip()

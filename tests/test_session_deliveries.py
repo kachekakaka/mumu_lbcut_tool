@@ -2,27 +2,28 @@
 
 import asyncio
 from datetime import datetime
-import json
+from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
+import yaml
 
 from console_helpers import DeferredQueries, observe_room
 from src.mvp.room_resolver import ResolvedRoom, RoomStatus
-from src.orchestrator.queries import Queries
 from src.orchestrator.room_query_process import QueryResult
 from src.orchestrator.scheduler import Scheduler
-from src.orchestrator.segment_upload_store import ArrangementStore
 from src.orchestrator.segment_uploads import SegmentUploads
 from src.orchestrator.session_deliveries import SessionDeliveries
 from src.orchestrator.storage import Store
-from src.orchestrator.upload_core_client import BridgeError
-from test_segment_uploads import ACCOUNT, Core, confirm
+from upload_platform_fixture import ACCOUNT, Platform
 
 
 STARTED = datetime.fromisoformat("2026-11-20T20:09:00+08:00").timestamp()
 BINDING = {"deployment": "A", "category_id": 171,
-           "account": ACCOUNT.model_dump(include={"id", "remote_user_id", "display_name"})}
+           "account": ACCOUNT}
+FIELDS = {"title": "测试主播｜2026-11-20 20:09｜直播回放", "description": "", "tags": ["直播回放", "测试主播"],
+          "category_id": 171, "copyright": 2, "source": "转载", "publish_mode": "self_only"}
 
 
 def room(title=None, number="1200"):
@@ -153,16 +154,16 @@ def delivery(tmp_path):
     target = store.add_target("live-a")
     store.save_posting_settings(target, True, BINDING)
     root = tmp_path / "recordings"
-    core = Core()
+    platform = Platform()
 
     def services(**options):
-        uploads = SegmentUploads(ArrangementStore(tmp_path / "uploads.sqlite3"), core,
-                                 Queries(store).segment, root, session_guard=store.session_send_guard)
-        return uploads, SessionDeliveries(SimpleNamespace(store=store), uploads,
+        runtime = SimpleNamespace(store=store, state="running")
+        uploads = SegmentUploads(runtime, platform.client, root)
+        return uploads, SessionDeliveries(runtime, uploads,
                                          verify_media=lambda path: SimpleNamespace(is_valid=path.read_bytes() != b"broken",
                                                                                    reject_reason="损坏"), **options)
 
-    yield store, target, root, core, services
+    yield store, target, root, platform, services
     store.close()
 
 
@@ -211,15 +212,20 @@ def test_order_only_includes_session_and_overlay_keeps_parts(delivery, multipart
         session = current(store, target)
         assert session["status"] == "delivered"
         row = uploads.store.get(session["arrangement_id"])
-        assert row["task_id"] == session["task_id"]
-        manifest = json.loads(row["frozen"])["registration"]["manifest"]
+        assert row["task_id"]
+        path = Path(row["manifest_path"])
+        assert path == root / "sessions" / row["work_id"] / "upload.yaml"
+        manifest = yaml.safe_load(path.read_bytes())
         paths = [a + "/000001.mp4"] + ([a + "/000002.mp4", b + "/000001.mp4"] if multipart else [])
         assert [video["path"] for video in manifest["assets"]["videos"]] == paths
         assert manifest["upload_units"][0]["mode"] == ("multipart" if multipart else "independent")
         assert manifest["work"]["title"] == "测试主播｜2026-11-20 20:09｜直播回放"
         keys = [(a, 1)] + ([(a, 2), (b, 1)] if multipart else [])
-        assert {item["task_id"] for item in await uploads.summaries(keys)} == {row["task_id"]}
-        assert len(await uploads.summaries(keys)) == len(keys)
+        records = uploads.store.for_segments(keys)
+        assert {item["task_id"] for item in records} == {row["task_id"]}
+        assert len(records) == len(keys)
+        assert all((root / name).is_file() for name in paths)
+        assert neighbor.read_bytes() == b"adjacent stream"
         assert len(core.tasks) == 1
 
     asyncio.run(scenario())
@@ -242,71 +248,58 @@ def test_bad_clip_keeps_original_and_never_creates_arrangement(delivery, clip, r
     assert not core.trace and len(list(root.glob("*/*.mp4"))) == 1
 
 
-@pytest.mark.parametrize("when", ["before_creation", "registered", "in_flight"])
+@pytest.mark.parametrize("when", ["before_creation", "before_send", "in_flight"])
 def test_disabling_posting_stops_sends_and_tracks_in_flight_order(delivery, when):
     store, target, root, core, services = delivery
     a, _ = close_recording(store, target, root, multipart=when == "in_flight")
 
-    async def disable():
+    async def disable(request=None):
         store.save_posting_settings(target, False)
         if when == "in_flight":
-            raise BridgeError("core_unreachable", "提交回包中断", 503)
+            raise httpx.ReadError("提交回包中断", request=request)
 
     async def scenario():
         uploads, service = services()
         await service.deliver(current(store, target))
         if when == "before_creation":
             await disable()
-        elif when == "registered":
-            core.register_action = disable
+        elif when == "before_send":
+            await disable()
         else:
-            core.submit_action = disable
-        await service.deliver(current(store, target))
-        # 重建服务对象，覆盖网页关闭、进程重启后从两个库继续查回。
+            core.after_accept = disable
+        if current(store, target)["status"] == "pending":
+            await service.deliver(current(store, target))
         uploads, service = services()
-        await service.deliver(current(store, target))
+        if current(store, target)["status"] == "pending":
+            await service.deliver(current(store, target))
         saved = current(store, target)
         if when == "in_flight":
             assert saved["status"] == "delivered"
-            assert len(core.tasks) == 1 and any(step[0] == "GET work tasks" for step in core.trace)
+            assert len(core.tasks) == 1 and any(step[0] == "GET" for step in core.trace)
         else:
             assert saved["status"] == "only_record" and not core.tasks
             assert (await uploads.context(a, 1))["accounts"]
-        assert sum(step[0] == "POST submit" for step in core.trace) == int(when == "in_flight")
+        assert sum(step[0] == "POST" for step in core.trace) == int(when == "in_flight")
         store.save_posting_settings(target, True, BINDING)
         assert current(store, target)["status"] == saved["status"]
 
     asyncio.run(scenario())
 
 
-def test_restart_replays_original_registration_and_manual_entry_cannot_duplicate(delivery):
+def test_manual_confirm_after_session_freeze_links_original_task(delivery):
     store, target, root, core, services = delivery
     a, _ = close_recording(store, target, root)
 
-    async def lost():
-        core.register_action = None
-        raise BridgeError("core_unreachable", "登记回包中断", 503)
-
     async def scenario():
         uploads, service = services()
+        preview = await uploads.preview(a, 1, "A", ACCOUNT, FIELDS)
         await service.deliver(current(store, target))
-        frozen = json.loads(current(store, target)["prepared"])
-        dialog_owner = uploads
-        dialog = await dialog_owner.context(a, 1)
-        core.register_action = lost
         await service.deliver(current(store, target))
-        uploads, service = services()
-        pending = current(store, target)
-        await service.deliver(pending)
-        store.request_stop(a, "manual_stop")
-        assert len(core.tasks) == 1
-        registers = [step for step in core.trace if step[0] == "POST register"]
-        assert len(registers) == 2 and registers[0] == registers[1]
-        assert current(store, target)["status"] == "delivered"
-        # 手动确认比自动安排晚到时，仍命中同一个任务。
-        manual = await confirm(dialog_owner, dialog, values=frozen["parameters"])
-        assert manual["task_id"] == current(store, target)["task_id"]
-        assert len([step for step in core.trace if step[0] == "POST submit"]) == 1
+        session = current(store, target)
+        assert session["status"] == "delivered"
+        manual = await uploads.confirm(preview["ticket"], True)
+        assert manual["task_id"] == uploads.store.get(session["arrangement_id"])["task_id"]
+        assert len([step for step in core.trace if step[0] == "POST"]) == 1
 
     asyncio.run(scenario())
 
@@ -319,29 +312,26 @@ def test_missing_submit_uses_frozen_request_only_if_still_enabled(delivery, disa
     async def scenario():
         uploads, service = services()
         await service.deliver(current(store, target))
-        submit = core.submit
-        lost = []
+        async def fail_before_accept(request):
+            raise httpx.ConnectError("未知提交结果", request=request)
 
-        async def fail_before_accept(binding, work, body, key):
-            lost.append(("POST submit", key, body))
-            raise BridgeError("core_unreachable", "未知提交结果")
-
-        core.submit = fail_before_accept
+        core.on_submit = fail_before_accept
         await service.deliver(current(store, target))
         assert not core.tasks
         if disable:
             store.save_posting_settings(target, False)
-        core.submit = submit
+        core.on_submit = None
         uploads, service = services()
         await service.deliver(current(store, target))
-        assert any(step[0] == "GET work tasks" for step in core.trace)
-        replays = [step for step in core.trace if step[0] == "POST submit"]
+        assert any(step[0] == "GET" for step in core.trace)
+        replays = [step for step in core.trace if step[0] == "POST"]
         saved = current(store, target)
         if disable:
-            assert not replays and not core.tasks
-            assert "暂未查到原平台任务" in saved["problem"]
+            assert len(replays) == 1 and not core.tasks
+            assert "暂未查到原任务" in saved["problem"]
         else:
-            assert replays == lost and len(core.tasks) == 1 and saved["status"] == "delivered"
+            assert len(replays) == 2 and replays[0] == replays[1]
+            assert len(core.tasks) == 1 and saved["status"] == "delivered"
 
     asyncio.run(scenario())
 
@@ -352,17 +342,15 @@ def test_automatic_delivery_finds_concurrent_identical_manual_order(delivery):
 
     async def scenario():
         uploads, service = services()
-        await service.deliver(current(store, target))
-        fields = json.loads(current(store, target)["prepared"])["parameters"]
-        dialog = await uploads.context(a, 1)
+        dialog = await uploads.preview(a, 1, "A", ACCOUNT, FIELDS)
         started, release = asyncio.Event(), asyncio.Event()
 
-        async def block_receipt():
+        async def block_receipt(request):
             started.set()
             await release.wait()
 
-        core.submit_action = block_receipt
-        manual = asyncio.create_task(confirm(uploads, dialog, values=fields))
+        core.after_accept = block_receipt
+        manual = asyncio.create_task(uploads.confirm(dialog["ticket"], True))
         try:
             await asyncio.wait_for(started.wait(), 5)
             await service.deliver(current(store, target))
@@ -372,7 +360,66 @@ def test_automatic_delivery_finds_concurrent_identical_manual_order(delivery):
             release.set()
         manual_result = await manual
         await service.deliver(current(store, target))
-        assert manual_result["task_id"] == current(store, target)["task_id"]
-        assert len(core.tasks) == 1 and len([step for step in core.trace if step[0] == "POST submit"]) == 1
+        saved = current(store, target)
+        assert manual_result["task_id"] == uploads.store.get(saved["arrangement_id"])["task_id"]
+        assert len(core.tasks) == 1 and len([step for step in core.trace if step[0] == "POST"]) == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("file_written", [False, True])
+def test_frozen_manifest_resumes_with_original_work_and_colon_session(delivery, monkeypatch, file_written):
+    store, target, root, platform, services = delivery
+    close_recording(store, target, root, multipart=True)
+    session = current(store, target)
+    assert ":" in session["session_key"]
+    platform.available = False
+
+    class Interrupted(BaseException):
+        pass
+
+    async def scenario():
+        uploads, service = services()
+        with monkeypatch.context() as patch:
+            if file_written:
+                patch.setattr(uploads.store, "save_session_manifest", lambda *_: interrupt())
+            else:
+                patch.setattr(service, "write_manifest", lambda *_: interrupt())
+            with pytest.raises(Interrupted):
+                await service.deliver(session)
+        saved = current(store, target)
+        original = uploads.store.get(saved["arrangement_id"])
+        path = root / "sessions" / original["work_id"] / "upload.yaml"
+        assert path.is_file() == file_written
+        content = path.read_bytes() if file_written else None
+        uploads, service = services()
+        await service.deliver(saved)
+        await service.deliver(current(store, target))
+        record = uploads.store.get(saved["arrangement_id"])
+        assert record["work_id"] == original["work_id"]
+        assert str(path) == record["manifest_path"]
+        assert content is None or path.read_bytes() == content
+        assert current(store, target)["status"] == "pending" and not platform.tasks
+
+    def interrupt():
+        raise Interrupted
+
+    asyncio.run(scenario())
+
+
+def test_partial_overlap_points_to_conflicting_clip(delivery):
+    store, target, root, platform, services = delivery
+    a, _ = close_recording(store, target, root, multipart=True)
+
+    async def scenario():
+        uploads, service = services()
+        preview = await uploads.preview(a, 1, "A", ACCOUNT, FIELDS)
+        result = await uploads.confirm(preview["ticket"], True)
+        assert result["task_id"]
+        await service.deliver(current(store, target))
+        saved = current(store, target)
+        assert saved["status"] == "review"
+        assert a in saved["problem"] and "第 1 片" in saved["problem"]
+        assert len(platform.tasks) == 1
 
     asyncio.run(scenario())

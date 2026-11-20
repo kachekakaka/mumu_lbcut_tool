@@ -15,6 +15,7 @@ const stubs = vi.hoisted(() => ({
 vi.mock('../src/api', () => ({ api: { segments: stubs.segments, targets: stubs.targets } }))
 vi.mock('../src/api/segmentUploads', async (original) => ({
   ...await original<typeof import('../src/api/segmentUploads')>(),
+  onLocalConsole: () => window.location.origin === 'http://127.0.0.1:8000',
   segmentUploads: { list: stubs.list },
 }))
 vi.mock('../src/poller', async (original) => ({
@@ -40,12 +41,12 @@ const segment: Segment = {
 const conflicted: Segment = { ...segment, segment_index: 2, status: 'conflicted', file_path: null }
 const saved: Arrangement = {
   id: 'old', job_id: conflicted.job_id, segment_index: conflicted.segment_index,
-  stage: 'task', revision: 1, task_id: 'core-old', status: 'SUCCEEDED',
-  worker_online: true, observed_at: 60, problem: null, rejected: false, can_revise: false, can_continue: false,
+  work_id: 'work-old', task_id: 'platform-old', observed: 'SUCCEEDED', automatic: true,
+  problem: null, rejected: false, can_revise: false, can_continue: false,
 }
 
 async function render(hostname: string) {
-  vi.stubGlobal('location', { hostname, pathname: '/' })
+  vi.stubGlobal('location', { hostname, pathname: '/', origin: 'http://' + hostname + ':8000' })
   stubs.targets.mockResolvedValue({ items: [] })
   stubs.segments.mockResolvedValue({ items: [segment, conflicted], total: 2, offset: 0, limit: 50 })
   const router = createRouter({ history: createMemoryHistory(), routes: [{ path: '/:p(.*)', component: { template: '<div/>' } }] })
@@ -88,7 +89,7 @@ describe('上传显示', () => {
     await stubs.loader?.()
     await flushPromises()
     expect(stubs.list).toHaveBeenCalledTimes(2)
-    expect(rows[1].text()).toContain('投稿成功')
+    expect(rows[1].text()).toContain('平台已受理')
   })
 
   it('模拟上传标签按状态配色', () => {

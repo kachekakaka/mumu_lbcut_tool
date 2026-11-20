@@ -20,17 +20,18 @@ const filters = reactive({
   range: null as [Date, Date] | null,
 })
 const focusIndex = computed(() => (route.query.focus ? Number(route.query.focus) : null))
+const focusJob = computed(() => filters.job_id)
 const items = ref<Segment[]>([])
 const targetOptions = ref<Target[]>([])
 const { page, size, total, query, fit } = usePager()
-const local = onLocalConsole()
+const local = ref(onLocalConsole())
 const uploadDialog = ref<InstanceType<typeof SegmentUploadDialog>>()
 const uploads = ref<Record<string, Arrangement[]>>({})
 let lastUploadLoad = 0
 let uploadGeneration = 0
 
 async function loadUploads() {
-  if (!local) return
+  if (!local.value) return
   lastUploadLoad = Date.now()
   const generation = ++uploadGeneration
   const rows = items.value
@@ -102,12 +103,13 @@ onMounted(loadTargets)
         style="width: 320px"
       />
     </div>
-    <SegmentTable :items="items" :upload-enabled="false" :focus-job="filters.job_id" :focus-index="focusIndex">
-      <template v-if="local" #upload="{ row }">
+    <el-alert v-if="!local" title="请在录制机打开 http://127.0.0.1:8000 安排上传" type="info" :closable="false" />
+    <SegmentTable :items="items" :upload-enabled="local" :focus-job="focusJob" :focus-index="focusIndex">
+      <template #upload="{ row }">
         <template v-if="uploads[segmentKey(row)]?.length">
           <div v-for="record in uploads[segmentKey(row)]" :key="record.id">
             <span>{{ arrangementStatus(record) }}</span>
-            <el-button link type="primary" size="small" @click="uploadDialog?.show(row, record)">查看任务</el-button>
+            <el-button link type="primary" size="small" @click="uploadDialog?.show(row, record)">{{ record.task_id ? '查看任务' : '查看原安排' }}</el-button>
           </div>
           <el-button v-if="row.status === 'finished' && row.started_at !== null && row.file_path && !uploads[segmentKey(row)]?.some(r => r.automatic)"
             link size="small" @click="uploadDialog?.show(row)">安排其他账号</el-button>

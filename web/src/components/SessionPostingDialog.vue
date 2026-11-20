@@ -1,10 +1,10 @@
 <script setup lang="ts">
 import { computed, onUnmounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
-import { request } from '../api/bilibili'
+import { request } from '../api/segmentUploads'
 import type { UploadAccount } from '../api/segmentUploads'
-import { platformStatusLabel } from '../api/segmentUploads'
 import { fmtTime } from '../format'
+import UploadPanel from './UploadPanel.vue'
 
 interface Settings {
   enabled: boolean
@@ -20,8 +20,7 @@ interface Session {
   status: string
   problem: string | null
   task_id: string | null
-  bvid?: string
-  platform_status?: string
+  observed?: string
 }
 
 const model = defineModel<boolean>({ required: true })
@@ -33,6 +32,7 @@ const account = ref('')
 const category = ref<number>()
 const loading = ref(false)
 const saving = ref(false)
+const accountsOpen = ref(false)
 const error = ref('')
 const statusError = ref('')
 let generation = 0
@@ -41,7 +41,7 @@ let statusGeneration = -1
 const path = computed(() => '/session-uploads/' + props.targetId)
 const statuses: Record<string, string> = {
   recording: '录制中', waiting_close: '等待本场结束', checking: '正在核对切片', only_record: '只录',
-  pending: '待交付', registered: '已登记，待接单', review: '待核对', delivered: '已交付',
+  pending: '待交付', review: '待核对', delivered: '平台已受理',
 }
 
 function recoverMessage(cause: unknown) {
@@ -53,7 +53,7 @@ async function loadSessions() {
   if (statusGeneration === current) return
   statusGeneration = current
   try {
-    const { items } = await request(path.value)
+    const { items } = await request<{items: Session[]}>(path.value)
     if (current !== generation) return
     sessions.value = items
     statusError.value = ''
@@ -72,7 +72,7 @@ async function open() {
   loading.value = true
   void loadSessions()
   try {
-    const data: Settings = await request(path.value + '/settings')
+    const data = await request<Settings>(path.value + '/settings')
     if (current !== generation) return
     settings.value = data
     enabled.value = data.enabled
@@ -97,13 +97,23 @@ async function save() {
     await request(path.value + '/settings', next ? {
       enabled: true, deployment: settings.value.deployment, account_id: account.value, category_id: category.value,
       remote_user_id: selected?.remote_user_id,
-    } : { enabled: false }, crypto.randomUUID())
+    } : { enabled: false })
     ElMessage.success(next ? '已保存自动投稿' : '已关闭自动投稿')
     if (current === generation) await open()
   } catch (cause) {
     if (current === generation) error.value = recoverMessage(cause)
   } finally {
     saving.value = false
+  }
+}
+
+async function refreshAccounts() {
+  const current = generation
+  try {
+    const data = await request<Settings>(path.value + '/settings')
+    if (current === generation) settings.value = data
+  } catch (cause) {
+    if (current === generation) error.value = recoverMessage(cause)
   }
 }
 
@@ -142,6 +152,7 @@ onUnmounted(() => { clearInterval(timer); generation++ })
           </el-form-item>
           <p class="muted">录完后按场次投稿，发布范围为仅自己可见。关闭后，本场尚未提交的自动安排会停止，录制继续。</p>
           <p v-if="settings.problem" class="muted">{{ settings.problem }}</p>
+          <el-button @click="accountsOpen = true">管理投稿账号</el-button>
           <el-button native-type="submit" type="primary" :loading="saving"
             :disabled="enabled && (!settings.deployment || !category || !settings.accounts.some(a => a.id === account))">
             保存
@@ -158,12 +169,14 @@ onUnmounted(() => { clearInterval(timer); generation++ })
       <el-table-column prop="title" label="直播间标题" min-width="135" show-overflow-tooltip />
       <el-table-column label="交付结果" min-width="210">
         <template #default="{ row }">
-          <div>{{ statuses[row.status] || row.status }}<template v-if="row.platform_status"> · {{ platformStatusLabel(row.platform_status) }}</template></div>
-          <div v-if="row.task_id" class="muted">任务 {{ row.task_id }}</div>
-          <div v-if="row.bvid">稿件 {{ row.bvid }}</div>
+          <div>{{ statuses[row.status] || row.status }}<template v-if="row.observed === 'UNCERTAIN'"> · 平台待核验</template></div>
+          <router-link v-if="row.task_id" :to="'/uploads/tasks/' + row.task_id">查看任务</router-link>
           <div v-if="row.problem" class="muted">{{ row.problem }}</div>
         </template>
       </el-table-column>
     </el-table>
+    <el-dialog v-model="accountsOpen" title="上传平台账号" width="min(960px, 96vw)" append-to-body destroy-on-close>
+      <UploadPanel v-if="accountsOpen" page="accounts" @account-updated="refreshAccounts" />
+    </el-dialog>
   </el-dialog>
 </template>
