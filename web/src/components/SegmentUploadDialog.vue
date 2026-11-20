@@ -138,7 +138,10 @@ defineExpose({ show })
       </template>
       <template v-else-if="detail">
         <p><strong>{{ arrangementStatus(detail) }}</strong></p>
-        <p class="upload-file">{{ detail.filename }} · {{ detail.parameters.title }}</p>
+        <p class="upload-file">{{ detail.parts ? '整场 · ' + detail.parts.length + ' 片' : detail.filename }} · {{ detail.parameters.title }}</p>
+        <ol v-if="detail.parts" class="upload-file">
+          <li v-for="part in detail.parts" :key="part">{{ part }}</li>
+        </ol>
         <p>{{ detail.account.display_name }}（MID {{ detail.account.remote_user_id ?? '未知' }}） · {{ detail.parameters.publish_mode === 'public' ? '公开' : '仅自己可见' }}</p>
         <dl>
           <dt>目标部署</dt><dd>{{ detail.deployment }}</dd>

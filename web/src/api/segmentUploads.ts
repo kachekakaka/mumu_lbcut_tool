@@ -36,13 +36,14 @@ export interface Arrangement {
   id: string
   job_id: string
   segment_index: number
-  stage: 'register' | 'submit' | 'task'
+  stage: 'register' | 'submit' | 'task' | 'stopped'
   revision: number
   task_id: string | null
   status: string | null
   worker_online: boolean | null
   observed_at: number | null
   problem: string | null
+  automatic?: boolean
   rejected: boolean
   can_revise: boolean
   can_continue: boolean
@@ -54,6 +55,7 @@ export interface ArrangementDetail extends Arrangement {
   account: UploadAccount
   parameters: PostingFields
   filename: string
+  parts?: string[]
   bvid?: string
   aid?: number
   reason?: string
@@ -83,11 +85,14 @@ const statuses: Record<string, string> = {
   RETRY_WAIT: '等待上传模块重试', RECOVERY_PENDING: '上传模块恢复中', UNCERTAIN: '投稿结果待核对',
   SUCCEEDED: '投稿成功', FAILED: '失败', CANCELLED: '已取消', EXPIRED: '已过期',
 }
+export const platformStatusLabel = (status: string) => statuses[status] || `未知状态（${status}）`
+
 export function arrangementStatus(row: Arrangement) {
+  if (row.stage === 'stopped') return '只录'
   if (row.rejected) return 'Core 明确拒绝'
   if (row.stage === 'task') {
     if (row.status === 'QUEUED' && row.worker_online === false) return '已排队，等待 Worker'
-    return row.status ? statuses[row.status] || `未知状态（${row.status}）` : '已关联，等待状态'
+    return row.status ? platformStatusLabel(row.status) : '已关联，等待状态'
   }
   if (row.problem) return row.stage === 'register' ? '登记待确认' : '提交待确认'
   return row.stage === 'register' ? '已保存安排' : '已登记，待取得任务'

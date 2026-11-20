@@ -148,11 +148,17 @@ def create_app(config, runtime=None):
 
     @asynccontextmanager
     async def lifespan(app):
+        deliveries = None
+        stop_deliveries = asyncio.Event()
         try:
             await asyncio.to_thread(runtime.start)
+            deliveries = asyncio.create_task(app.state.session_deliveries.run(stop_deliveries))
             yield
         finally:
+            stop_deliveries.set()
             try:
+                if deliveries:
+                    await deliveries
                 await app.state.finish_login_actions()
             finally:
                 await asyncio.to_thread(runtime.close)

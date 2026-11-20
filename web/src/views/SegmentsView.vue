@@ -109,7 +109,8 @@ onMounted(loadTargets)
             <span>{{ arrangementStatus(record) }}</span>
             <el-button link type="primary" size="small" @click="uploadDialog?.show(row, record)">查看任务</el-button>
           </div>
-          <el-button v-if="row.status === 'finished' && row.started_at !== null && row.file_path" link size="small" @click="uploadDialog?.show(row)">安排其他账号</el-button>
+          <el-button v-if="row.status === 'finished' && row.started_at !== null && row.file_path && !uploads[segmentKey(row)]?.some(r => r.automatic)"
+            link size="small" @click="uploadDialog?.show(row)">安排其他账号</el-button>
         </template>
         <el-button v-else-if="row.status === 'finished' && row.started_at !== null && row.file_path" link type="primary" size="small" @click="uploadDialog?.show(row)">安排上传</el-button>
         <span v-else>—</span>

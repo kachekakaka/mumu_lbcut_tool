@@ -7,6 +7,8 @@ accepted（第 1 条的前端形态由 [ADR 0016](0016-console-frontend-separate
 
 本记录保留当时的设计方向，并非各项均已交付：当前没有 YAML 批量导入或 Webhook 上传；上传方向未取消，需另行实施，见 [ADR 0017](0017-console-control-scope-and-session-intent.md)。实例复位职责进一步由 [ADR 0020](0020-worker-cleanup-force-stop-douyin.md) 修订，现行交付边界见[运行说明](../最小调度运行说明.md)。
 
+第 5 条在主播自动投稿流程中采用的交付方式及关闭开关时的行为见 [ADR 0022](0022-per-streamer-session-submission.md)。
+
 ## Context
 随着录播 Worker（执行单元）的成熟，系统需要一套工业级的上层调度平台，解决多模拟器并发分配、开播批量巡检、风控阻断自愈、切片交付等实际运营问题。以往单体录屏软件要么缺乏多开协调，要么直接在录制器内部耦合大文件上传逻辑，导致职责过载且极易因网络或鉴权异常阻塞主录制管线。
 

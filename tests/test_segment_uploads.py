@@ -13,6 +13,7 @@ import httpx
 import pytest
 
 from src.orchestrator.bilibili_api import install_accounts
+from src.orchestrator.segment_upload_core import posting_capabilities
 from src.orchestrator.segment_upload_store import ArrangementStore
 from src.orchestrator.segment_uploads import SegmentUploads
 from src.orchestrator.upload_core_client import Account, BridgeError
@@ -22,6 +23,33 @@ PARAMETERS = dict(title="切片测试", description="", tags=["测试"], categor
                   copyright=1, source="", publish_mode="self_only")
 ACCOUNT = Account(id="account", display_name="测试账号", platform="bilibili", reference="bilibili:42",
                   remote_user_id="42", enabled=True, availability="ready", block_reasons=[])
+
+
+@pytest.mark.parametrize(("verified", "supports_private", "settings", "expected"), [
+    (["public"], True, {"allow_self_only": True}, ["public", "self_only"]),
+    (["public"], True, {"allow_self_only": False}, ["public"]),
+    (["public"], True, {}, ["public"]),
+    (["public", "self_only"], True, {}, ["public", "self_only"]),
+    (["public", "self_only"], False, {"allow_self_only": True}, ["public"]),
+    (["self_only"], True, {}, ["self_only"]),
+    (["public"], True, {"allow_self_only": "true"}, None),
+])
+def test_posting_modes_follow_engine_support_and_deployment(tmp_path, verified, supports_private, settings, expected):
+    engine = tmp_path / "engine.json"
+    capabilities = tmp_path / "capabilities.json"
+    limits = dict(title=80, part_title=80, description=2000, tag=20, tag_count=10, part_count=100)
+    engine.write_text(json.dumps(settings), encoding="utf-8")
+    capabilities.write_text(json.dumps({
+        "engine_build_id": "dev6", "protocol_version": 1, "submit_api": "web", "upload_ready": True,
+        "verified_publish_modes": verified, "supports_self_only": supports_private, "metadata_limits": limits,
+    }), encoding="utf-8")
+    config = {"engine_config": engine, "engine": {"capabilities_file": capabilities, "build_id": "dev6"}}
+    if expected is None:
+        with pytest.raises(BridgeError) as failure:
+            posting_capabilities(config)
+        assert failure.value.code == "posting_unavailable"
+    else:
+        assert posting_capabilities(config) == (expected, limits)
 
 
 class Core:
@@ -42,7 +70,7 @@ class Core:
         await self.binding(binding["deployment"])
 
     async def capabilities(self, binding):
-        return ["self_only"], dict(title=80, part_title=80, description=500, tag=20, tag_count=10)
+        return ["self_only"], dict(title=80, part_title=80, description=500, tag=20, tag_count=10, part_count=100)
 
     async def health(self, binding):
         return False
@@ -58,16 +86,19 @@ class Core:
 
     async def submit(self, binding, work, body, key):
         self.trace.append(("POST submit", key, deepcopy(body)))
-        video = body["manifest"]["assets"]["videos"][0]["path"]
+        videos = body["manifest"]["assets"]["videos"]
+        unit = body["manifest"]["upload_units"][0]
         if work not in self.tasks:
             self.tasks[work] = {
                 "work_id": work, "id": str(uuid4()), "account_id": ACCOUNT.id, "version": 1,
                 "status": "QUEUED", "snapshot": {
-                    "mode": "independent", "unit_id": "segment", "item_key": "video",
+                    "mode": unit["mode"], "unit_id": unit["id"],
+                    "item_key": "group" if unit["mode"] == "multipart" else unit["videos"][0],
                     "directory": body["directory"],
                     "target": {"account_id": ACCOUNT.id, "expected_mid": "42", "platform": "bilibili"},
-                    "parts": [{"video_id": "video"}],
-                    "assets": [{"asset_id": "video", "role": "video", "video_id": "video", "relative_path": video}],
+                    "parts": [{"video_id": video} for video in unit["videos"]],
+                    "assets": [{"asset_id": video["id"], "role": "video", "video_id": video["id"],
+                                "relative_path": video["path"]} for video in videos],
                 },
             }
         if self.submit_action:

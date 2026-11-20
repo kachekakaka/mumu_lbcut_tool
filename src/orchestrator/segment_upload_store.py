@@ -1,4 +1,4 @@
-"""手动安排及每个步骤的派发权。与录制调度使用独立的数据库。"""
+"""手动与整场安排，以及每个步骤的派发权。"""
 
 from contextlib import closing, contextmanager, nullcontext
 import json
@@ -17,10 +17,17 @@ CREATE TABLE IF NOT EXISTS arrangements (
  frozen TEXT NOT NULL, work_id TEXT NOT NULL, register_key TEXT NOT NULL, submit_key TEXT NOT NULL,
  stage TEXT NOT NULL DEFAULT 'register', attempts INTEGER NOT NULL DEFAULT 0,
  generation INTEGER NOT NULL DEFAULT 0, lease_until REAL NOT NULL DEFAULT 0,
- rejected INTEGER NOT NULL DEFAULT 0, problem TEXT, task_id TEXT,
+ rejected INTEGER NOT NULL DEFAULT 0, problem TEXT, problem_detail TEXT, task_id TEXT,
  observed TEXT, observed_at REAL, next_check REAL NOT NULL DEFAULT 0,
- UNIQUE(job_id, segment_index, deployment, account_id)
+ auto_target TEXT, auto_session TEXT, follow_session INTEGER NOT NULL DEFAULT 0,
+ UNIQUE(auto_target, auto_session)
 );
+CREATE TABLE IF NOT EXISTS arrangement_segments (
+ arrangement_id TEXT NOT NULL REFERENCES arrangements(id), position INTEGER NOT NULL,
+ job_id TEXT NOT NULL, segment_index INTEGER NOT NULL,
+ PRIMARY KEY(arrangement_id, position), UNIQUE(arrangement_id, job_id, segment_index)
+);
+CREATE INDEX IF NOT EXISTS arrangement_segments_lookup ON arrangement_segments(job_id, segment_index);
 CREATE TABLE IF NOT EXISTS confirmations (
  key TEXT PRIMARY KEY, arrangement_id TEXT NOT NULL REFERENCES arrangements(id),
  revision INTEGER NOT NULL, intent TEXT NOT NULL
@@ -50,7 +57,7 @@ def stale():
 
 def revisable(row, now):
     return (
-        row["stage"] != "task" and row["lease_until"] <= now
+        not row["auto_target"] and row["stage"] != "task" and row["lease_until"] <= now
         and (row["rejected"] or row["attempts"] == 0)
     )
 
@@ -67,8 +74,13 @@ class ArrangementStore:
             if not self._initialized:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
                 with closing(sqlite3.connect(self.path, timeout=2)) as db:
+                    version = db.execute("PRAGMA user_version").fetchone()[0]
+                    has_tables = db.execute("SELECT 1 FROM sqlite_master WHERE type='table'").fetchone()
+                    if has_tables and version != 1:
+                        raise BridgeError("upload_db_version", "投递库格式已变更，请使用新的独立数据目录", 503)
                     db.execute("PRAGMA journal_mode=WAL")
                     db.executescript(SCHEMA)
+                    db.execute("PRAGMA user_version=1")
                 self._initialized = True
         with closing(sqlite3.connect(self.path, timeout=2)) as db:
             db.row_factory = sqlite3.Row
@@ -95,8 +107,10 @@ class ArrangementStore:
         values = ",".join(["(?,?)"] * len(segments))
         with self.connect() as db:
             return [dict(row) for row in db.execute(
-                f"""SELECT * FROM arrangements WHERE (job_id, segment_index) IN (VALUES {values})
-                ORDER BY job_id, segment_index, id""",
+                f"""SELECT a.*,s.job_id AS member_job_id,s.segment_index AS member_index
+                FROM arrangement_segments s JOIN arrangements a ON a.id=s.arrangement_id
+                WHERE (s.job_id,s.segment_index) IN (VALUES {values})
+                ORDER BY s.job_id,s.segment_index,a.id""",
                 [value for pair in segments for value in pair],
             )]
 
@@ -106,10 +120,14 @@ class ArrangementStore:
                          "account": account, "input": confirmed_input(frozen), "revise": revise})
         with self.connect(write=True, guard=guard) as db:
             old = db.execute(
-                """SELECT * FROM arrangements
-                   WHERE job_id=? AND segment_index=? AND deployment=? AND account_id=?""",
+                """SELECT a.* FROM arrangements a JOIN arrangement_segments s ON s.arrangement_id=a.id
+                   WHERE s.job_id=? AND s.segment_index=? AND a.deployment=? AND a.account_id=?""",
                 (job, index, deployment, account),
             ).fetchone()
+            auto = db.execute("""SELECT a.* FROM arrangements a JOIN arrangement_segments s ON s.arrangement_id=a.id
+                WHERE s.job_id=? AND s.segment_index=? AND a.auto_target IS NOT NULL""", (job, index)).fetchone()
+            if auto and (old is None or old["id"] != auto["id"]):
+                raise BridgeError("arrangement_conflict", "该切片已纳入整场安排，请查看原单")
             prior = db.execute("SELECT * FROM confirmations WHERE key=?", (key,)).fetchone()
             if prior:
                 if prior["intent"] != intent:
@@ -120,7 +138,14 @@ class ArrangementStore:
                     raise stale()
                 return dict(old), False
 
-            if revise:
+            if old and old["auto_target"]:
+                saved = json.loads(old["frozen"])
+                if (revise or len(saved["clips"]) != 1 or saved["parameters"] != frozen["parameters"]
+                    or saved["account"]["remote_user_id"] != frozen["account"]["remote_user_id"]
+                    or saved["file"] != frozen["file"] or saved["quality_flags"] != frozen["quality_flags"]):
+                    raise BridgeError("arrangement_conflict", "该切片已纳入整场安排，请查看原单")
+                record_id, revision, created = old["id"], old["revision"], False
+            elif revise:
                 if old is None or old["id"] != revise or old["revision"] != expected:
                     raise stale()
                 if not revisable(old, self.clock()):
@@ -132,7 +157,7 @@ class ArrangementStore:
                 revised = freeze_requests(frozen, old["work_id"])
                 db.execute(
                     """UPDATE arrangements SET revision=revision+1, frozen=?, register_key=?, submit_key=?,
-                       stage='register', attempts=0, rejected=0, problem=NULL, lease_until=0, next_check=0
+                       stage='register', attempts=0, rejected=0, problem=NULL, problem_detail=NULL, lease_until=0, next_check=0
                        WHERE id=?""",
                     (encode(revised), str(uuid4()), str(uuid4()), revise),
                 )
@@ -156,15 +181,73 @@ class ArrangementStore:
                     (record_id, job, index, deployment, account, revision, encode(saved),
                      work_id, str(uuid4()), str(uuid4())),
                 )
+                db.execute("INSERT INTO arrangement_segments VALUES (?,1,?,?)", (record_id, job, index))
             db.execute("INSERT INTO confirmations VALUES (?,?,?,?)", (key, record_id, revision, intent))
             return self._get(db, record_id), created
+
+    def arrange_session(self, session_key, deployment, frozen, freeze_requests, *, guard):
+        clips, account = frozen["clips"], frozen["account"]
+        with self.connect(write=True, guard=guard) as db:
+            old = db.execute("SELECT * FROM arrangements WHERE auto_target=? AND auto_session=?",
+                             session_key).fetchone()
+            if old:
+                return dict(old)
+            # 与手动确认共用写事务。任何重叠安排都在这里看到。
+            pairs = [(clip["job_id"], clip["segment_index"]) for clip in clips]
+            overlaps = {}
+            for job, index in pairs:
+                for row in db.execute("""SELECT a.* FROM arrangements a
+                    JOIN arrangement_segments s ON s.arrangement_id=a.id
+                    WHERE s.job_id=? AND s.segment_index=?""", (job, index)):
+                    overlaps[row["id"]] = row
+            if overlaps:
+                if len(pairs) == len(overlaps) == 1:
+                    row = next(iter(overlaps.values()))
+                    if (not row["auto_target"] and row["deployment"] == deployment
+                        and row["account_id"] == account["id"]
+                        and confirmed_input(json.loads(row["frozen"])) == confirmed_input(frozen)):
+                        db.execute("UPDATE arrangements SET follow_session=1 WHERE id=?", (row["id"],))
+                        return dict(row)
+                raise BridgeError("arrangement_conflict", "切片已有安排，与整场清单冲突，请查看切片页原单")
+            record_id, work_id = str(uuid4()), str(uuid4())
+            db.execute("""INSERT INTO arrangements
+                (id,job_id,segment_index,deployment,account_id,revision,frozen,work_id,
+                 register_key,submit_key,auto_target,auto_session) VALUES (?,?,?,?,?,1,?,?,?,?,?,?)""",
+                       (record_id, *pairs[0], deployment, account["id"], encode(freeze_requests(frozen, work_id)),
+                        work_id, str(uuid4()), str(uuid4()), *session_key))
+            db.executemany("INSERT INTO arrangement_segments VALUES (?,?,?,?)",
+                           [(record_id, pos, *pair) for pos, pair in enumerate(pairs, 1)])
+            return self._get(db, record_id)
+
+    def stop_session(self, record_id):
+        with self.connect(write=True) as db:
+            stopped = db.execute("""UPDATE arrangements SET stage='stopped',lease_until=0
+                WHERE id=? AND auto_target IS NOT NULL AND (stage='register' OR (stage='submit' AND attempts=0))""",
+                                 (record_id,)).rowcount
+            if stopped:
+                db.execute("DELETE FROM arrangement_segments WHERE arrangement_id=?", (record_id,))
+
+    def find_session(self, key):
+        with self.connect() as db:
+            row = db.execute("SELECT id FROM arrangements WHERE auto_target=? AND auto_session=?", key).fetchone()
+            return row["id"] if row else None
+
+    def due_tasks(self):
+        if not self.path.is_file():
+            return []
+        now = self.clock()
+        with self.connect() as db:
+            return [row[0] for row in db.execute("""SELECT id FROM arrangements
+                WHERE (auto_target IS NOT NULL OR follow_session=1)
+                  AND stage='task' AND lease_until<=? AND next_check<=?
+                ORDER BY next_check LIMIT 4""", (now, now))]
 
     def claim(self, record_id, *, dispatch, revision=None, force=False):
         with self.connect(write=True) as db:
             row, now = self._get(db, record_id), self.clock()
             if revision is not None and row["revision"] != revision:
                 raise stale()
-            if row["lease_until"] > now or row["rejected"]:
+            if row["stage"] == "stopped" or row["lease_until"] > now or row["rejected"]:
                 return None
             if not dispatch or row["stage"] == "task":
                 needs_lookup = row["stage"] == "task" or row["stage"] == "submit" and row["attempts"]

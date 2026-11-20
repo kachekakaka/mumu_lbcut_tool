@@ -14,12 +14,14 @@ class ImmediateQueries:
 
     def __init__(self, resolver):
         self.resolver = resolver
+        self.calls = []
 
     def available(self, source):
         return True
 
     def submit(self, source, raw):
         future = Future()
+        self.calls.append((source, raw, future))
         future.set_result(QueryResult(self.resolver.resolve(raw)))
         return future
 

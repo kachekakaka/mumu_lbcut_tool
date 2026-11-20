@@ -223,6 +223,8 @@ def test_login_checks_end_without_waiting_for_periodic_scan(system,notice):
     e.scheduler.auto_scan = True
     e.scheduler._next_scan = e.clock() + 600
     e.network.resolved.clear()
+    calls = e.scheduler.room_queries.calls
+    calls.clear()
     e.network.rooms['A'] = ResolvedRoom('A', RoomStatus.ENDED)
     e.children[0].emit(notice, reason='login_prompt_detected',
                        action='rejected' if notice=='capture_startup' else 'relocate_target')
@@ -236,7 +238,7 @@ def test_login_checks_end_without_waiting_for_periodic_scan(system,notice):
     assert e.network.resolved == ['A']
     e.clock.advance(.6)
     pump(e, lambda: not e.children[0].alive)
-    assert e.network.resolved == ['A', 'A']
+    assert [source for source, _, _ in calls if source != 'title'] == ['login', 'login']
     assert row(e, 'SELECT stop_reason FROM jobs WHERE id=?', job['id'])['stop_reason'] == 'anchor_offline'
 
 

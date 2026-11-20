@@ -97,14 +97,18 @@ def finite_time(value):
     return value if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) else None
 
 
+def quality_flags(risks):
+    return [{"flag": r.get("flag"), "suspected_start_time": finite_time(r.get("suspected_start_time"))}
+            for r in risks]
+
+
 def segment_object(row):
     data = fields(row, "job_id,target_id,nickname,target_raw,segment_index,status,file_path,duration_sec,file_size_mb,is_final,reason,created_at,started_at,ended_at,updated_at")
     data["is_final"] = bool(data["is_final"])
     data["reason"] = reason_object(data["reason"])
     if row["status"] == "started":
         data["file_path"] = row["file_path"] or row["raw_path"]
-    data["quality_flags"] = [{"flag": r.get("flag"), "suspected_start_time": finite_time(r.get("suspected_start_time"))}
-                             for r in json.loads(row["risk_json"] or "[]")]
+    data["quality_flags"] = quality_flags(json.loads(row["risk_json"] or "[]"))
     return data
 
 

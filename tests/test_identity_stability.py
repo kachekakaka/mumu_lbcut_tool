@@ -214,7 +214,8 @@ def test_pending_manual_refresh_reuses_task_for_missing_or_stale_identity(system
     assert result(e, key)['status'] == 'succeeded'
     assert e.children[0].spec.job_id == job_id
     assert len(e.store.rows('SELECT * FROM jobs')) == 1
-    assert len(e.network.resolved) == 2  # 手动刷新与启动复核都真正执行。
+    # 手动刷新与启动复核都执行，标题走独立查询槽位。
+    assert [source for source, _, _ in e.scheduler.room_queries.calls] == ['manual', 'verify', 'title']
 
 
 def test_prelaunch_missing_releases_slot_and_scan_completion_resumes(system):

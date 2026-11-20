@@ -154,6 +154,7 @@ class Scheduler:
         self._boot_stop = threading.Event()
         self._waiting_exit = {}
         self._login_checks = {}
+        self._title_queries = {}
         self._next_waiting_probe = 0.0
         self._shutdown = False
         self._closed = False
@@ -162,6 +163,11 @@ class Scheduler:
             self.store.interrupt_commands(self.clock())
             self.room_queries = query_executor or QueryProcesses()
             self.observations = ObservationDispatcher(store, self.room_queries, clock)
+            with self.store.transaction() as db:
+                # 已派发的历史请求不能变成重启后的又一次开录查询。
+                db.execute("""UPDATE recording_sessions SET title_step=CASE
+                    WHEN title_step='fallback_query' THEN 'done' ELSE 'opening_done' END
+                    WHERE title_step IN ('opening_wait','opening_query','fallback_query')""")
             self.store.sync_instances(self.pool.refresh(), self.clock(), preset=self.preset, clear_booting=True)
             self.reconcile()
         except BaseException:
@@ -320,7 +326,54 @@ class Scheduler:
             elif result.room.status != RoomStatus.LIVE:
                 self.store.defer_start(subject, self.clock(), "prelaunch_not_confirmed_live")
             else:
-                self._launch(job, target, result.room)
+                self._launch(job, target, result.room, meta["observed_at"])
+
+    def _session_titles(self):
+        now = self.clock()
+        for key, (step, future, deadline) in list(self._title_queries.items()):
+            if not future.done() and now < deadline:
+                continue
+            del self._title_queries[key]
+            room = None
+            if future.done():
+                try:
+                    result = future.result()
+                    room = result.room if not result.error and now < deadline else None
+                except Exception:
+                    logger.warning("本场标题查询失败", exc_info=True)
+            title = room.title.strip() if room and isinstance(room.title, str) else ""
+            with self.store.transaction() as db:
+                if title and room.status in (RoomStatus.LIVE, RoomStatus.ENDED):
+                    db.execute("""UPDATE recording_sessions SET title=?,title_observed_at=?,title_step='done'
+                        WHERE target_id=? AND session_key=? AND room_id=? AND anchor_uid=? AND title IS NULL
+                          AND title_step=? AND status IN ('recording','checking','only_record','review')
+                          AND EXISTS (SELECT 1 FROM targets WHERE id=? AND session_key=?)""",
+                               (title, now, *key, room.room_id, room.anchor_uid, step, *key))
+                db.execute("""UPDATE recording_sessions SET title_step=? WHERE target_id=? AND session_key=?
+                    AND title_step=?""", ("opening_done" if step == "opening_query" else "done", *key, step))
+
+        with self.store.transaction() as db:
+            db.execute("""UPDATE recording_sessions SET title_step='opening_done'
+                WHERE title_step='opening_wait' AND title_deadline<=?""", (now,))
+            db.execute("""UPDATE recording_sessions SET title_step='fallback_wait',title_deadline=?
+                WHERE status IN ('checking','only_record','review') AND title_step='opening_done'""", (now + 30,))
+            db.execute("""UPDATE recording_sessions SET title_step='done'
+                WHERE title_step='fallback_wait' AND title_deadline<=?""", (now,))
+        for row in self.store.rows("""SELECT target_id,session_key,web_rid,title_step,title_deadline FROM recording_sessions
+            WHERE title_step IN ('opening_wait','fallback_wait') ORDER BY title_step DESC,started_at LIMIT 20"""):
+            if not self.room_queries.available("title"):
+                break
+            key = row["target_id"], row["session_key"]
+            step = row["title_step"].replace("_wait", "_query")
+            with self.store.transaction() as db:
+                db.execute("UPDATE recording_sessions SET title_step=? WHERE target_id=? AND session_key=?", (step, *key))
+            future = self.room_queries.submit("title", row["web_rid"])
+            if future is not None:
+                self._title_queries[key] = step, future, row["title_deadline"]
+            else:
+                with self.store.transaction() as db:
+                    db.execute("UPDATE recording_sessions SET title_step=? WHERE target_id=? AND session_key=?",
+                               ("opening_done" if step == "opening_query" else "done", *key))
 
     def _login_result(self, meta, job_id, token, result):
         check = self._login_checks.get(job_id)
@@ -528,7 +581,7 @@ class Scheduler:
             if vmindex is not None:
                 self._boots[vmindex] = self._queries.submit(self.pool.boot_instance, vmindex, self._boot_stop)
 
-    def _launch(self, job: dict, target: dict, room: ResolvedRoom):
+    def _launch(self, job: dict, target: dict, room: ResolvedRoom, observed_at=None):
         if self._shutdown:
             return
         job_id = job["id"]
@@ -552,6 +605,9 @@ class Scheduler:
                                (room.room_id, str(journal), self.clock(), job_id))
             if not saved.rowcount:
                 return
+            db.execute("INSERT INTO recording_admissions VALUES(?,?,?,?,?,?)",
+                       (job_id, room.room_id, room.anchor_uid, room.nickname, room.web_rid,
+                        self.clock() if observed_at is None else observed_at))
         handle = self.handle_factory(spec=spec, on_event=lambda event, key=job_id: self._events.put_nowait((key, event)))
         self._handles[job_id] = handle
         try:
@@ -671,6 +727,7 @@ class Scheduler:
         self._reconcile_targets()
         self._dispatch()
         self._collect()
+        self._session_titles()
 
     def close(self, timeout_sec: float = 70.0, *, preserve_ledger=False):
         """即使存储故障也先收尾本主控的子进程，不碰其他任务。"""

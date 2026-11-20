@@ -25,7 +25,7 @@ class SegmentValidationResult:
 
 def verify_segment_file(file_path: Path, min_size_bytes: int = 0,
                         ffprobe_exe: Path | None = None, timeout: float = 8.0,
-                        allow_short_tail: bool = False) -> SegmentValidationResult:
+                        allow_short_tail: bool = False, *, require_mp4: bool = False) -> SegmentValidationResult:
     """元数据完整性不是逐帧解码保证；min_size_bytes 不再作为拒绝有效媒体的门槛。"""
     result = SegmentValidationResult(False, False, False, is_short_tail=allow_short_tail)
     try:
@@ -42,7 +42,10 @@ def verify_segment_file(file_path: Path, min_size_bytes: int = 0,
     except (OSError, RuntimeError) as exc:
         result.reject_reason = f"固定媒体工具不可用：{exc}"
         return result
-    cmd = [str(probe), "-v", "error", "-show_entries",
+    cmd = [str(probe), "-v", "error"]
+    if require_mp4:
+        cmd += ["-f", "mp4"]
+    cmd += ["-show_entries",
            "stream=codec_type,codec_name,duration,nb_frames:format=duration,size",
            "-of", "json", str(file_path)]
     try:

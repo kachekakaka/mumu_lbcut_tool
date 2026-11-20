@@ -13,7 +13,7 @@ from src.mvp.room_resolver import ResolvedRoom, RoomResolver, RoomStatus
 from src.mvp.windows_job import WindowsJob, close_process_handle
 
 MAX_MESSAGE = 65536
-CAPACITY = {"scan": 5, "verify": 1, "manual": 2, "login": 1}
+CAPACITY = {"scan": 5, "verify": 1, "manual": 2, "login": 1, "title": 2}
 
 
 @dataclass

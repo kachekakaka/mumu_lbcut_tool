@@ -11,6 +11,7 @@ import uuid
 
 from src.mvp.room_resolver import ResolvedRoom
 from src.worker.room_locator import valid_identity_id
+from . import session_ledger
 
 
 logger = logging.getLogger(__name__)
@@ -30,7 +31,7 @@ ACTIVE = ("pending", "starting", "running", "stopping", "needs_reconcile")
 NEEDS_FIX = "needs_fix: "          # 目标无效，直到显式 record 查询确认 LIVE 后解除
 RETRY_BASE_SEC, RETRY_MAX_SEC = 5, 300
 BOOT_RETRY_BASE_SEC, BOOT_RETRY_MAX_SEC = 30, 300
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 # 这些停止原因已由目标状态决定后续（移除、确认下播、换场、主控正常退出），无需退避。
 SETTLED_STOPS = ("target_removed", "anchor_offline", "live_session_changed", "scheduler_shutdown")
 SCHEMA = """
@@ -169,7 +170,7 @@ class Store:
             raise ValueError("数据库不是当前调度器格式；拒绝覆盖或自动迁移，请使用新的独立数据目录")
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
-        self.db.executescript(SCHEMA)
+        self.db.executescript(SCHEMA + session_ledger.SCHEMA)
         self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
     @contextmanager
@@ -223,6 +224,37 @@ class Store:
                                   (job_id, index)).fetchone()
             if not row or row["status"] != "finished":
                 raise ControlError("segment_unfinished", "切片已不能用于安排或发送")
+            yield
+
+    def save_posting_settings(self, target_id, enabled, binding=None):
+        with self.transaction() as db:
+            if not db.execute("SELECT 1 FROM targets WHERE id=? AND enabled=1", (target_id,)).fetchone():
+                raise ControlError("target_not_found", "找不到启用的主播", 404)
+            db.execute("""INSERT INTO posting_settings VALUES(?,?,?)
+                ON CONFLICT(target_id) DO UPDATE SET enabled=excluded.enabled,
+                binding=COALESCE(excluded.binding,posting_settings.binding)""",
+                       (target_id, int(enabled), json.dumps(binding) if binding else None))
+            if not enabled:
+                db.execute("""UPDATE recording_sessions SET stopped=1,
+                    status=CASE WHEN submit_started=0 AND status!='recording' THEN 'only_record' ELSE status END
+                    WHERE target_id=? AND status IN ('recording','checking','pending','review')""", (target_id,))
+
+    @contextmanager
+    def session_send_guard(self, session_key, evidence, *, submitting=False):
+        with self._lock:
+            with self.transaction() as db:
+                session = db.execute("SELECT * FROM recording_sessions WHERE target_id=? AND session_key=?",
+                                     session_key).fetchone()
+                if not session or session['status'] != 'pending' or session['stopped']:
+                    raise ControlError("posting_stopped", "本场自动投稿已停止")
+                clips, problem = session_ledger.gather_evidence(db, session)
+                active = db.execute("""SELECT 1 FROM jobs WHERE target_id=? AND session_key=?
+                    AND status IN ('pending','starting','running','stopping','needs_reconcile')""", session_key).fetchone()
+                if active or problem or clips != evidence:
+                    raise ControlError("segment_changed", problem or "本场切片台账发生变化")
+                if submitting:
+                    db.execute("""UPDATE recording_sessions SET submit_started=1
+                        WHERE target_id=? AND session_key=?""", session_key)
             yield
 
     def add_target(self, raw: str, auto_record=True, allow_unconfirmed=False, now=None) -> str:
@@ -283,8 +315,14 @@ class Store:
                 room_id = room.room_id if valid_identity_id(room.room_id) else None
                 uid = getattr(room, 'anchor_uid', None)
                 uid = uid if valid_identity_id(uid) else None
-                session = ('room:' + room_id) if room_id else (t['session_key'] if t['trusted_status'] == 'live' else None)
-                new_session = bool(room_id) and (t['trusted_status'] != 'live' or session != t['session_key'])
+                # 同一房间持续在播沿用场次。已结束后即使复用房间 ID，也建立新场次。
+                previous_room = (t['session_key'] or '').split(':')[1:2]
+                new_session = bool(room_id) and (t['trusted_status'] != 'live' or previous_room != [room_id])
+                session = t['session_key'] if t['trusted_status'] == 'live' else None
+                if new_session:
+                    session = 'room:' + room_id
+                    if db.execute("SELECT 1 FROM jobs WHERE target_id=? AND session_key=?", (target_id, session)).fetchone():
+                        session += ':' + uuid.uuid4().hex
                 db.execute("""UPDATE targets SET trusted_status='live',confirmed_at=?,room_id=?,anchor_uid=?,nickname=?,
                     session_key=?,ended_count=0,ended_since=0 WHERE id=?""",
                     (now, room_id, uid, room.nickname, session, target_id))
@@ -297,6 +335,7 @@ class Store:
                 if count >= ended_confirmations and now - since >= ended_interval_sec:
                     db.execute("""UPDATE targets SET trusted_status='ended',confirmed_at=?,suppressed_session=NULL,
                         record_session_key=NULL,attempts=0,retry_at=0,control_revision=control_revision+1 WHERE id=?""", (now, target_id))
+                    session_ledger.close_session(db, target_id, t["session_key"], "anchor_offline")
 
     def _instance_busy_or_reconcile(self, db, row, *, allow_booting: bool = False) -> bool:
         if row["job_id"] or row["status"] == "reconcile":
@@ -485,11 +524,15 @@ class Store:
                     AND (suppressed_session IS NOT session_key OR record_session_key IS NOT NULL)""",
                            (job["session_key"], time.time(), job["target_id"], job["session_key"]))
             if job["status"] == "needs_reconcile":
+                if reason == "manual_stop":
+                    session_ledger.close_session(db, job["target_id"], job["session_key"], reason)
                 return
             if job["status"] == "pending":
                 db.execute("UPDATE jobs SET status='cancelled',stop_reason=?,ended_at=? WHERE id=?", (reason, time.time(), job_id))
             else:
                 db.execute("UPDATE jobs SET status='stopping',stop_reason=COALESCE(stop_reason,?) WHERE id=?", (reason, job_id))
+            if reason == "manual_stop":
+                session_ledger.close_session(db, job["target_id"], job["session_key"], reason)
 
     def record_event(self, job_id: str, event: dict, now: float, *, replay=False):
         validate_worker_event(job_id, event)
@@ -520,7 +563,8 @@ class Store:
                 db.execute("INSERT OR IGNORE INTO segments(job_id,segment_index,created_at,updated_at) VALUES(?,?,?,?)", (job_id, idx, stamp, stamp))
                 db.execute("UPDATE segments SET updated_at=MAX(updated_at,?) WHERE job_id=? AND segment_index=?", (stamp, job_id, idx))
                 if kind == "segment_started":
-                    db.execute("UPDATE segments SET started=1,raw_path=?,started_at=? WHERE job_id=? AND segment_index=?", (event.get("file_path"), stamp, job_id, idx))
+                    db.execute("UPDATE segments SET started=1,raw_path=?,started_at=? WHERE job_id=? AND segment_index=? AND started=0", (event.get("file_path"), stamp, job_id, idx))
+                    session_ledger.first_segment(db, job_id, stamp, now, replay)
                     # Popen 成功不等于开始录制；首片开始后才将任务标为 running，并把失败计数清零。
                     if not replay and db.execute("UPDATE jobs SET status='running' WHERE id=? AND status='starting'", (job_id,)).rowcount:
                         db.execute("UPDATE targets SET attempts=0 WHERE id=(SELECT target_id FROM jobs WHERE id=?)", (job_id,))
@@ -676,6 +720,9 @@ class Store:
             elif not cancelled and stop not in SETTLED_STOPS:
                 attempts = db.execute("SELECT attempts FROM targets WHERE id=?", (job["target_id"],)).fetchone()[0]
                 db.execute("UPDATE targets SET retry_at=?,attempts=MAX(1,attempts),updated_at=? WHERE id=? AND session_key=?", (now + retry_delay(attempts), now, job["target_id"], job["session_key"]))
+            duration_stop = code == 0 and requested_total_duration(job["command_json"]) > 0
+            session_ledger.close_session(db, job["target_id"], job["session_key"],
+                                         "manual_stop" if stop == "manual_stop" or duration_stop else None)
 
     def mark_waiting_exit(self, job_id, now, *, deadline=None, reason="waiting_old_worker_exit", quarantine=False):
         with self.transaction() as db:
@@ -821,6 +868,7 @@ class Store:
             for job in jobs:
                 if job["status"] != "needs_reconcile":
                     self.request_stop(job["id"], "manual_stop")
+            session_ledger.close_session(db, subject, session, "manual_stop")
             return dict(target_id=subject, session_key=session, outcome="already_stopped" if already else "stop_requested" if affected else "intent_cancelled", affected_job_ids=affected, reconcile_job_ids=reconcile)
         if kind == "reconcile":
             jobs = self.rows("SELECT id FROM jobs WHERE status='needs_reconcile'" + (" AND id=?" if subject else ""), (subject,) if subject else ())

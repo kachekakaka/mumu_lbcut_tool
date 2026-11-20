@@ -40,7 +40,9 @@ def test_process_reuse_capacity_isolation_and_shared_shutdown():
         # 扫描、启动和手动槽位全满时，登录复核仍能独立派发。
         futures += [queries.submit('login', 'block_response')]
         assert queries.submit('login', 'ok') is None
-        wait_for(lambda: len([s for s in queries.slots if s.proc]) == 9)
+        futures += [queries.submit('title', 'block_response') for _ in range(2)]
+        assert queries.submit('title', 'ok') is None
+        wait_for(lambda: all(s.proc for s in queries.slots))
         pids = [s.proc.pid for s in queries.slots]
         started = time.monotonic()
         queries.close()

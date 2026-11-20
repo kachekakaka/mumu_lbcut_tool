@@ -51,6 +51,7 @@ def install_segment_uploads(router, config, runtime, core):
         ArrangementStore(config.data_dir / "upload-core" / "segment-uploads.sqlite3"),
         PostingCore(core), segment, config.output_dir, writable=lambda: runtime.state == "running",
         guard=lambda job, index: runtime.store.segment_send_guard(job, index),
+        session_guard=lambda *args, **kwargs: runtime.store.session_send_guard(*args, **kwargs),
     )
 
     @router.get(BASE)

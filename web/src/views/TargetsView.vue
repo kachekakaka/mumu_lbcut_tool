@@ -11,6 +11,8 @@ import { canControl, connection, refreshNow, usePageLoader } from '../poller'
 import { ops } from '../operations'
 import { useMobile } from '../mobile'
 import AddTargetsDialog from '../components/AddTargetsDialog.vue'
+import SessionPostingDialog from '../components/SessionPostingDialog.vue'
+import { onLocalConsole } from '../api/segmentUploads'
 
 const route = useRoute()
 const mobile = useMobile()
@@ -24,6 +26,8 @@ const filters = reactive({
 const focus = computed(() => String(route.query.focus ?? ''))
 const items = ref<Target[]>([])
 const addOpen = ref(false)
+const postingOpen = ref(false)
+const postingTarget = ref<Target>()
 const callbackOwner = Symbol('targets')
 onUnmounted(() => ops.detachOwner(callbackOwner))
 const { page, size, total, query, fit } = usePager()
@@ -94,6 +98,11 @@ async function stopSession(t: Target) {
   ops.start('stop_target', t.id, `停止本场：${name(t)}`, (key) => api.stopTarget(t.id, session, key))
 }
 
+function openPosting(t: Target) {
+  postingTarget.value = t
+  postingOpen.value = true
+}
+
 async function remove(t: Target) {
   try {
     await ElMessageBox.confirm(
@@ -161,7 +170,7 @@ async function remove(t: Target) {
           <span v-if="!notices(row).length">—</span>
         </template>
       </el-table-column>
-      <el-table-column label="操作" min-width="220" :fixed="mobile ? false : 'right'">
+      <el-table-column label="操作" :min-width="onLocalConsole() ? 290 : 220" :fixed="mobile ? false : 'right'">
         <template #default="{ row }">
           <el-tooltip content="后端会重新确认开播；已抑制或需要修正的主播同样可用" placement="top">
             <el-button size="small" :disabled="!canControl" :loading="ops.busy(row.id, 'record')" @click="record(row)">立即开录</el-button>
@@ -175,6 +184,7 @@ async function remove(t: Target) {
           >
             停止本场
           </el-button>
+          <el-button v-if="onLocalConsole()" size="small" @click="openPosting(row)">自动投稿</el-button>
           <el-button size="small" type="danger" :disabled="!canControl" :loading="ops.busy(row.id, 'remove')" @click="remove(row)">删除</el-button>
         </template>
       </el-table-column>
@@ -182,5 +192,6 @@ async function remove(t: Target) {
     <el-pagination v-model:current-page="page" v-model:page-size="size" :total="total" :page-sizes="PAGE_SIZES" layout="total, sizes, prev, pager, next" small />
     <p class="muted">“停止本场”在本场录制意图有效时可用（包括失败重试中、等待对账），确认后固定停止点击时看到的场次。</p>
     <AddTargetsDialog v-model="addOpen" />
+    <SessionPostingDialog v-if="postingTarget" v-model="postingOpen" :target-id="postingTarget.id" :nickname="name(postingTarget)" />
   </div>
 </template>

@@ -28,6 +28,7 @@ python -m pytest tests -q -p no:cacheprovider --basetemp "$TestRoot/work" --juni
 | --- | --- |
 | `test_bilibili_bridge.py`、`test_bilibili_host.py`、`web/tests/bilibili.test.ts` | 合成 Core 回包、SQLite 占用与恢复、本机访问限制、并发续领；Windows 专属 venv 验证双主控启动同一无窗口子进程。真实手机扫码单独验收。 |
 | `test_segment_uploads.py` | 独立 SQLite、切换部署、并发确认、步骤和代次失效、提交后移走录像并查完分页、拒绝后的修订和旧弹窗失效。真实 ASGI 路由覆盖争议片隔离、登记与提交间的冲突、领取取消和等锁时的响应。Core 回包由测试控制。 |
+| `test_session_deliveries.py`、`web/tests/session_posting.test.ts` | 开录标题冻结、收尾补查、房间复用、重放、多任务有序合单、媒体校验、关闭开关、丢回包、重启和手动入口并发。Core 回包受控，前端测试使用组件环境。 |
 | `test_script_worker_process.py` | 真 Windows 子进程、合成媒体和实际 Ctrl+Break；脚本正常停止/最终片判定及忽略信号后的有界强制回收，不操作设备 |
 | `test_script_safety.py` | 脚本导入/帮助/预览无设备副作用，独立输出、离线解析、严格实例映射、有界客户端、取消及验收反例；设备/网络为替身，专属睡眠进程测试超时不涉及 MuMu；不能替代实机验收 |
 | `test_ui_dump_runtime.py`、`test_room_locator.py`、`test_navigation_budget.py` | 32 位 UI 导出命令、路径注入拒绝、精确 serial 和指标归类；非零/缺入口/超时不误读或点击，唯一文件及预算约束；设备为替身 |

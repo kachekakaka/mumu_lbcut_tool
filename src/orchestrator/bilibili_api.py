@@ -368,6 +368,10 @@ def install_accounts(app, config, runtime=None):
 
     if runtime is not None:
         from .segment_upload_api import install_segment_uploads
+        from .session_deliveries import SessionDeliveries
+        from .session_upload_api import install_session_uploads
 
         uploads = install_segment_uploads(router, config, runtime, core)
+        install_session_uploads(router, runtime, uploads)
+        app.state.session_deliveries = SessionDeliveries(runtime, uploads)
     app.include_router(router)

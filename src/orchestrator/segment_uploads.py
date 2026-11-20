@@ -64,16 +64,23 @@ def form_errors(values, modes, limits, filename):
 
 
 def freeze_requests(frozen, work_id):
-    params, path = frozen["parameters"], Path(frozen["file"]["path"])
+    params = frozen["parameters"]
+    path = Path(frozen["file"]["path"])
+    directory = Path(frozen["directory"]) if "clips" in frozen else path.parent
+    videos = ([{"id": f"p{position}", "path": Path(clip["file"]["path"]).relative_to(directory).as_posix()}
+               for position, clip in enumerate(frozen["clips"], 1)] if "clips" in frozen else
+              [{"id": "video", "path": path.name}])
     registration = {
-        "directory": str(path.parent),
+        "directory": str(directory),
         "manifest": {
             "version": 1,
             "work": {"id": work_id, "ready": True,
                      **{k: params[k] for k in ("title", "description", "tags")}},
-            "assets": {"videos": [{"id": "video", "path": path.name}]},
+            "assets": {"videos": videos},
             "upload_units": [{
-                "id": "segment", "mode": "independent", "videos": ["video"],
+                "id": "session" if "clips" in frozen else "segment",
+                "mode": "multipart" if len(videos) > 1 else "independent",
+                "videos": [video["id"] for video in videos],
                 "targets": [{
                     "platform": "bilibili", "account": frozen["account"]["id"], "enabled": True,
                     "options": {k: params[k] for k in ("category_id", "copyright", "source", "publish_mode")},
@@ -89,22 +96,23 @@ def freeze_requests(frozen, work_id):
 
 def matches(row, snapshot):
     frozen = json.loads(row["frozen"])
-    file = Path(frozen["file"]["path"])
-    manifest = frozen["registration"]["manifest"]
+    registration = frozen["registration"]
+    manifest = registration["manifest"]
     unit = manifest["upload_units"][0]
-    video = unit["videos"][0]
+    item = "group" if unit["mode"] == "multipart" else unit["videos"][0]
     return (
-        snapshot.get("unit_id") == unit["id"] and snapshot.get("item_key") == video
+        snapshot.get("unit_id") == unit["id"] and snapshot.get("item_key") == item
         and snapshot.get("mode") == unit["mode"]
         and snapshot["target"]["account_id"] == row["account_id"]
         and snapshot["target"]["platform"] == "bilibili"
         and snapshot["target"].get("expected_mid") == frozen["account"]["remote_user_id"]
-        and [p["video_id"] for p in snapshot["parts"]] == [video]
+        and [p["video_id"] for p in snapshot["parts"]] == unit["videos"]
         and snapshot["assets"] == [
-            {"asset_id": video, "role": "video", "video_id": video, "relative_path": file.name}
+            {"asset_id": video["id"], "role": "video", "video_id": video["id"], "relative_path": video["path"]}
+            for video in manifest["assets"]["videos"]
         ]
         and isinstance(dir_value := snapshot.get("directory"), str)
-        and os.path.normcase(dir_value) == os.path.normcase(str(file.parent))
+        and os.path.normcase(dir_value) == os.path.normcase(registration["directory"])
         and "b18_run_id" not in snapshot
     )
 
@@ -137,12 +145,13 @@ def observation(task, worker):
 
 
 class SegmentUploads:
-    def __init__(self, store, core, segment, output_dir, *, writable=lambda: True, guard=None):
+    def __init__(self, store, core, segment, output_dir, *, writable=lambda: True, guard=None, session_guard=None):
         self.store, self.core, self.segment, self.output_dir = store, core, segment, output_dir
         self.writable = writable
         self.dialogs = {}
         self.poll_limit = asyncio.Semaphore(4)
         self.guard = guard
+        self.session_guard = session_guard
         self.claim_cleanups = set()
 
     @contextmanager
@@ -193,8 +202,10 @@ class SegmentUploads:
             "id", "job_id", "segment_index", "stage", "revision", "task_id", "observed_at", "problem",
         )} | {
             "status": state.get("status"), "worker_online": state.get("worker_online"),
+            "automatic": row["auto_target"] is not None,
             "rejected": bool(row["rejected"]), "can_revise": bool(revisable(row, self.store.clock())),
-            "can_continue": row["stage"] != "task" and not row["rejected"] and row["lease_until"] <= self.store.clock(),
+            "can_continue": not row["auto_target"] and row["stage"] != "task" and not row["rejected"]
+                            and row["lease_until"] <= self.store.clock(),
         }
         if detail:
             frozen = json.loads(row["frozen"])
@@ -202,6 +213,8 @@ class SegmentUploads:
                          deployment=row["deployment"], work_id=row["work_id"],
                          account=frozen["account"], parameters=frozen["parameters"],
                          filename=Path(frozen["file"]["path"]).name)
+            if row["auto_target"]:
+                value["parts"] = [video["path"] for video in frozen["registration"]["manifest"]["assets"]["videos"]]
         return value
 
     def require_writable(self):
@@ -225,7 +238,7 @@ class SegmentUploads:
                 raise BridgeError("revision_forbidden", "原请求结果仍待确认，暂不能修订")
             accounts = [a for a in accounts if a.id == row["account_id"]]
         else:
-            accounts = [a for a in accounts if a.id not in rows]
+            accounts = [a for a in accounts if a.id not in rows and not any(r["auto_target"] for r in present)]
         now = time.monotonic()
         self.dialogs = {key: ctx for key, ctx in self.dialogs.items() if ctx["expires"] > now}
         if len(self.dialogs) >= 256:
@@ -303,7 +316,7 @@ class SegmentUploads:
                     found.add(task_id)
                 else:
                     snapshot = task["snapshot"]
-                    if (
+                    if row["auto_target"] or (
                         task["account_id"] == row["account_id"]
                         and snapshot.get("unit_id") == unit["id"]
                         and snapshot.get("item_key") == unit["videos"][0]
@@ -323,11 +336,45 @@ class SegmentUploads:
 
     async def link(self, row, task_id):
         return await asyncio.to_thread(self.store.finish, row, stage="task", task_id=task_id, attempts=0,
-                                       lease_until=0, problem=None, next_check=0)
+                                       lease_until=0, problem=None, problem_detail=None, next_check=0)
 
-    async def drive(self, record_id, revision, binding=None):
+    def check_frozen_files(self, row, frozen):
+        if row["auto_target"]:
+            if str(self.output_dir.resolve()) != frozen["registration"]["directory"]:
+                raise BridgeError("segment_changed", "录像输出目录已变更")
+            for clip in frozen["clips"]:
+                try:
+                    current = file_snapshot(clip["file"]["path"], self.output_dir)
+                except BridgeError:
+                    current = None
+                if current != clip["file"]:
+                    raise BridgeError("segment_changed", f"任务 {clip['job_id']} 第 {clip['segment_index']} 片已变化或不可读")
+        else:
+            _, current = self.current_segment(row["job_id"], row["segment_index"])
+            if current != {k: frozen[k] for k in ("file", "quality_flags")}:
+                raise BridgeError("segment_changed", "录像或质量提示已变化，请核对原安排")
+
+    @contextmanager
+    def request_guard(self, row, frozen):
+        if not row["auto_target"]:
+            with self.send_guard(row["job_id"], row["segment_index"]):
+                yield
+            return
         self.require_writable()
-        while row := await self.claim(record_id, dispatch=True, revision=revision, force=True):
+        try:
+            key = row["auto_target"], row["auto_session"]
+            with self.session_guard(key, frozen["evidence"], submitting=row["stage"] == "submit"):
+                self.require_writable()
+                yield
+        except ControlError as exc:
+            raise BridgeError(exc.code, str(exc), exc.status) from None
+
+    async def drive(self, record_id, revision, binding=None, *, automatic=False, lookup_only=False):
+        self.require_writable()
+        saved = await asyncio.to_thread(self.store.get, record_id)
+        if saved["auto_target"] and not automatic:
+            raise BridgeError("automatic_arrangement", "整场安排由后台继续，请在主播页查看")
+        while row := await self.claim(record_id, dispatch=not lookup_only, revision=revision, force=True):
             if row["stage"] == "task":
                 await self.refresh_claim(row, binding)
                 break
@@ -340,21 +387,24 @@ class SegmentUploads:
                             if await self.link(row, task_id):
                                 continue
                             break
+                    if lookup_only:
+                        await asyncio.to_thread(self.store.finish, row, problem="submission_not_found", problem_detail=None,
+                                                next_check=self.store.clock() + 15)
+                        break
                     frozen = json.loads(row["frozen"])
-                    _, current = await asyncio.to_thread(self.current_segment, row["job_id"], row["segment_index"])
-                    if current != {k: frozen[k] for k in ("file", "quality_flags")}:
-                        raise BridgeError("segment_changed", "录像或质量提示已变化，请核对原安排")
                     modes, limits = await self.core.capabilities(original)
-                    if problem := form_errors(
-                        frozen["parameters"], modes, limits, Path(frozen["file"]["path"]).name,
-                    ):
-                        raise BridgeError("invalid_submission", problem, 422)
+                    files = [clip["file"] for clip in frozen["clips"]] if row["auto_target"] else [frozen["file"]]
+                    if row["auto_target"] and len(files) > limits["part_count"]:
+                        raise BridgeError("too_many_parts", "整场切片数量超过原部署的分 P 上限", 422)
+                    for file in files:
+                        if problem := form_errors(frozen["parameters"], modes, limits, Path(file["path"]).name):
+                            raise BridgeError("invalid_submission", problem, 422)
                     accounts = await self.core.accounts(original)
                     if not any(a.id == row["account_id"] and a.remote_user_id == frozen["account"]["remote_user_id"] for a in accounts):
                         raise BridgeError("invalid_account", "原账号目前不可用，请核对原部署")
-                    self.require_writable()
+                    await asyncio.to_thread(self.check_frozen_files, row, frozen)
                     sent = await asyncio.to_thread(self.store.mark_sent, row,
-                        guard=lambda: self.send_guard(row["job_id"], row["segment_index"]))
+                        guard=lambda: self.request_guard(row, frozen))
                     if not sent:
                         break
                     if row["stage"] == "register":
@@ -362,7 +412,7 @@ class SegmentUploads:
                         if result["work_id"] != row["work_id"]:
                             raise protocol()
                         if await asyncio.to_thread(self.store.finish, row, stage="submit", attempts=0,
-                                                   lease_until=0, problem=None):
+                                                   lease_until=0, problem=None, problem_detail=None):
                             continue
                     else:
                         result = await self.core.submit(original, row["work_id"], frozen["submission"], row["submit_key"])
@@ -373,13 +423,16 @@ class SegmentUploads:
                             raise protocol()
                         if await self.link(row, identifier(task["task_id"])):
                             continue
-            except (BridgeError, TimeoutError, KeyError, TypeError, AttributeError) as exc:
+            except (BridgeError, TimeoutError, KeyError, TypeError, AttributeError, ValueError) as exc:
                 code = exc.code if isinstance(exc, BridgeError) else "core_timeout" if isinstance(exc, TimeoutError) else "protocol"
                 rejected = (
                     sent and row["attempts"] == 0 and isinstance(exc, BridgeError)
                     and exc.status in (400, 409, 422) and code in DEFINITE_REJECTIONS
                 )
-                await asyncio.to_thread(self.store.finish, row, problem=code, rejected=int(rejected),
+                message = exc.message if isinstance(exc, BridgeError) and code in (
+                    "segment_changed", "invalid_submission", "too_many_parts", "posting_unavailable", "invalid_account",
+                ) else None
+                await asyncio.to_thread(self.store.finish, row, problem=code, problem_detail=message, rejected=int(rejected),
                                         next_check=self.store.clock() + 5)
             finally:
                 await asyncio.to_thread(self.store.release, row)
@@ -431,13 +484,15 @@ class SegmentUploads:
     async def summaries(self, segments):
         rows = await asyncio.to_thread(self.store.for_segments, segments)
         now = self.store.clock()
-        due = [row for row in rows if row["lease_until"] <= now and row["next_check"] <= now
-               and not row["rejected"] and (row["stage"] == "task" or row["stage"] == "submit" and row["attempts"])]
+        due = {row["id"]: row for row in rows if row["lease_until"] <= now and row["next_check"] <= now
+               and not row["rejected"] and (row["stage"] == "task" or row["stage"] == "submit" and row["attempts"])}
 
         async def poll(row):
             async with self.poll_limit:
                 return await self.refresh(row["id"])
 
-        updated = await asyncio.gather(*(poll(row) for row in sorted(due, key=lambda r: r["next_check"])[:4]))
+        updated = await asyncio.gather(*(poll(row) for row in sorted(due.values(), key=lambda r: r["next_check"])[:4]))
         by_id = {r["id"]: r for r in updated}
-        return [self.public(by_id.get(r["id"], r)) for r in rows]
+        return [self.public(by_id.get(r["id"], r)) | {
+            "job_id": r["member_job_id"], "segment_index": r["member_index"],
+        } for r in rows]

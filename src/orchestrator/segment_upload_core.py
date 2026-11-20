@@ -31,18 +31,23 @@ def posting_capabilities(config):
             engine = json.load(stream)
         if engine.get("b18_allowlist_file") is not None:
             raise BridgeError("b18_deployment", "该部署使用 B18 专用名额，不能安排普通投稿")
+        allow_self_only = engine.get("allow_self_only", False)
         with Path(config["engine"]["capabilities_file"]).open(encoding="utf-8") as stream:
             caps = json.loads(stream.read(65537))
+        verified_modes = caps.get("verified_publish_modes")
         if (
             type(caps.get("protocol_version")) is not int
             or caps["protocol_version"] != 1
             or caps["engine_build_id"] != config["engine"]["build_id"]
             or caps["submit_api"] != "web"
             or caps.get("upload_ready") is not True
-            or not isinstance(caps.get("verified_publish_modes"), list)
+            or not isinstance(verified_modes, list)
+            or type(allow_self_only) is not bool
         ):
             raise ValueError
-        modes = [m for m in ("public", "self_only") if m in caps["verified_publish_modes"]]
+        modes = ["public"] if "public" in verified_modes else []
+        if caps.get("supports_self_only") is True and (allow_self_only or "self_only" in verified_modes):
+            modes.append("self_only")
         names = ("title", "part_title", "description", "tag", "tag_count", "part_count")
         limits = {name: caps["metadata_limits"][name] for name in names}
         if not modes or not all(type(n) is int and n > 0 for n in limits.values()):
