@@ -13,14 +13,6 @@ from src.mvp.dep_manager import MediaTools
 
 
 
-def test_no_blind_background_tap_in_identity_cleanup():
-    import inspect
-    source=inspect.getsource(WorkerNavigator._observe_live_room)
-    assert "int(frame.shape[0]*.2)" not in source
-    assert "int(h*.25)" not in source
-    assert "'input','tap'" not in source.split('finally:')[1]
-
-
 def test_overlay_back_rechecks_and_does_not_leave_clean_live(monkeypatch):
     nav=WorkerNavigator.__new__(WorkerNavigator)
     commands=[]
@@ -43,12 +35,72 @@ def test_partial_manifest_is_not_closed(tmp_path):
     assert result[1].end_pts==6
 
 
-def test_no_window_and_no_control_are_used_for_continuous_capture():
-    import inspect
-    source=inspect.getsource(ContinuousPipeline.start)
-    assert '--no-control' in source and '--record-format=mkv' in source
-    assert "'-c','copy'" in source
-    assert '-r' not in [p.strip("'\"") for p in source.split(',')]
+def test_production_capture_command_preserves_encoded_media(monkeypatch, tmp_path):
+    import io
+    from types import SimpleNamespace
+    import src.worker.continuous_pipeline as module
+
+    commands = []
+    class Pipe:
+        name = 'synthetic-pipe'
+        error = None
+        def __init__(self, job):
+            pass
+        def start(self, sink, tap):
+            pass
+    def spawn(command, **kwargs):
+        commands.append(command)
+        return SimpleNamespace(stdin=io.BytesIO(), stdout=io.BytesIO(), poll=lambda: None)
+
+    monkeypatch.setattr(module, 'NamedPipeBridge', Pipe)
+    monkeypatch.setattr(module, 'StreamMonitor', Mock())
+    monkeypatch.setattr(module, 'PipelineLogDrainer', Mock())
+    monkeypatch.setattr(module.subprocess, 'Popen', spawn)
+    pipeline = ContinuousPipeline('synthetic', tmp_path, 'scrcpy.exe', 'adb.exe', 2, 'ffmpeg.exe')
+    def first_media():
+        (pipeline.directory / 'part_000001.mp4').write_bytes(b'first'*240)
+        return True
+    pipeline.wait_hook = first_media
+    try:
+        pipeline.start()
+        muxer, capture = commands
+        def verify_commands(mux, recorder):
+            assert {'--record-format=mkv', '--no-window', '--no-control'} <= set(recorder)
+            assert mux[mux.index('-c') + 1] == 'copy' and '-r' not in mux
+        verify_commands(muxer, capture)
+        for flag in ('--record-format=mkv', '--no-window', '--no-control'):
+            with pytest.raises(AssertionError):
+                verify_commands(muxer, [arg for arg in capture if arg != flag])
+        with pytest.raises(AssertionError):
+            verify_commands([*muxer, '-r', '25'], capture)
+    finally:
+        pipeline._progress_thread.join(2)
+        pipeline._mux_log.close()
+
+
+def test_fragment_cursor_handles_half_line_rotation_and_replacement(tmp_path):
+    p = ContinuousPipeline('synthetic', tmp_path, 'scrcpy.exe', 'adb.exe', 2, 'ffmpeg.exe')
+    p.directory.mkdir()
+    first = p.directory / 'part_000001.mp4'
+    first.touch()
+    assert p.fragment_updates() == [Fragment(1, first, False)]
+    manifest = p.directory / 'segments.csv'
+    manifest.write_bytes(b'part_000001.mp4,0,')
+    assert p.fragment_updates() == []
+    with manifest.open('ab') as stream:
+        stream.write(b'2\n')
+    second = p.directory / 'part_000002.mp4'
+    second.touch()
+    assert p.fragment_updates() == [Fragment(1, first, True, 0, 2), Fragment(2, second, False)]
+    p.progress['out_time_us'] = '2600000'
+    assert p.get_current_segment_elapsed() == pytest.approx(.6)
+    assert p.fragment_updates() == []
+    replacement = p.directory / 'rewritten.csv'
+    replacement.write_bytes(b'part_000001.mp4,0,1\npart_000002.mp4,1,0.5\n')
+    replacement.replace(manifest)
+    assert [f.index for f in p.fragment_updates()] == [1, 2]
+    assert p.timeline_invalid
+    assert p.get_current_segment_elapsed() == pytest.approx(1.6)
 
 
 def test_capture_error_after_total_duration_cutoff_is_tagged_expected(tmp_path,caplog):
@@ -128,6 +180,106 @@ def test_runtime_overlay_recovery_keeps_same_capture_process(tmp_path):
         assert {e.segment_index for e in emitted if e.event=='segment_quality_warning'}=={1,2}
     finally:
         s.probes.shutdown(wait=True);s.pool.shutdown(wait=True)
+
+
+@pytest.mark.parametrize('history', [32, 128, 512, 1024])
+def test_recording_iteration_avoids_history_when_media_is_unchanged(monkeypatch, tmp_path, history):
+    import io
+    import statistics
+    from types import SimpleNamespace
+    from src.worker.continuous_session import ContinuousSession
+    from src.worker.controller import WorkerConfig, WorkerController
+    from src.worker.events import WorkerEventEmitter
+
+    stream = io.StringIO()
+    controller = WorkerController(WorkerConfig(vmindex=77, target='123', output_dir=tmp_path,
+        target_kind='room_id', expected_anchor_uid='456',
+        heartbeat_interval_sec=.05), WorkerEventEmitter(stream))
+    controller.target_room_id = '123'
+    pipeline = ContinuousPipeline('fixture', tmp_path, 'scrcpy.exe', 'adb.exe', 2, 'ffmpeg.exe')
+    pipeline.directory.mkdir()
+    manifest = pipeline.directory / 'segments.csv'
+    manifest.write_text(''.join(f'part_{idx:06d}.mp4,{idx-1},{idx}\n'
+                                for idx in range(1, history+1)), encoding='utf-8')
+    (pipeline.directory / f'part_{history+1:06d}.mp4').touch()
+    pipeline.progress['out_time_us'] = str(history * 1_000_000 + 500_000)
+    seeded = pipeline.fragment_updates()
+    pipeline.monitor = SimpleNamespace(drain_events=lambda: [], fps=lambda sec: 15, unavailable=False,
+                                       clock=lambda: 1.0)
+    monkeypatch.setattr(pipeline, 'is_recording', lambda: True)
+
+    cfg_time = [100.0]
+    durations = []
+    sync_durations = []
+    last = time.perf_counter()
+    def sleep(_seconds):
+        nonlocal last
+        durations.append((time.perf_counter() - last) * 1000)
+        cfg_time[0] += .1
+        last = time.perf_counter()
+        if len(durations) >= 21:
+            controller.request_stop()
+
+    session = ContinuousSession(controller, 'fixture', 'scrcpy.exe', 'adb.exe',
+        SimpleNamespace(), clock=lambda: cfg_time[0], sleeper=sleep)
+    session.pipe, session.epoch = pipeline, 2
+    session.latest_segment_index = history + 1
+    class NoHistory(dict):
+        def __iter__(self):
+            pytest.fail('无变化循环访问了历史')
+        items = values = keys = __iter__
+        def __getitem__(self, key):
+            if key <= history:
+                pytest.fail(f'无变化循环访问了历史切片 {key}')
+            return super().__getitem__(key)
+    session.ledger = NoHistory({row.index: dict(epoch=2, terminal=row.closed) for row in seeded})
+    pipeline._fragments = NoHistory(pipeline._fragments)
+    session.identity_risks[2] = dict(lower=1.0, wall=1.0, flags={'identity_unconfirmed'}, marked=set())
+    session.start_epoch = lambda: True
+    session.poll_identity = lambda **kw: False
+    session.poll_surface = lambda: None
+    session.close = lambda: None
+    original_sync = session.sync
+    def timed_sync():
+        started = time.perf_counter()
+        original_sync()
+        sync_durations.append((time.perf_counter() - started) * 1000)
+    session.sync = timed_sync
+    original_open = Path.open
+    read_sizes = []
+
+    class TracedManifest:
+        def __init__(self, file):
+            self.file = file
+        def __enter__(self):
+            self.file.__enter__()
+            return self
+        def __exit__(self, *args):
+            return self.file.__exit__(*args)
+        def __getattr__(self, key):
+            return getattr(self.file, key)
+        def read(self):
+            data = self.file.read()
+            read_sizes.append(len(data))
+            return data
+    def tracked_open(path, *args, **kwargs):
+        file = original_open(path, *args, **kwargs)
+        return TracedManifest(file) if path == manifest else file
+    monkeypatch.setattr(Path, 'open', tracked_open)
+    monkeypatch.setattr(Path, 'glob', lambda *args, **kwargs: pytest.fail('无变化循环枚举了目录'))
+    try:
+        assert session.run() == 0
+        assert read_sizes == [0] * 21
+        heartbeats = [json.loads(line) for line in stream.getvalue().splitlines()
+                      if '"heartbeat"' in line]
+        assert len(heartbeats) == 21
+        print(f'历史 {history} 片，旧行访问 0，旧字节重读 0，目录枚举 0，'
+              f'sync 中位数 {statistics.median(sync_durations[1:]):.3f} ms，'
+              f'整轮处理耗时中位数 {statistics.median(durations[1:]):.3f} ms')
+    finally:
+        session.identity_probes.shutdown()
+        session.probes.shutdown()
+        session.pool.shutdown()
 
 
 @pytest.mark.parametrize('flag',['--recording-mode','--overlap-duration'])

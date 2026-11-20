@@ -110,6 +110,7 @@ def test_real_navigator_independent_profile_cycles_keep_conflicts_on_cleanup_fai
     nav._profile_entry_clicked_generation = None
     nav.adb_client = object()
     state = dict(page='live', cycle=0, taps=0)
+    inputs = []
     nav.get_current_focus_activity = lambda: 'UserProfileActivity' if state['page'] == 'profile' else 'LivePlayActivity'
     frame = np.zeros((1920, 1080, 3), dtype=np.uint8)
     nav._capture_frame_array = lambda: frame
@@ -119,6 +120,8 @@ def test_real_navigator_independent_profile_cycles_keep_conflicts_on_cleanup_fai
         lambda adb: SimpleNamespace(get_ui_dump=lambda: '<hierarchy/>'))
     live = 'topResumedActivity=ActivityRecord{live u0 com.ss.android.ugc.aweme/.live.LivePlayActivity t41}'
     def adb(*args, **kw):
+        if args[:2] == ('shell', 'input'):
+            inputs.append(args[2:])
         if args[:3] == ('shell', 'input', 'tap'):
             state['taps'] += 1
             if args[3:] == ('151', '643'):
@@ -138,6 +141,13 @@ def test_real_navigator_independent_profile_cycles_keep_conflicts_on_cleanup_fai
     assert (first.room_id, first.anchor_uid) == ('901', '456')
     assert first.returned_to_live is not cleanup_fails
     assert nav._operation_deadline is None
+    assert state['taps'] == 2
+    cleanup = inputs[inputs.index(('keyevent', '4')):]
+    def verify_cleanup(actions):
+        assert actions and all(action == ('keyevent', '4') for action in actions)
+    verify_cleanup(cleanup)
+    with pytest.raises(AssertionError):
+        verify_cleanup([('tap', '300', '430'), *cleanup])
     if cleanup_fails:
         assert compare_evidence(first, '900', '123') == IdentityStatus.MISMATCH
     else:

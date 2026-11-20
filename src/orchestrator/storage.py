@@ -2,7 +2,6 @@
 from contextlib import contextmanager
 import json
 import logging
-import math
 from pathlib import Path
 import re
 import sqlite3
@@ -31,7 +30,7 @@ ACTIVE = ("pending", "starting", "running", "stopping", "needs_reconcile")
 NEEDS_FIX = "needs_fix: "          # 目标无效，直到显式 record 查询确认 LIVE 后解除
 RETRY_BASE_SEC, RETRY_MAX_SEC = 5, 300
 BOOT_RETRY_BASE_SEC, BOOT_RETRY_MAX_SEC = 30, 300
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 # 这些停止原因已由目标状态决定后续（移除、确认下播、换场、主控正常退出），无需退避。
 SETTLED_STOPS = ("target_removed", "anchor_offline", "live_session_changed", "scheduler_shutdown")
 SCHEMA = """
@@ -58,7 +57,8 @@ CREATE TABLE IF NOT EXISTS jobs (
  room_id TEXT, status TEXT NOT NULL, vmindex INTEGER, pid INTEGER, process_created REAL,
  command_json TEXT, event_log_path TEXT, created_at REAL NOT NULL, started_at REAL, ended_at REAL,
  stop_reason TEXT, error_reason TEXT, exit_code INTEGER, heartbeat_json TEXT,
- collection_complete INTEGER NOT NULL DEFAULT 0, reconcile_requested INTEGER NOT NULL DEFAULT 0
+ collection_complete INTEGER NOT NULL DEFAULT 0, reconcile_requested INTEGER NOT NULL DEFAULT 0,
+ old_worker_deadline REAL, worker_reason TEXT, worker_run_id TEXT, launch_intent_at REAL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS one_active_target ON jobs(target_id)
  WHERE status IN ('pending','starting','running','stopping','needs_reconcile');
@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS commands (
  error_code TEXT, message TEXT, created_at REAL NOT NULL, started_at REAL, finished_at REAL
 );
 CREATE INDEX IF NOT EXISTS jobs_query ON jobs(status,target_id,created_at,id);
+CREATE INDEX IF NOT EXISTS targets_enabled ON targets(id) WHERE enabled=1;
 CREATE INDEX IF NOT EXISTS segments_time ON segments(COALESCE(started_at,created_at),job_id,segment_index);
 CREATE INDEX IF NOT EXISTS events_job ON events(job_id,kind,received_at);
 CREATE INDEX IF NOT EXISTS commands_pending ON commands(status,created_at,id);
@@ -120,6 +121,36 @@ def canonical_target(raw: str) -> str:
     raw = raw.strip()
     match = re.search(r"live\.douyin\.com/([\w.~-]+)", raw)
     return match.group(1) if match else raw.rstrip("/")
+
+
+def validate_worker_event(job_id, event):
+    if not isinstance(event, dict) or not isinstance(event.get("event"), str) or not event["event"]:
+        raise ValueError("Worker 事件缺少类型")
+    if event.get("job_id") not in (None, "", job_id):
+        raise ValueError("Worker 事件 job_id 不匹配")
+    if event.get("run_id") is not None and not isinstance(event["run_id"], str):
+        raise ValueError("Worker 运行标识无效")
+    if "event_seq" in event and (
+        event.get("job_id") != job_id or not isinstance(event.get("run_id"), str)
+        or not event["run_id"] or not isinstance(event.get("event_id"), str) or not event["event_id"]
+        or type(event["event_seq"]) is not int or event["event_seq"] < 1
+    ):
+        raise ValueError("Worker 事件的运行归属或序号无效")
+    if event["event"] in ("segment_started", "segment_finished", "segment_aborted", "segment_quality_warning"):
+        if type(event.get("segment_index")) is not int or not 0 < event["segment_index"] < 2**63:
+            raise ValueError("Worker 事件切片编号无效")
+        for key in ("file_path", "reason"):
+            if event.get(key) is not None and not isinstance(event[key], str):
+                raise ValueError(f"Worker 事件的 {key} 无效")
+        for key in ("duration_sec", "file_size_mb"):
+            if event.get(key) is not None and (type(event[key]) not in (int, float) or not abs(event[key]) < 2**63):
+                raise ValueError(f"Worker 事件的 {key} 无效")
+    if event["event"] in ("worker_stopped", "worker_failed"):
+        code = event.get("exit_code")
+        if code is not None and (type(code) is not int or not -(2**63) <= code < 2**63):
+            raise ValueError("Worker 退出码无效")
+        if event.get("reason") is not None and not isinstance(event["reason"], str):
+            raise ValueError("Worker 停止原因无效")
 
 
 class Store:
@@ -183,6 +214,16 @@ class Store:
     def row(self, sql: str, params=()) -> dict | None:
         rows = self.rows(sql, params)
         return rows[0] if rows else None
+
+    @contextmanager
+    def segment_send_guard(self, job_id, index):
+        """切片事件提交与安排登记共用同一把锁。"""
+        with self._lock:
+            row = self.db.execute("SELECT status FROM segments WHERE job_id=? AND segment_index=?",
+                                  (job_id, index)).fetchone()
+            if not row or row["status"] != "finished":
+                raise ControlError("segment_unfinished", "切片已不能用于安排或发送")
+            yield
 
     def add_target(self, raw: str, auto_record=True, allow_unconfirmed=False, now=None) -> str:
         raw = raw.strip()
@@ -439,7 +480,9 @@ class Store:
             if not job or job["status"] not in ACTIVE:
                 return
             if reason == "manual_stop":
-                db.execute("UPDATE targets SET suppressed_session=?,record_session_key=NULL,updated_at=?,control_revision=control_revision+1 WHERE id=? AND session_key=?",
+                db.execute("""UPDATE targets SET suppressed_session=?,record_session_key=NULL,updated_at=?,
+                    control_revision=control_revision+1 WHERE id=? AND session_key=?
+                    AND (suppressed_session IS NOT session_key OR record_session_key IS NOT NULL)""",
                            (job["session_key"], time.time(), job["target_id"], job["session_key"]))
             if job["status"] == "needs_reconcile":
                 return
@@ -448,23 +491,27 @@ class Store:
             else:
                 db.execute("UPDATE jobs SET status='stopping',stop_reason=COALESCE(stop_reason,?) WHERE id=?", (reason, job_id))
 
-    def record_event(self, job_id: str, event: dict, now: float):
+    def record_event(self, job_id: str, event: dict, now: float, *, replay=False):
+        validate_worker_event(job_id, event)
         payload = json.dumps(event, sort_keys=True, ensure_ascii=False)
         # 无事件编号的旧式测试事件直接比较规范化内容，不引入摘要算法。
         key = job_id + ":" + str(event.get("event_id") or payload)
         kind = event.get("event", "")
         stamp = event.get("timestamp")
-        stamp = stamp if isinstance(stamp, (int, float)) and not isinstance(stamp, bool) and math.isfinite(stamp) else now
-        if event.get("job_id") not in (None, "", job_id):
-            raise ValueError("Worker 事件 job_id 不匹配")
+        stamp = stamp if type(stamp) in (int, float) and abs(stamp) < 2**63 else now
         quality_issue = None
         with self.transaction() as db:
             if db.execute("INSERT OR IGNORE INTO events VALUES(?,?,?,?,?)", (key, job_id, kind, payload, now)).rowcount == 0:
                 return
+            if run_id := event.get("run_id"):
+                row = db.execute("""UPDATE jobs SET worker_run_id=COALESCE(worker_run_id,?)
+                    WHERE id=? RETURNING worker_run_id""", (run_id, job_id)).fetchone()
+                if row[0] != run_id:
+                    return
             if kind == "heartbeat":
                 old = json.loads(db.execute("SELECT heartbeat_json FROM jobs WHERE id=?", (job_id,)).fetchone()[0] or "{}")
                 numeric = [event.get(k) for k in ("elapsed_sec", "fps")]
-                valid = all(v is None or (isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v >= 0) for v in numeric)
+                valid = all(v is None or (type(v) in (int, float) and 0 <= v < 2**63) for v in numeric)
                 if valid and stamp >= old.get("timestamp", 0):
                     db.execute("UPDATE jobs SET heartbeat_json=? WHERE id=?", (json.dumps(dict(event, timestamp=stamp), ensure_ascii=False), job_id))
             if kind in ("segment_started", "segment_finished", "segment_aborted", "segment_quality_warning"):
@@ -475,15 +522,24 @@ class Store:
                 if kind == "segment_started":
                     db.execute("UPDATE segments SET started=1,raw_path=?,started_at=? WHERE job_id=? AND segment_index=?", (event.get("file_path"), stamp, job_id, idx))
                     # Popen 成功不等于开始录制；首片开始后才将任务标为 running，并把失败计数清零。
-                    if db.execute("UPDATE jobs SET status='running' WHERE id=? AND status='starting'", (job_id,)).rowcount:
+                    if not replay and db.execute("UPDATE jobs SET status='running' WHERE id=? AND status='starting'", (job_id,)).rowcount:
                         db.execute("UPDATE targets SET attempts=0 WHERE id=(SELECT target_id FROM jobs WHERE id=?)", (job_id,))
                 elif kind == "segment_quality_warning":
                     quality_issue = self._record_quality_warning(db, job_id, idx, old, event, stamp)
                 else:
                     status = "finished" if kind == "segment_finished" else "aborted"
-                    if old and old["status"] in ("finished", "aborted"):
-                        if old["status"] != status or old["file_path"] != event.get("file_path"):
-                            raise ValueError("同一切片收到冲突终态")
+                    if old and old["status"] in ("finished", "aborted", "conflicted"):
+                        if old["status"] == "conflicted":
+                            return
+                        if (old["status"] != status or old["file_path"] != event.get("file_path")
+                                or bool(old["is_final"]) != bool(event.get("is_final"))):
+                            db.execute("""UPDATE segments SET status='conflicted',file_path=NULL,
+                                is_final=0,reason='segment_terminal_conflict' WHERE job_id=? AND segment_index=?""",
+                                       (job_id, idx))
+                            db.execute("""UPDATE jobs SET status='failed',exit_code=COALESCE(NULLIF(exit_code,0),30),
+                                collection_complete=0,error_reason=? WHERE id=?
+                                AND status IN ('finished','finished_with_warnings','failed','cancelled')""",
+                                       (f"event_collection_incomplete: 切片 {idx} 终态冲突", job_id))
                         return
                     db.execute("""UPDATE segments SET status=?,file_path=?,duration_sec=?,file_size_mb=?,is_final=?,reason=?,ended_at=?
                         WHERE job_id=? AND segment_index=?""", (status, event.get("file_path"), event.get("duration_sec"),
@@ -517,44 +573,119 @@ class Store:
         db.execute("UPDATE jobs SET status='finished_with_warnings' WHERE id=? AND status='finished' AND exit_code=0", (job_id,))
         return None
 
+    def finish_worker(self, job_id, now, process_code=None, context=""):
+        """只依据已提交的事件判定完整性，在线和日志回放共用。"""
+        with self.transaction() as db:
+            events = [json.loads(r[0]) for r in db.execute(
+                "SELECT payload FROM events WHERE job_id=?", (job_id,))]
+            worker = [e for e in events if e.get("run_id") or e.get("job_id") or "event_seq" in e
+                      or e["event"] != "login_status_checked"]
+            stops = [e for e in worker if e["event"] == "worker_stopped"]
+            numbered = [e for e in worker if "event_seq" in e]
+            ordered = sorted(numbered, key=lambda e: e["event_seq"])
+            terminal = ordered[-1] if ordered and ordered[-1]["event"] == "worker_stopped" else {}
+            run_id = db.execute("SELECT worker_run_id FROM jobs WHERE id=?", (job_id,)).fetchone()[0]
+            matching = [e for e in worker if e.get("run_id") == run_id]
+            evidence = next((e for e in reversed(matching) if e["event"] == "worker_stopped"), {})
+            if not evidence:
+                evidence = next((e for e in reversed(matching) if e["event"] == "worker_failed"), {})
+            problems = []
+            if not terminal or len(stops) != 1:
+                problems.append("缺少唯一的末尾 worker_stopped")
+            if len(numbered) != len(worker):
+                problems.append("存在无序号的 Worker 事件")
+            if len({e["run_id"] for e in numbered}) > 1:
+                problems.append("Worker 运行归属冲突")
+            for expected, event in enumerate(ordered, 1):
+                if event["event_seq"] != expected:
+                    problems.append(f"事件序号预期 {expected}，实际 {event['event_seq']}")
+                    break
+            if terminal and terminal.get("exit_code") is None:
+                problems.append("停止事件缺少退出码")
+            code = evidence.get("exit_code")
+            failure = next((e["exit_code"] for e in reversed(matching)
+                            if e["event"] == "worker_failed" and e.get("exit_code")), None)
+            if failure is not None and code is not None and code != failure:
+                problems.append(f"退出码冲突：失败事件 {failure}，停止事件 {code}")
+                code = code or failure
+            if code is None:
+                code = process_code if process_code is not None else 30
+            elif process_code is not None and process_code != code:
+                problems.append(f"退出码冲突：事件 {code}，进程 {process_code}")
+                code = code or process_code
+            stamp = evidence.get("timestamp")
+            ended = stamp if type(stamp) in (int, float) and abs(stamp) < 2**63 else None
+            reason = evidence.get("reason") or ""
+            self.finish_job(job_id, code, now, not problems, reason, ended_at=ended,
+                            problems=problems, context=context, worker_reason=reason)
+
     def finish_job(self, job_id: str, code: int, now: float, collection_complete: bool,
-                   reason: str = "", hold_instance: bool = False, ended_at: float | None = None):
+                   reason: str = "", hold_instance: bool = False, ended_at: float | None = None,
+                   *, problems=(), context="", worker_reason=""):
         """ended_at：Worker 实际退出时刻（对账时取自日志）；缺省为 now。退避仍从 now 起算。"""
+        if hold_instance:
+            self.mark_waiting_exit(job_id, now, reason=reason, quarantine=True)
+            return
         with self.transaction() as db:
             job = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if not job or job["status"] not in ACTIVE:
+                return
             segs = list(db.execute("SELECT * FROM segments WHERE job_id=?", (job_id,)))
-            incomplete = any(not s["started"] or s["status"] == "started" for s in segs)
-            too_many_final = sum(s["is_final"] for s in segs) > 1
-            if not collection_complete or incomplete or too_many_final:
+            issues = list(problems)
+            for s in segs:
+                idx = s["segment_index"]
+                if not s["started"]:
+                    issues.append(f"切片 {idx} 缺少开始事件")
+                if s["status"] == "started":
+                    issues.append(f"切片 {idx} 缺少终态")
+                elif s["status"] == "conflicted":
+                    issues.append(f"切片 {idx} 终态冲突")
+            finals = [str(s["segment_index"]) for s in segs if s["is_final"]]
+            if len(finals) > 1:
+                issues.append("重复尾片 " + "、".join(finals))
+            collection_complete = collection_complete and not issues
+            if not collection_complete:
                 code = code or 30
-                reason = reason or "event_collection_incomplete"
-            if code == 0 and not segs and not job["stop_reason"]:
+                details = "；".join([*issues, *([context] if context else [])])
+                reason = "event_collection_incomplete" + (f": {details}" if details else "")
+            elif context:
+                logger.info("任务 %s 收尾证据情况：%s", job_id, context)
+            cancelled = reason == "cancelled_before_launch"
+            if code == 0 and not segs and not job["stop_reason"] and not cancelled:
                 code, reason = 30, "no_recorded_segment"
             has_errors = any(s["status"] == "aborted" or s["risk_json"] for s in segs)
-            status = "failed" if code else ("finished_with_warnings" if has_errors else "finished")
-            if hold_instance:
-                status = "needs_reconcile"
-            db.execute("UPDATE jobs SET status=?,exit_code=?,error_reason=?,ended_at=?,collection_complete=? WHERE id=?",
-                       (status, code, reason or None, ended_at or now, int(collection_complete and not incomplete), job_id))
+            status = "cancelled" if cancelled else "failed" if code else (
+                "finished_with_warnings" if has_errors else "finished")
+            db.execute("""UPDATE jobs SET status=?,exit_code=?,error_reason=?,ended_at=?,collection_complete=?,
+                       worker_reason=? WHERE id=?""",
+                       (status, code, reason or None, ended_at if ended_at is not None else now,
+                        int(collection_complete), worker_reason or None, job_id))
             if job["vmindex"] is not None:
-                slot_status = "reconcile" if hold_instance else ("offline" if code == 20 else "idle")
-                db.execute("UPDATE instances SET status=?,job_id=?,reason=?,updated_at=? WHERE vmindex=? AND (job_id IS NULL OR job_id=?)",
-                           (slot_status, job_id if hold_instance else None, reason or None, now, job["vmindex"], job_id))
+                slot_status = "offline" if code == 20 else "idle"
+                db.execute("UPDATE instances SET status=?,job_id=NULL,reason=?,updated_at=? WHERE vmindex=? AND job_id=?",
+                           (slot_status, reason or None, now, job["vmindex"], job_id))
             stop = job["stop_reason"]
             if stop == "manual_stop" or (code == 0 and requested_total_duration(job["command_json"]) > 0):
-                db.execute("UPDATE targets SET suppressed_session=?,record_session_key=NULL,updated_at=?,control_revision=control_revision+1 WHERE id=? AND session_key=?", (job["session_key"], now, job["target_id"], job["session_key"]))
+                db.execute("""UPDATE targets SET suppressed_session=?,record_session_key=NULL,updated_at=?,
+                    control_revision=control_revision+1 WHERE id=? AND session_key=?
+                    AND (suppressed_session IS NOT session_key OR record_session_key IS NOT NULL)""",
+                           (job["session_key"], now, job["target_id"], job["session_key"]))
             elif code == 9:
                 db.execute("UPDATE targets SET note=?,record_session_key=NULL,updated_at=?,control_revision=control_revision+1 WHERE id=? AND session_key=?",
                            (NEEDS_FIX + (reason or "target_invalid"), now, job["target_id"], job["session_key"]))
-            elif stop not in SETTLED_STOPS:
+            elif not cancelled and stop not in SETTLED_STOPS:
                 attempts = db.execute("SELECT attempts FROM targets WHERE id=?", (job["target_id"],)).fetchone()[0]
                 db.execute("UPDATE targets SET retry_at=?,attempts=MAX(1,attempts),updated_at=? WHERE id=? AND session_key=?", (now + retry_delay(attempts), now, job["target_id"], job["session_key"]))
 
-    def mark_waiting_exit(self, job_id: str):
-        """旧主控遗留的本任务进程仍在运行：等它发现主控断开后自行封口退出。"""
+    def mark_waiting_exit(self, job_id, now, *, deadline=None, reason="waiting_old_worker_exit", quarantine=False):
         with self.transaction() as db:
-            db.execute("UPDATE jobs SET status='stopping',error_reason='waiting_old_worker_exit' WHERE id=?", (job_id,))
-            db.execute("UPDATE instances SET status='busy' WHERE job_id=?", (job_id,))
+            status = "needs_reconcile" if quarantine else "stopping"
+            updated = db.execute("""UPDATE jobs SET status=?,error_reason=?,old_worker_deadline=COALESCE(old_worker_deadline,?)
+                WHERE id=? AND status IN ('starting','running','stopping','needs_reconcile')""",
+                                 (status, reason, deadline, job_id))
+            if updated.rowcount:
+                db.execute("UPDATE instances SET status=?,reason=?,updated_at=? WHERE job_id=?",
+                           ("reconcile" if quarantine else "busy", reason, now, job_id))
 
     def _check_instance_control(self, db, vmindex: int, enabled: bool):
         """校验实例是否存在，以及停用时是否处于占用、开机或待对账状态。"""
@@ -684,7 +815,9 @@ class Store:
             affected = [j["id"] for j in jobs if j["status"] != "needs_reconcile"]
             reconcile = [j["id"] for j in jobs if j["status"] == "needs_reconcile"]
             already = t["suppressed_session"] == session and not t["record_session_key"] and all(j["status"] in ("stopping", "needs_reconcile") for j in jobs)
-            db.execute("UPDATE targets SET record_session_key=NULL,suppressed_session=?,updated_at=?,control_revision=control_revision+1 WHERE id=?", (session, now, subject))
+            db.execute("""UPDATE targets SET record_session_key=NULL,suppressed_session=?,updated_at=?,
+                control_revision=control_revision+1 WHERE id=?
+                AND (suppressed_session IS NOT session_key OR record_session_key IS NOT NULL)""", (session, now, subject))
             for job in jobs:
                 if job["status"] != "needs_reconcile":
                     self.request_stop(job["id"], "manual_stop")

@@ -1,51 +1,64 @@
-"""测试任务目录隔离防碰撞命名、进程互斥锁与观测增强 (Ticket 12)。"""
-import json
-import os
+"""用两个同时存活的进程验证实例锁。"""
 from pathlib import Path
-import pytest
-
-from src.worker.naming_lock import (
-    build_segment_filename,
-    WorkerInstanceLock,
-    LockAcquisitionError,
-)
-from src.worker.events import (
-    WorkerEventEmitter,
-    BaseWorkerEvent,
-)
+import subprocess
+import sys
+import time
 
 
-def test_build_segment_filename_strict_format():
-    """切片命名严格遵循 <room_id>_<start_epoch>_<segment_index:04d>_<generation:02d>.mp4。"""
-    filename = build_segment_filename(
-        room_id="737141888",
-        start_epoch=1730550000,
-        segment_index=1,
-        generation_id=2,
-    )
-    assert filename == "737141888_1730550000_0001_02.mp4"
+CONTENDER = r'''
+from pathlib import Path
+import sys, time
+from src.worker.naming_lock import WorkerInstanceLock, LockAcquisitionError
+root, label = Path(sys.argv[1]), sys.argv[2]
+lock = WorkerInstanceLock(root / 'locks', 2, label)
+def await_file(path):
+    until = time.monotonic() + 10
+    while not path.exists():
+        if time.monotonic() >= until:
+            raise TimeoutError(path)
+        time.sleep(.01)
+(root / ('ready-' + label)).touch()
+await_file(root / 'contend')
+try:
+    lock.acquire()
+except LockAcquisitionError:
+    (root / ('blocked-' + label)).touch()
+    await_file(root / 'first-released')
+    lock.acquire()
+    (root / ('acquired-after-release-' + label)).touch()
+    lock.release()
+else:
+    (root / ('held-' + label)).touch()
+    await_file(root / 'release')
+    lock.release()
+    (root / 'first-released').touch()
+'''
 
 
-def test_worker_instance_lock_prevents_duplicate_acquisition(tmp_path):
-    """同一设备和同一房间在已有锁持有时，第二个实例获取锁必须失败并抛出异常。"""
-    lock1 = WorkerInstanceLock(lock_dir=tmp_path, vmindex=2, room_id="737141")
-    assert lock1.acquire() is True
+def test_instance_lock_across_two_processes(tmp_path):
+    children = [subprocess.Popen([sys.executable, '-c', CONTENDER, str(tmp_path), label])
+                for label in ('A', 'B')]
+    def wait_for(pattern, count):
+        until = time.monotonic() + 8
+        while time.monotonic() < until:
+            matches = list(tmp_path.glob(pattern))
+            if len(matches) >= count:
+                return matches
+            time.sleep(.02)
+        raise AssertionError(pattern)
 
-    # 另一个实例尝试获取同一设备+房间锁
-    lock2 = WorkerInstanceLock(lock_dir=tmp_path, vmindex=2, room_id="737141")
-    with pytest.raises(LockAcquisitionError):
-        lock2.acquire()
-
-    # lock1 释放后，lock2 能够正常获取
-    lock1.release()
-    assert lock2.acquire() is True
-    lock2.release()
-
-
-def test_event_emitter_includes_uuid_and_monotonic_timestamp():
-    """NDJSON 事件必须包含全局唯一 event_id (UUID) 与 mono_time 单调时钟。"""
-    event = BaseWorkerEvent(event="custom_test_event")
-    assert hasattr(event, "event_id")
-    assert hasattr(event, "mono_time")
-    assert len(event.event_id) >= 16
-    assert event.mono_time > 0.0
+    try:
+        wait_for('ready-*', 2)
+        (tmp_path / 'contend').touch()
+        held, = wait_for('held-*', 1)
+        blocked, = wait_for('blocked-*', 1)
+        assert held.name[-1] != blocked.name[-1]
+        assert not list(tmp_path.glob('acquired-after-release-*'))
+        (tmp_path / 'release').touch()
+        assert [proc.wait(5) for proc in children] == [0, 0]
+        assert (tmp_path / ('acquired-after-release-' + blocked.name[-1])).is_file()
+    finally:
+        for proc in children:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(5)

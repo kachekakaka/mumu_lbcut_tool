@@ -57,8 +57,8 @@ class WorkerNavigator:
                 timeout = min(timeout, self._operation_deadline - time.monotonic())
                 if timeout < 1.0:
                     raise TimeoutError("导航流程预算耗尽")
-            options = {'kill_tree_on_timeout': False} if self._operation_deadline is not None else {}
-            res = self.adb_client.run_adb(*args, timeout=max(.001,timeout-.2) if options else timeout, **options)
+            reclaim = .2 if self._operation_deadline is not None else 0
+            res = self.adb_client.run_adb(*args, timeout=timeout-reclaim)
             self._last_adb_failed = res.exit_code != 0
             output = res.stdout.strip() or res.stderr.strip()
             if "not found" in output or "offline" in output:
@@ -69,7 +69,7 @@ class WorkerNavigator:
                 retry_budget = min(timeout, self._operation_deadline-time.monotonic()) if self._operation_deadline is not None else timeout
                 if retry_budget < 1.0:
                     return ''
-                res2 = self.adb_client.run_adb(*args, timeout=max(.001,retry_budget-.2) if options else retry_budget, **options)
+                res2 = self.adb_client.run_adb(*args, timeout=retry_budget-reclaim)
                 self._last_adb_failed = res2.exit_code != 0
                 output = res2.stdout.strip()
             return output
@@ -634,8 +634,7 @@ class WorkerNavigator:
                 break
             try:
                 result = self.adb_client.run_adb('shell', 'dumpsys', 'window', target,
-                                                 timeout=max(.001,remaining-.2), check=False,
-                                                 kill_tree_on_timeout=False)
+                                                 timeout=max(.001,remaining-.2), check=False)
                 if result.exit_code == 0:
                     texts[target] = result.stdout or ''
             except Exception as exc:
@@ -654,8 +653,7 @@ class WorkerNavigator:
             if stop_requested() or remaining <= 0:
                 raise TimeoutError('identity_probe_deadline')
             result = self.adb_client.run_adb('shell', 'dumpsys', 'activity', target,
-                                            timeout=max(.001,remaining-.2), check=False,
-                                            kill_tree_on_timeout=False)
+                                            timeout=max(.001,remaining-.2), check=False)
             if result.exit_code:
                 raise RuntimeError('identity_probe_failed')
             return result.stdout or ''

@@ -106,15 +106,16 @@ def test_total_duration_is_cut_by_muxer_on_media_timeline(tmp_path,media_tools):
 
 
 def test_segment_elapsed_counts_from_last_sealed_cut(tmp_path):
-    from src.worker.continuous_pipeline import Fragment
-    p=ContinuousPipeline.__new__(ContinuousPipeline)
-    p.progress={};p._fragments={}
+    p=ContinuousPipeline('synthetic',tmp_path,'scrcpy.exe','adb.exe',4,'ffmpeg.exe')
+    p.directory.mkdir()
     assert p.get_current_segment_elapsed()==0
     p.progress['out_time_us']='4200000'
-    p._fragments={1:Fragment(1,tmp_path/'part_000001.mp4',False)}
+    (p.directory/'part_000001.mp4').touch()
+    p.fragment_updates()
     assert p.get_current_segment_elapsed()==4.2
     p.progress['out_time_us']='5100000'
-    p._fragments={1:Fragment(1,tmp_path/'a',True,0.0,4.0),2:Fragment(2,tmp_path/'b',False)}
+    (p.directory/'segments.csv').write_text('part_000001.mp4,0,4\n', encoding='utf8')
+    p.fragment_updates()
     assert round(p.get_current_segment_elapsed(),3)==1.1
     p.progress['out_time_us']='N/A';p.progress['out_time_ms']='6000000'
     assert round(p.get_current_segment_elapsed(),3)==2.0

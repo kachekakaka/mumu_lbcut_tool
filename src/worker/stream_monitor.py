@@ -7,6 +7,8 @@ from collections import deque
 from dataclasses import dataclass
 import logging
 import os
+from pathlib import Path
+import re
 import subprocess
 import threading
 import time
@@ -125,7 +127,7 @@ def build_command(ffmpeg_exe):
 class Analyzer:
     """一个分析 ffmpeg 进程：有界输入队列、写线程、按整帧读取的读线程。"""
 
-    def __init__(self, ffmpeg_exe, on_frame, max_queue_bytes, stderr_file=None):
+    def __init__(self, ffmpeg_exe, on_frame, max_queue_bytes, stderr_file=None, job_id=None):
         self.failed = None
         self.fed_at = None
         self.bytes_at_fed = 0
@@ -139,6 +141,8 @@ class Analyzer:
         self._cond = threading.Condition()
         self._closed = False
         cmd = build_command(ffmpeg_exe)
+        if job_id:
+            cmd[-1:-1] = ['-metadata', f'comment=mumu_capture_{job_id}']
         flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=stderr_file or subprocess.DEVNULL, bufsize=0,
@@ -202,7 +206,7 @@ class Analyzer:
             self.fail('analyzer_output_broken')
 
     def kill(self):
-        """不等待；可在持锁时调用。"""
+        """要求本分析器退出，等待与管道释放交给 close。"""
         with self._cond:
             self._closed = True
             self._queue.clear()
@@ -272,27 +276,30 @@ class StreamMonitor:
         self._thread = None
         self._stderr = None
         self._feed_error_logged = False
-        # 旧分析进程在锁外回收：读线程回调也要拿锁，持锁等待会连带阻塞字节桥。
-        self._retired = []
+        self._generation = 0
+        self._changing = False
+        self._settled = threading.Condition(self._lock)
 
     # ---- 生命周期 ----
     def start(self):
         if self.stderr_path:
             self._stderr = open(self.stderr_path, 'ab')
-        with self._lock:
-            self._launch(self.clock(), 'initial')
+        self._launch(self.clock(), 'initial')
         self._thread = threading.Thread(target=self._loop, name='stream-monitor', daemon=True)
         self._thread.start()
 
     def stop(self):
         self._stop.set()
+        with self._lock:
+            self._generation += 1
+            analyzer, self.analyzer = self.analyzer, None
+        if analyzer:
+            analyzer.close()
+        with self._settled:
+            if not self._settled.wait_for(lambda: not self._changing, timeout=10):
+                raise RuntimeError('录像流分析器启动或回收超时')
         if self._thread:
             self._thread.join(timeout=2)
-        with self._lock:
-            analyzer, self.analyzer = self.analyzer, None
-            if analyzer:
-                self._retire(analyzer)
-        self._reap()
         if self._stderr:
             self._stderr.close()
             self._stderr = None
@@ -304,18 +311,12 @@ class StreamMonitor:
             except Exception:
                 log.exception('录像流分析监督异常')
 
-    def _retire(self, analyzer):
-        analyzer.kill()
-        self._retired.append(analyzer)
-
-    def _reap(self):
-        with self._lock:
-            retired, self._retired = self._retired, []
-        for analyzer in retired:
-            analyzer.close()
-
     def _spawn(self):
-        return Analyzer(self.ffmpeg_exe, self._on_frame, self.max_queue_bytes, self._stderr)
+        job_id = None
+        if self.stderr_path is not None:
+            job_id = next((part for part in reversed(Path(self.stderr_path).parts[:-1])
+                           if re.fullmatch(r'[0-9a-f]{32}', part)), None)
+        return Analyzer(self.ffmpeg_exe, self._on_frame, self.max_queue_bytes, self._stderr, job_id)
 
     def _event(self, action, reason='', analyzer=None):
         self._events.append({'action': action, 'reason': reason,
@@ -328,40 +329,66 @@ class StreamMonitor:
         return events
 
     def _launch(self, now, reason):
+        with self._lock:
+            if self._stop.is_set() or self._changing:
+                return
+            change = self._detach(now, reason)
+        self._apply_change(change)
+
+    def _detach(self, now, reason=None):
         old, self.analyzer = self.analyzer, None
-        if old:
-            self._retire(old)
+        self._generation += 1
+        self._changing = True
         self._need_join = True
         self.available_since = None
-        try:
-            analyzer = self.analyzer_factory()
-        except Exception as exc:
-            log.warning('启动录像流分析进程失败: %s', exc)
-            self._event('analyzer_start_failed', str(exc))
+        return self._generation, old, now, reason
+
+    def _apply_change(self, change):
+        if change is None:
             return
-        analyzer.started_at = now
-        self.analyzer = analyzer
-        self._event('analyzer_started', reason, analyzer)
+        gen, old, now, reason = change
+        try:
+            if old:
+                old.close()
+            if reason is None or self._stop.is_set():
+                return
+            try:
+                analyzer = self.analyzer_factory()
+            except Exception as exc:
+                log.warning('启动录像流分析进程失败: %s', exc)
+                with self._lock:
+                    self._event('analyzer_start_failed', str(exc))
+                    if reason == 'retry':
+                        self.next_retry_at = now + self.retry_sec
+                return
+            with self._lock:
+                if gen == self._generation and not self._stop.is_set():
+                    analyzer.started_at = self.clock()
+                    self.analyzer = analyzer
+                    self._event('analyzer_started', reason, analyzer)
+                    return
+            analyzer.close()
+        finally:
+            with self._settled:
+                self._changing = False
+                self._settled.notify_all()
 
     def _go_unavailable(self, now, reason):
-        old, self.analyzer = self.analyzer, None
-        if old:
-            self._retire(old)
         self.unavailable = True
         self.next_retry_at = now + self.retry_sec
         self.available_since = None
         self.frozen_since = None
         self._verify = None
         self._event('unavailable', reason)
+        return self._detach(now)
 
     def _on_failure(self, now, reason):
         self._event('analyzer_failed', reason, self.analyzer)
         self._verify = None
         if self.restarts >= self.max_restarts:
-            self._go_unavailable(now, reason)
-        else:
-            self.restarts += 1
-            self._launch(now, reason)
+            return self._go_unavailable(now, reason)
+        self.restarts += 1
+        return self._detach(now, reason)
 
     # ---- 字节桥与读线程回调 ----
     def feed(self, data):
@@ -415,25 +442,19 @@ class StreamMonitor:
 
     # ---- 监督 ----
     def tick(self, now=None):
-        try:
-            self._tick(self.clock() if now is None else now)
-        finally:
-            self._reap()
+        self._apply_change(self._tick(self.clock() if now is None else now))
 
     def _tick(self, now):
         with self._lock:
-            if self._stop.is_set():
+            if self._stop.is_set() or self._changing:
                 return
             analyzer = self.analyzer
             if self.unavailable:
-                self._tick_unavailable(now, analyzer)
-                return
+                return self._tick_unavailable(now, analyzer)
             if analyzer is None:
-                self._on_failure(now, 'analyzer_start_failed')
-                return
+                return self._on_failure(now, 'analyzer_start_failed')
             if analyzer.failed:
-                self._on_failure(now, analyzer.failed)
-                return
+                return self._on_failure(now, analyzer.failed)
             if self._verify:
                 self._tick_verify(now, analyzer)
                 return
@@ -447,7 +468,7 @@ class StreamMonitor:
                 # 先换一个分析进程核实，分清是分析卡住还是录像本身没有新画面。
                 self._verify = {'origin': ref, 'started': now}
                 self._event('verify_no_frames', f'{now - ref:.1f}s', analyzer)
-                self._launch(now, 'verify_no_frames')
+                return self._detach(now, 'verify_no_frames')
 
     def _tick_verify(self, now, analyzer):
         verify = self._verify
@@ -474,9 +495,7 @@ class StreamMonitor:
     def _tick_unavailable(self, now, analyzer):
         if analyzer is None:
             if now >= self.next_retry_at:
-                self._launch(now, 'retry')
-                if self.analyzer is None:
-                    self.next_retry_at = now + self.retry_sec
+                return self._detach(now, 'retry')
             return
         if analyzer.frames:
             self.unavailable = False
@@ -485,9 +504,8 @@ class StreamMonitor:
             self._event('recovered', '', analyzer)
         elif analyzer.failed or now - analyzer.started_at >= self.trial_timeout_sec:
             self._event('retry_failed', analyzer.failed or 'no_frames', analyzer)
-            self.analyzer = None
-            self._retire(analyzer)
             self.next_retry_at = now + self.retry_sec
+            return self._detach(now)
 
     # ---- 查询 ----
     def view(self):

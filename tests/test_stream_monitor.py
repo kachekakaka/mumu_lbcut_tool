@@ -2,6 +2,7 @@
 import io
 import itertools
 import json
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -97,6 +98,37 @@ class FakeAnalyzer:
         self.monitor._on_frame(self, bytes([value]) * FRAME_BYTES)
 
 
+def test_stop_during_analyzer_start_reaps_both_generations():
+    rig = Rig()
+    old = rig.current
+    entered, release = threading.Event(), threading.Event()
+    factory = rig.monitor.analyzer_factory
+    def slow_start():
+        entered.set()
+        assert release.wait(3)
+        return factory()
+    rig.monitor.analyzer_factory = slow_start
+    old.fail('injected_restart')
+    restarting = threading.Thread(target=rig.monitor.tick)
+    stopping = threading.Thread(target=rig.monitor.stop)
+    restarting.start()
+    try:
+        assert entered.wait(2)
+        stopping.start()
+        assert rig.monitor._stop.wait(2)
+        rig.monitor.feed(rig.data[:rig.offsets[1]])
+        assert rig.monitor.bytes_in == rig.offsets[1]
+        assert old.killed and rig.current is None
+    finally:
+        release.set()
+        restarting.join(3)
+        if stopping.ident is not None:
+            stopping.join(3)
+    assert not restarting.is_alive() and not stopping.is_alive()
+    assert len(rig.analyzers) == 2 and all(a.killed for a in rig.analyzers)
+    assert rig.current is None
+
+
 class Rig:
     """每 0.5 秒：送一个 Cluster 的录像字节、当前分析进程按 fps 出帧、监督一次。"""
 
@@ -108,8 +140,7 @@ class Rig:
         self.header, self.data, self.offsets = synthetic_stream(clusters)
         self.offsets.append(len(self.data))
         self.cluster = 0
-        with self.monitor._lock:
-            self.monitor._launch(self.now, 'initial')
+        self.monitor._launch(self.now, 'initial')
 
     def factory(self):
         analyzer = FakeAnalyzer(self.monitor)
@@ -238,6 +269,7 @@ class SessionRig:
 
     def add_segment(self, index):
         self.session.ledger[index] = {'epoch': self.session.epoch, 'terminal': False}
+        self.session.latest_segment_index = index
 
     def warnings(self):
         return [(e['segment_index'], e['flag']) for e in map(json.loads, self.stream.getvalue().splitlines())

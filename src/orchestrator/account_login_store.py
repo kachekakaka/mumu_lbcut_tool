@@ -13,11 +13,13 @@ from .upload_core_runtime import live
 class LoginStore:
     def __init__(self, path):
         self.path = path
+        self.pid = os.getpid()
+        self.created = psutil.Process().create_time()
 
     @contextmanager
     def db(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with closing(sqlite3.connect(self.path, timeout=4)) as db:
+        with closing(sqlite3.connect(self.path, timeout=4)) as db, db:
             db.row_factory = sqlite3.Row
             db.execute("BEGIN IMMEDIATE")
             version = db.execute("PRAGMA user_version").fetchone()[0]
@@ -35,7 +37,6 @@ class LoginStore:
             db.execute("""CREATE TABLE IF NOT EXISTS observed(deployment TEXT, session TEXT, terminal INTEGER,
                 PRIMARY KEY(deployment,session))""")
             yield db
-            db.commit()
 
     def entries(self, deployment):
         with self.db() as db:
@@ -88,12 +89,12 @@ class LoginStore:
             if not row:
                 row = db.execute(
                     """SELECT * FROM requests WHERE deployment=? AND action=? AND target IS ?
-                    AND status IN ('linked','unknown','sending') LIMIT 1""",
+                    AND status IN ('linked','unknown','sending','not_sent') LIMIT 1""",
                     (deployment, action, target),
                 ).fetchone()
             if row and (
                 row["key"] != key
-                or row["status"] not in ("sending", "unknown")
+                or row["status"] not in ("sending", "unknown", "not_sent")
                 or live(row["pid"], row["created"])
             ):
                 return dict(row), False
@@ -105,17 +106,18 @@ class LoginStore:
                     deployment,
                     action,
                     target,
-                    os.getpid(),
-                    psutil.Process().create_time(),
+                    self.pid,
+                    self.created,
                 ),
             )
-            return {"key": key}, bool(row)
+            return {"key": key}, bool(row and row["status"] != "not_sent")
 
     def finish(self, key, status, session=None, error=None):
         with self.db() as db:
             db.execute(
-                "UPDATE requests SET status=?,session=coalesce(?,session),error=?,pid=NULL,created=NULL WHERE key=? AND status='sending'",
-                (status, session, error, key),
+                """UPDATE requests SET status=?,session=coalesce(?,session),error=?,pid=NULL,created=NULL
+                    WHERE key=? AND status='sending' AND pid=? AND created=?""",
+                (status, session, error, key, self.pid, self.created),
             )
 
     def terminal(self, deployment, sid):

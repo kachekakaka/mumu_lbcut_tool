@@ -49,7 +49,10 @@ class Child:
         self.seq = 0
     def emit(self, kind, **kw):
         self.seq += 1
-        self.on_event(dict(event=kind, event_id=f'{self.spec.job_id}:{self.seq}', job_id=self.spec.job_id, **kw))
+        event = dict(event=kind, event_id=f'{self.spec.job_id}:{self.seq}', job_id=self.spec.job_id,
+                     run_id=self.spec.job_id, event_seq=self.seq, **kw)
+        self.on_event(event)
+        return event
     def start(self):
         self.alive = True
         self.file = self.spec.output_dir / 'segment.mp4'
@@ -171,7 +174,7 @@ def test_manual_stop_suppresses_same_session_and_event_idempotence(system):
     observe(e, {'A': RoomStatus.LIVE})
     pump(e, lambda: len(e.children) == 1)
     job = e.store.rows('SELECT * FROM jobs')[0]
-    event = dict(event='heartbeat', event_id='same-event', job_id=job['id'], status='recording')
+    event = e.children[0].emit('heartbeat', status='recording')
     e.store.record_event(job['id'], event, e.clock())
     e.store.record_event(job['id'], event, e.clock())
     assert len(e.store.rows("SELECT * FROM events WHERE kind='heartbeat'")) == 1
@@ -433,6 +436,7 @@ def test_device_offline_moves_job_to_other_instance(system):
     e = system
     e.child_options = dict(record=False)
     target, job = start_one(e)
+    e.vms[job['vmindex']] = False
     e.children[0].exit(20, 'device_offline')
     pump(e, lambda: job_status(e, job['id']) == 'failed')
     assert row(e, 'SELECT status FROM instances WHERE vmindex=?', job['vmindex'])['status'] == 'offline'
@@ -487,6 +491,175 @@ def write_journal(job, events):
     path.write_text(''.join(json.dumps(ev) + '\n' for ev in events), encoding='utf-8')
 
 
+def test_completion_marker_waits_after_two_interleaved_workers_and_full_queue(system, monkeypatch):
+    import queue
+
+    e = system
+    _, a = start_one(e)
+    second = e.store.add_target('B', now=e.clock())
+    observe(e, {'B': RoomStatus.LIVE})
+    pump(e, lambda: len(e.children) == 2 and job_status(e, e.children[-1].spec.job_id) == 'running')
+    ca, cb = e.children
+    original_put = e.scheduler._events.put_nowait
+    rejected = []
+    def put(item):
+        if isinstance(item[1], str) and item[0] == a['id'] and not rejected:
+            rejected.append(True)
+            raise queue.Full
+        original_put(item)
+    monkeypatch.setattr(e.scheduler._events, 'put_nowait', put)
+    for n in range(4001):
+        ca.emit('heartbeat', elapsed_sec=n)
+        if n % 1000 == 0:
+            cb.emit('heartbeat', elapsed_sec=n)
+    ca.emit('segment_quality_warning', segment_index=1, flag='low_frame_rate')
+    ca.exit(0, 'completed')
+    e.scheduler._collect()
+    assert job_status(e, a['id']) == 'running'
+    assert row(e, 'SELECT job_id FROM instances WHERE vmindex=?', a['vmindex'])['job_id'] == a['id']
+    for _ in range(12):
+        e.scheduler.tick()
+        if job_status(e, a['id']) == 'finished_with_warnings':
+            break
+        time.sleep(.01)
+    assert job_status(e, a['id']) == 'finished_with_warnings'
+    assert rejected == [True]
+    assert row(e, 'SELECT collection_complete FROM jobs WHERE id=?', a['id'])['collection_complete'] == 1
+    assert len(e.store.rows("SELECT id FROM events WHERE job_id=? AND kind='segment_finished'", (a['id'],))) == 1
+    b = e.store.active_job(second)
+    assert b['status'] == 'running' and json.loads(b['heartbeat_json'])['elapsed_sec'] == 4000
+
+
+def test_unlaunched_cancel_discards_late_verification_result(system, monkeypatch):
+    from concurrent.futures import Future
+    from src.orchestrator.room_query_process import QueryResult
+    e = system
+    late = Future()
+    original = e.scheduler.room_queries.submit
+    def submit(source, raw):
+        return late if source == 'verify' else original(source, raw)
+    monkeypatch.setattr(e.scheduler.room_queries, 'submit', submit)
+    target = e.store.add_target('A', now=e.clock())
+    observe(e, {'A': RoomStatus.LIVE})
+    e.scheduler.tick()
+    job = e.store.active_job(target)
+    assert job['status'] == 'starting' and job['event_log_path'] is None
+    before = row(e, 'SELECT control_revision FROM targets WHERE id=?', target)
+    e.store.enqueue_command('stop', job['id'])
+    e.scheduler.tick()
+    result = row(e, 'SELECT status,error_reason FROM jobs WHERE id=?', job['id'])
+    assert result == dict(status='cancelled', error_reason='cancelled_before_launch')
+    assert row(e, 'SELECT job_id,status FROM instances WHERE vmindex=?', job['vmindex']) == dict(
+        job_id=None, status='idle')
+    late.set_result(QueryResult(e.network.resolve('A')))
+    e.scheduler.tick()
+    assert not e.children
+    assert row(e, 'SELECT control_revision FROM targets WHERE id=?', target)['control_revision'] == before['control_revision'] + 1
+
+
+def test_reconcile_candidates_have_fixed_queries_with_disabled_history(system):
+    e = system
+    counts = []
+    for disabled_count in (1, 200):
+        with e.store.transaction() as db:
+            db.executemany("INSERT OR IGNORE INTO targets(id,raw,canonical,enabled,created_at,updated_at) "
+                           "VALUES(?,?,?,0,1,1)", ((f'x{i}',)*3 for i in range(disabled_count)))
+        statements = []
+        e.store.db.set_trace_callback(statements.append)
+        try:
+            e.scheduler._reconcile_targets()
+        finally:
+            e.store.db.set_trace_callback(None)
+        assert len(statements) == 1
+        plan = e.store.rows('EXPLAIN QUERY PLAN ' + statements[0])
+        assert any('targets_enabled' in step['detail'] for step in plan)
+        assert e.store.rows(statements[0]) == []
+        counts.append(len(statements))
+    assert counts == [1, 1]
+
+
+@pytest.mark.parametrize('issue', ['ok', 'warning', 'exit', 'empty', 'gap', 'no_stop', 'no_start', 'no_end', 'two_final'])
+def test_online_stop_and_replay_use_same_evidence_rules(tmp_path, issue):
+    from src.orchestrator.scheduler import Scheduler
+    def run(mode):
+        store = Store(tmp_path / mode / 'state.sqlite3')
+        pool = InstancePool(SimpleNamespace(list_available_instances=lambda: [
+            dict(vmindex=1, android_started=True)]))
+        network = Network()
+        scheduler = Scheduler(store, tmp_path / mode / 'out', [1], pool=pool,
+                              query_executor=ImmediateQueries(network), auto_scan=False,
+                              process_probe=lambda job: 'absent')
+        target = store.add_target('A', now=1)
+        with store.transaction() as db:
+            db.execute("UPDATE targets SET session_key='s' WHERE id=?", (target,))
+        key = store.create_pending(target, 1)
+        assert store.claim(key, 1, 1)
+        path = store.path.with_suffix('.ndjson')
+        with store.transaction() as db:
+            db.execute("UPDATE jobs SET event_log_path=? WHERE id=?", (str(path), key))
+        series = [('worker_started', {})]
+        if issue not in ('no_start','empty'):
+            series.append(('segment_started', dict(segment_index=1, file_path='raw.mp4')))
+        if issue not in ('no_end','empty'):
+            series.append(('segment_finished', dict(segment_index=1, file_path='formal.mp4', is_final=True)))
+        if issue in ('warning','gap'):
+            series.append(('segment_quality_warning', dict(segment_index=1, flag='low_frame_rate')))
+        if issue == 'two_final':
+            series.extend([('segment_started', dict(segment_index=2)),
+                           ('segment_finished', dict(segment_index=2, file_path='tail.mp4', is_final=True))])
+        if issue != 'no_stop':
+            series.append(('worker_stopped', dict(exit_code=16 if issue == 'exit' else 0, reason='fixture_stop')))
+        events = [dict(event=kind, job_id=key, run_id='fixture', event_id=f'e{seq}', event_seq=seq,
+                       timestamp=100+seq, **fields) for seq, (kind, fields) in enumerate(series, 1)]
+        if issue == 'gap':
+            events.pop(-2)
+        try:
+            if mode == 'replay':
+                write_journal({'event_log_path': str(path)}, events)
+                scheduler.reconcile(key)
+            else:
+                handle = Child(SimpleNamespace(job_id=key), None)
+                handle.events_complete, handle.code = True, 16 if issue == 'exit' else 0
+                handle.stop = handle.wait
+                scheduler._handles[key] = handle
+                for event in events:
+                    scheduler._events.put_nowait((key, event))
+                if mode == 'stop':
+                    scheduler.close()
+            deadline = time.monotonic() + 4
+            while time.monotonic() < deadline:
+                if result := store.row("SELECT status, exit_code,collection_complete,error_reason,ended_at "
+                                       "FROM jobs WHERE id=? AND ended_at IS NOT NULL", (key,)):
+                    break
+                scheduler.tick()
+                time.sleep(.01)
+            else:
+                pytest.fail('任务未结算')
+            if issue == 'no_stop':
+                result.pop('ended_at')
+            segments = store.rows("SELECT status,file_path,risk_json,is_final FROM segments ORDER BY segment_index")
+            for segment in segments:
+                segment['risk_json'] = [
+                    {name: value for name, value in record.items() if name != 'job_id'}
+                    for record in json.loads(segment['risk_json'] or '[]')
+                ]
+            return result, segments
+        finally:
+            scheduler.close()
+            store.close()
+
+    online = run('online')
+    assert online == run('replay')
+    # 空台账且明确停服时，业务规则允许尚未录到首片的正常停止。
+    if issue != 'empty':
+        assert online == run('stop')
+    outcome = online[0]
+    assert (outcome['status'], outcome['exit_code'], outcome['collection_complete']) == {
+        'ok': ('finished', 0, 1), 'warning': ('finished_with_warnings', 0, 1),
+        'exit': ('failed', 16, 1), 'empty': ('failed', 30, 1),
+    }.get(issue, ('failed', 30, 0))
+
+
 def test_reconcile_absent_process_replays_journal_and_resumes(system):
     e = system
     target, job = start_one(e)
@@ -494,13 +667,15 @@ def test_reconcile_absent_process_replays_journal_and_resumes(system):
     assert child.spec.log_path == Path(job['event_log_path']).with_suffix('.log')
     stopped_at = e.clock() - 100
     write_journal(job, [
-        dict(event='segment_started', event_id=f"{job['id']}:2", job_id=job['id'], segment_index=1, file_path=str(child.file)),
-        dict(event='segment_finished', event_id='late-1', job_id=job['id'], segment_index=1, file_path=str(child.file),
+        dict(event='segment_started', event_id=f"{job['id']}:2", job_id=job['id'], run_id=job['id'], event_seq=2,
+             segment_index=1, file_path=str(child.file)),
+        dict(event='segment_finished', event_id='late-1', job_id=job['id'], run_id=job['id'], event_seq=3, segment_index=1, file_path=str(child.file),
              duration_sec=1, file_size_mb=.01, is_final=True),
-        dict(event='worker_stopped', event_id='late-2', job_id=job['id'], reason='event_stream_lost', exit_code=0,
+        dict(event='worker_stopped', event_id='late-2', job_id=job['id'], run_id=job['id'], event_seq=4, reason='event_stream_lost', exit_code=0,
              timestamp=stopped_at)])
     e.scheduler._handles.clear()
     e.scheduler.reconcile()
+    e.scheduler.tick()
     finished = row(e, 'SELECT * FROM jobs WHERE id=?', job['id'])
     assert (finished['status'], finished['error_reason'], finished['collection_complete']) == ('finished', 'event_stream_lost', 1)
     assert finished['ended_at'] == stopped_at
@@ -530,7 +705,7 @@ def test_reconcile_waits_for_owned_old_worker_then_resumes(system):
     e.clock.advance(3)
     e.scheduler.tick()
     assert job_status(e, job['id']) == 'failed'
-    assert row(e, 'SELECT error_reason FROM jobs WHERE id=?', job['id'])['error_reason'] == 'interrupted_host_restart'
+    assert '事件日志缺失' in row(e, 'SELECT error_reason FROM jobs WHERE id=?', job['id'])['error_reason']
     e.clock.advance(5)
     observe(e, {'A': RoomStatus.LIVE})
     pump(e, lambda: len(e.children) == 2)
@@ -542,10 +717,17 @@ def test_reconcile_old_worker_not_exiting_or_unowned_needs_manual(system):
     e.scheduler._handles.clear()
     e.scheduler.process_probe = lambda record: 'alive'
     e.scheduler.reconcile()
-    e.clock.advance(121)
+    state = row(e, 'SELECT attempts,retry_at,control_revision,suppressed_session,record_session_key FROM targets WHERE id=?', target)
+    deadline = row(e, 'SELECT old_worker_deadline FROM jobs WHERE id=?', job['id'])['old_worker_deadline']
+    e.clock.advance(60)
+    e.scheduler.reconcile(job['id'])
+    assert row(e, 'SELECT old_worker_deadline FROM jobs WHERE id=?', job['id'])['old_worker_deadline'] == deadline
+    e.clock.advance(61)
     e.scheduler.tick()
     held = row(e, 'SELECT * FROM jobs WHERE id=?', job['id'])
     assert (held['status'], held['error_reason']) == ('needs_reconcile', 'old_worker_did_not_exit')
+    assert held['exit_code'] is None and held['ended_at'] is None
+    assert row(e, 'SELECT attempts,retry_at,control_revision,suppressed_session,record_session_key FROM targets WHERE id=?', target) == state
     assert row(e, 'SELECT status FROM instances WHERE vmindex=?', job['vmindex'])['status'] == 'reconcile'
     # 归属无法确认：保持人工对账，不派新任务，也不终止进程。
     e.scheduler.process_probe = lambda record: 'unknown'
@@ -558,6 +740,7 @@ def test_reconcile_old_worker_not_exiting_or_unowned_needs_manual(system):
     assert len(e.children) == 1 and e.children[0].alive
     e.scheduler.process_probe = lambda record: 'absent'
     e.scheduler.reconcile(job['id'])
+    e.scheduler.tick()
     assert job_status(e, job['id']) == 'failed'
     assert row(e, 'SELECT suppressed_session FROM targets WHERE id=?', target)['suppressed_session'] is None
 

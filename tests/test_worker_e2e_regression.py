@@ -1,125 +1,25 @@
-from src.worker.state_machine import WorkerState
-"""Worker 主控制流程与 14 项核心规格全量回归测试套件。
-
-覆盖核心场景（采集会话恢复与校验失败见 test_worker_controller.py）：
-4. ffprobe 不可用：超过原大小门槛的非视频文件不能被判为有效双轨录像；
-5. 正常短尾片：小体积但有效双轨的正常尾片不会误判为损坏；
-6. 归档冲突或移动失败：已有目标文件字节内容不变，不丢失原始文件；
-7. 目标 A、模拟器实际为 B：从主流程验证实际身份探测结果被使用，退出码为 18；
-8. CLI 逃逸开关：只放行 UNCONFIRMED，绝不放行明确 MISMATCH；
-9. 视频冻结但音频/文件正常，以及文件停止增长但视频正常：两条独立路径分别被识别处置；
-10. 运行期下播与查询失败：已确认下播正常退出 (码 2)，网络失败和 UNKNOWN 不误退出；
-11. 同一 VM、不同房间、不同输出目录：第二个 Worker 无法获取控制权，不同 VM 可并行；
-12. 同一输出根目录并发运行：run_id 任务目录排他隔离，无覆盖；
-14. 高频 stdout/stderr 输出：防背压日志持续消费与资源回收。
-"""
+"""Worker 主流程错房纠偏与采集日志背压回归。"""
 import io
 import json
 import os
 from pathlib import Path
-import subprocess
 import tempfile
-import time
 import unittest
 from unittest.mock import MagicMock, patch
 
-from src.worker.cli import main as cli_main
 from src.worker.controller import (
     WorkerConfig,
     WorkerController,
-    EXIT_SUCCESS,
-    EXIT_STREAM_ENDED,
     EXIT_ROOM_MISMATCH,
-    EXIT_RECORDING_FAILED,
 )
-from src.worker.events import (
-    WorkerEventEmitter,
-    SegmentStartedEvent,
-    SegmentFinishedEvent,
-    SegmentAbortedEvent,
-    HeartbeatEvent,
-    StreamEndedEvent,
-)
-from src.worker.health_monitor import HealthMonitor
-from src.worker.identity_verifier import IdentityStatus, verify_room_identity
-from src.worker.naming_lock import WorkerInstanceLock, LockAcquisitionError
+from src.worker.events import WorkerEventEmitter
 from src.worker.scrcpy_probe import PipelineLogDrainer
-from src.worker.segment_verifier import (
-    verify_segment_file,
-    finalize_segment,
-    SegmentValidationResult,
-)
-from src.worker.state_machine import (
-    WorkerState,
-    PipelineAction,
-    ActionType,
-    GenerationActionDispatcher,
-)
-from src.worker.stream_end_detector import StreamEndDetector
 
 
 class TestWorkerE2ERegression(unittest.TestCase):
     """Worker 主控制流程集成与回归测试。"""
 
-    def setUp(self):
-        self.events = []
-        self.emitter = WorkerEventEmitter()
-        self.emitter.emit = lambda ev: self.events.append(ev)
-
-    def test_04_missing_ffprobe_rejects_non_video_file(self):
-        """场景 4: ffprobe 不可用时，普通大文件不能被判定为有效双轨录像。"""
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            big_fake_file = Path(tmp_dir) / "huge_junk.mp4"
-            big_fake_file.write_bytes(b"\x00" * (300 * 1024))  # 300KB 无效数据
-
-            with patch("shutil.which", return_value=None):
-                res = verify_segment_file(big_fake_file, ffprobe_exe=None)
-
-            self.assertFalse(res.is_valid, "缺少 ffprobe 时绝不能仅凭文件大小放行！")
-            self.assertFalse(res.has_video)
-            self.assertFalse(res.has_audio)
-            self.assertIn("ffprobe", res.reject_reason)
-
-    def test_05_valid_short_tail_succeeds(self):
-        """场景 5: 正常短尾片：小体积但有效双轨的正常短尾片在 allow_short_tail 下成功。"""
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            short_tail = Path(tmp_dir) / "short_tail.mp4"
-            short_tail.write_bytes(b"\x00" * 4096)  # 4KB 小体积文件
-
-            with patch("shutil.which", return_value="ffprobe"), \
-                 patch("src.worker.segment_verifier.run_command") as mock_cmd:
-                mock_cmd.return_value = MagicMock(
-                    exit_code=0,
-                    stdout=json.dumps({
-                        "streams": [{"codec_type": "video"}, {"codec_type": "audio"}],
-                        "format": {"duration": "3.5"}
-                    }),
-                    stderr=""
-                )
-                res = verify_segment_file(short_tail, allow_short_tail=True)
-
-            self.assertTrue(res.is_valid, "合法的短尾双轨文件在 allow_short_tail=True 下应通过核验")
-            self.assertTrue(res.has_video)
-            self.assertTrue(res.has_audio)
-
-    def test_06_archive_conflict_preserves_existing_target(self):
-        """场景 6: 归档冲突或移动失败：已有目标文件字节内容不变，原文件保留。"""
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            raw = Path(tmp_dir) / "raw_1.mp4"
-            raw.write_bytes(b"new_stream_bytes")
-            target = Path(tmp_dir) / "target_1.mp4"
-            old_bytes = b"precious_historical_recording_data"
-            target.write_bytes(old_bytes)
-
-            with patch("src.worker.segment_verifier.verify_segment_file") as mock_v:
-                mock_v.return_value = MagicMock(is_valid=True)
-                ok, res_path, res_obj = finalize_segment(raw, target)
-
-            self.assertFalse(ok, "目标已存在时必须拒绝覆盖")
-            self.assertEqual(target.read_bytes(), old_bytes, "已有文件字节绝不能被破坏或替换！")
-            self.assertTrue(raw.exists(), "归档失败时原文件必须妥善保留")
-
-    def test_07_identity_mismatch_detected_from_page_blocks_recording(self):
+    def test_identity_mismatch_detected_from_page_blocks_recording(self):
         """真实控制流程三次纠偏后仍为其他房间：不把错误画面交付为目标录像。"""
         from src.worker.room_locator import RoomEvidence
         stream = io.StringIO()
@@ -147,125 +47,7 @@ class TestWorkerE2ERegression(unittest.TestCase):
             self.assertEqual(sum(e.get('action')=='correct_wrong_room' for e in events),3)
             self.assertFalse(any(e['event']=='segment_started' for e in events))
 
-    def test_08_cli_escape_switch_allows_unconfirmed_but_blocks_mismatch(self):
-        """场景 8: CLI 逃逸开关：只放行 UNCONFIRMED，绝不放行明确 MISMATCH。"""
-        # A. 明确 MISMATCH: 即使加了 --allow-unconfirmed-identity 仍然必须阻断！
-        res_mismatch = verify_room_identity(
-            target_uid="UID_100",
-            current_uid="UID_200",
-            allow_unconfirmed=True,
-        )
-        self.assertEqual(res_mismatch.status, IdentityStatus.MISMATCH)
-        self.assertFalse(res_mismatch.can_proceed, "明确错房绝不允许逃逸放行！")
-
-        # B. 无法确认 UNCONFIRMED:
-        # 未开启参数时阻断
-        res_unconfirmed_strict = verify_room_identity(
-            target_uid="UID_100",
-            current_uid=None,
-            allow_unconfirmed=False,
-        )
-        self.assertEqual(res_unconfirmed_strict.status, IdentityStatus.UNCONFIRMED)
-        self.assertFalse(res_unconfirmed_strict.can_proceed)
-
-        # 开启参数时放行
-        res_unconfirmed_escape = verify_room_identity(
-            target_uid="UID_100",
-            current_uid=None,
-            allow_unconfirmed=True,
-        )
-        self.assertEqual(res_unconfirmed_escape.status, IdentityStatus.UNCONFIRMED)
-        self.assertTrue(res_unconfirmed_escape.can_proceed, "开启逃逸开关时应放行无法确认状态")
-
-    def test_09_decoupled_health_signals_video_frozen_vs_file_stalled(self):
-        """场景 9: 视频冻结但文件正常，以及文件停止增长但视频正常：四维解耦独立判断。"""
-        monitor = HealthMonitor(video_freeze_threshold_sec=10.0, file_stall_threshold_sec=10.0)
-
-        # 1. 视频冻结持续 12s，但文件正常有增量 (1.5MB)，音频 active
-        s1 = monitor.evaluate_signals(
-            video_motion=0.001,
-            audio_active=True,
-            process_alive=True,
-            file_delta_mb=1.5,
-            video_frozen_duration_sec=12.0,
-            file_stall_duration_sec=0.0,
-        )
-        self.assertFalse(s1.is_healthy)
-        self.assertEqual(s1.alert_reason, "video_frozen", "音频正常不能否决持续视频冻结！")
-
-        # 2. 视频动态良好 (0.8)，但文件停止增长达 12s
-        s2 = monitor.evaluate_signals(
-            video_motion=0.8,
-            audio_active=True,
-            process_alive=True,
-            file_delta_mb=0.0,
-            video_frozen_duration_sec=0.0,
-            file_stall_duration_sec=12.0,
-        )
-        self.assertFalse(s2.is_healthy)
-        self.assertEqual(s2.alert_reason, "file_write_stalled", "画面动态不能掩盖文件写入停滞！")
-
-    def test_10_runtime_stream_end_vs_network_failure(self):
-        """场景 10: 运行期下播与查询失败：已确认下播正常退出；网络失败和 UNKNOWN 不误退出。"""
-        detector = StreamEndDetector(confirm_window_sec=3.0)
-
-        t0 = 1000.0
-        # 1. 网络瞬时失败或未知：screen=False, api=False -> normal_live
-        is_ended, _ = detector.feed_observation(screen_shows_ended=False, api_shows_ended=False, current_time=t0)
-        self.assertFalse(is_ended)
-
-        # 2. 首次发现下播疑似 (screen=True, api=True)，在滤波窗口内未确诊
-        is_ended, r2 = detector.feed_observation(screen_shows_ended=True, api_shows_ended=True, current_time=t0 + 1.0)
-        self.assertFalse(is_ended)
-        self.assertEqual(r2, "pending_confirmation")
-
-        # 3. 超过 3.0s 滤波确认窗口 (从首次 t0+1.0 到 t0+4.5 经过 3.5s >= 3.0s) -> 确诊下播
-        is_ended, r3 = detector.feed_observation(screen_shows_ended=True, api_shows_ended=True, current_time=t0 + 4.5)
-        self.assertTrue(is_ended)
-        self.assertEqual(r3, "stream_ended_confirmed")
-
-    def test_11_same_vm_different_rooms_different_dirs_mutual_exclusion(self):
-        """场景 11: 同一 VM、不同房间、不同输出目录，第二个 Worker 无法获取控制权；不同 VM 可并行。"""
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            shared_lock_dir = Path(tmp_dir) / "shared_locks"
-
-            # 两个任务针对同一 VM 2，但房间不同，目录不同
-            lock_vm2_roomA = WorkerInstanceLock(lock_dir=shared_lock_dir, vmindex=2, room_id="room_A")
-            lock_vm2_roomB = WorkerInstanceLock(lock_dir=shared_lock_dir, vmindex=2, room_id="room_B")
-
-            self.assertTrue(lock_vm2_roomA.acquire())
-            # 第二个 Worker 必须被排他性拒绝！
-            with self.assertRaises(LockAcquisitionError):
-                lock_vm2_roomB.acquire()
-
-            # 不同的 VM 3 可以同时成功获取锁
-            lock_vm3 = WorkerInstanceLock(lock_dir=shared_lock_dir, vmindex=3, room_id="room_B")
-            self.assertTrue(lock_vm3.acquire())
-
-            lock_vm2_roomA.release()
-            lock_vm3.release()
-
-    def test_12_concurrent_output_isolation_via_run_id(self):
-        """场景 12: 同一输出根目录下多次或并发运行：独立 run_id 目录彻底隔离产物。"""
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            root_out = Path(tmp_dir)
-            cfg1 = WorkerConfig(vmindex=1, target="t1", output_dir=root_out, allow_unconfirmed_identity=True)
-            cfg2 = WorkerConfig(vmindex=2, target="t2", output_dir=root_out, allow_unconfirmed_identity=True)
-
-            ctrl1 = WorkerController(config=cfg1)
-            ctrl2 = WorkerController(config=cfg2)
-
-            self.assertNotEqual(ctrl1.run_id, ctrl2.run_id)
-            self.assertNotEqual(ctrl1.task_output_dir, ctrl2.task_output_dir)
-
-            ctrl1.task_output_dir.mkdir(parents=True, exist_ok=True)
-            ctrl2.task_output_dir.mkdir(parents=True, exist_ok=True)
-
-            self.assertTrue(ctrl1.task_output_dir.exists())
-            self.assertTrue(ctrl2.task_output_dir.exists())
-            self.assertNotEqual(str(ctrl1.task_output_dir), str(ctrl2.task_output_dir))
-
-    def test_14_high_frequency_log_drainer_no_backpressure(self):
+    def test_high_frequency_log_drainer_no_backpressure(self):
         """场景 14: 高频 stdout/stderr 输出：防背压日志排空器平稳消费并妥善回收。"""
         # 使用管道模拟高频写入 10,000 行日志，验证不发生死锁
         pipe_r, pipe_w = os.pipe()

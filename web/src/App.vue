@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { fmtTime } from './format'
 import { isActiveOperation } from './commands'
 import { useMobile } from './mobile'
-import { canControl, connection, pageError, startPolling } from './poller'
+import { canControl, connection, pageError, startPolling, stopPolling } from './poller'
 import { ops } from './operations'
 import OperationsDrawer from './components/OperationsDrawer.vue'
 
@@ -37,6 +37,10 @@ const serviceWarning = computed(() => {
 })
 
 onMounted(startPolling)
+onUnmounted(() => {
+  ops.dispose()
+  stopPolling()
+})
 </script>
 
 <template>

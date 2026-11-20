@@ -1,5 +1,6 @@
 """固定媒体工具的部署边界与设备操作前失败行为。"""
 import io
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -58,15 +59,22 @@ def test_invalid_pair_is_not_replaced_from_path(monkeypatch, tmp_path, problem):
         DependencyManager(ffmpeg_dir=directory).get_media_tools()
 
 
-def test_media_failure_does_not_start_device(monkeypatch, tmp_path):
+def test_missing_fixed_ffprobe_stops_at_real_dependency_gate(monkeypatch, tmp_path):
     from src.worker import controller as module
     from src.worker.controller import WorkerConfig, WorkerController
     from src.worker.events import WorkerEventEmitter
-    dependency = SimpleNamespace(get_media_tools=Mock(side_effect=RuntimeError('固定工具版本不符')))
+    directory = installed(tmp_path)
+    (directory / 'bin' / 'ffprobe.exe').unlink()
+    dependency = DependencyManager(ffmpeg_dir=directory)
+    monkeypatch.setattr('src.mvp.dep_manager.run_client', version_result)
     monkeypatch.setattr(module, 'DependencyManager', lambda: dependency)
     device = Mock()
     monkeypatch.setattr(module, 'MuMuClient', device)
     config = WorkerConfig(vmindex=321, target='123', target_kind='room_id', expected_anchor_uid='456', output_dir=tmp_path/'out', lock_dir=tmp_path/'locks')
-    worker = WorkerController(config, WorkerEventEmitter(io.StringIO()))
+    stream = io.StringIO()
+    worker = WorkerController(config, WorkerEventEmitter(stream))
     assert worker.run() != 0
     device.assert_not_called()
+    stopped = json.loads(stream.getvalue().splitlines()[-1])
+    assert stopped['event'] == 'worker_stopped'
+    assert '固定媒体工具' in stopped['reason'] and 'ffprobe.exe' in stopped['reason']

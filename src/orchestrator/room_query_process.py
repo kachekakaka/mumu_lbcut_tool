@@ -1,6 +1,5 @@
 """有界外网查询进程。阻塞 IPC 只在自有线程中执行，独立监控负责期限和回收。"""
 from concurrent.futures import Future
-import ctypes
 from dataclasses import asdict, dataclass
 import json
 import os
@@ -11,51 +10,10 @@ import threading
 import time
 
 from src.mvp.room_resolver import ResolvedRoom, RoomResolver, RoomStatus
+from src.mvp.windows_job import WindowsJob, close_process_handle
 
 MAX_MESSAGE = 65536
 CAPACITY = {"scan": 5, "verify": 1, "manual": 2, "login": 1}
-
-
-class QueryJob:
-    """只收纳查询子进程；句柄不继承，不包含录制 Worker。"""
-    def __init__(self):
-        self.handle = None
-        if os.name != "nt":
-            return
-        from ctypes import wintypes as w
-        class Basic(ctypes.Structure):
-            _fields_ = [("process_time", ctypes.c_int64), ("job_time", ctypes.c_int64),
-                        ("flags", w.DWORD), ("min_ws", ctypes.c_size_t), ("max_ws", ctypes.c_size_t),
-                        ("active", w.DWORD), ("affinity", ctypes.c_size_t), ("priority", w.DWORD), ("scheduling", w.DWORD)]
-        class IO(ctypes.Structure):
-            _fields_ = [(name, ctypes.c_uint64) for name in ("r", "w", "o", "rb", "wb", "ob")]
-        class Extended(ctypes.Structure):
-            _fields_ = [("basic", Basic), ("io", IO), ("process_mem", ctypes.c_size_t),
-                        ("job_mem", ctypes.c_size_t), ("peak_process", ctypes.c_size_t), ("peak_job", ctypes.c_size_t)]
-        self.api = ctypes.WinDLL("kernel32", use_last_error=True)
-        self.api.CreateJobObjectW.argtypes = [ctypes.c_void_p, w.LPCWSTR]
-        self.api.CreateJobObjectW.restype = w.HANDLE
-        self.api.SetInformationJobObject.argtypes = [w.HANDLE, ctypes.c_int, ctypes.c_void_p, w.DWORD]
-        self.api.AssignProcessToJobObject.argtypes = [w.HANDLE, w.HANDLE]
-        self.api.CloseHandle.argtypes = [w.HANDLE]
-        self.handle = self.api.CreateJobObjectW(None, None)
-        if not self.handle:
-            raise ctypes.WinError(ctypes.get_last_error())
-        info = Extended()
-        info.basic.flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        if not self.api.SetInformationJobObject(self.handle, 9, ctypes.byref(info), ctypes.sizeof(info)):
-            error = ctypes.WinError(ctypes.get_last_error())
-            self.close()
-            raise error
-
-    def assign(self, proc):
-        if self.handle and not self.api.AssignProcessToJobObject(self.handle, int(proc._handle)):
-            raise ctypes.WinError(ctypes.get_last_error())
-
-    def close(self):
-        if self.handle:
-            self.api.CloseHandle(self.handle)
-            self.handle = None
 
 
 @dataclass
@@ -72,16 +30,19 @@ class Slot:
         self.future = None
         self.deadline = 0.0
         self.expired_at = None
+        self.raw = None
 
 
 class QueryProcesses:
     def __init__(self, timeout=30.0, reclaim_timeout=5.0, child_command=None):
         self.timeout, self.reclaim_timeout = timeout, reclaim_timeout
         self.command = child_command or [sys.executable, "-m", "src.orchestrator.room_query_process"]
-        self.job = QueryJob()
+        self.job = WindowsJob()
         self.slots = [Slot(source) for source, count in CAPACITY.items() for _ in range(count)]
         self.lock = threading.RLock()
         self.closing = threading.Event()
+        self.close_lock = threading.Lock()
+        self.close_deadline = None
         self.fatal_error = None
         self.monitor = threading.Thread(target=self._monitor, name="room-query-monitor", daemon=True)
         self.monitor.start()
@@ -97,6 +58,7 @@ class QueryProcesses:
                 return None
             slot = next(s for s in self.slots if s.source == source and s.future is None)
             future = slot.future = Future()
+            slot.raw = raw
             slot.deadline, slot.expired_at = time.monotonic() + self.timeout, None
             slot.thread = threading.Thread(target=self._exchange, args=(slot, raw), name="room-query-ipc", daemon=True)
             slot.thread.start()
@@ -150,16 +112,17 @@ class QueryProcesses:
         finally:
             with self.lock:
                 discard = broken or slot.expired_at is not None or self.closing.is_set()
-                if discard:
-                    self._kill(slot)
-            if discard and slot.proc is not None:
+                proc = slot.proc if discard else None
+                deadline = self.close_deadline or (time.monotonic() + self.reclaim_timeout)
+            if proc is not None:
                 try:
-                    slot.proc.wait(timeout=self.reclaim_timeout)
-                    slot.proc.stdin.close()
-                    slot.proc.stdout.close()
-                    slot.proc = None
+                    self._kill(slot)
+                    self._reap(proc, deadline)
                 except Exception as exc:
-                    self.fatal_error = f"查询进程回收失败: {exc}"
+                    self.fatal_error = f"查询进程回收失败（{slot.source}）: {exc}"
+                else:
+                    with self.lock:
+                        slot.proc = None
             with self.lock:
                 if not slot.future.done():
                     if slot.expired_at is not None:
@@ -178,7 +141,7 @@ class QueryProcesses:
                         continue
                     if not slot.thread.is_alive():
                         slot.thread.join()
-                        slot.thread, slot.future = None, None
+                        slot.thread, slot.future, slot.raw = None, None, None
                         continue
                     if now >= slot.deadline:
                         slot.expired_at = slot.expired_at or now
@@ -189,29 +152,62 @@ class QueryProcesses:
                         if now - slot.expired_at > self.reclaim_timeout:
                             self.fatal_error = "查询进程或 IPC 线程未在回收预算内退出"
 
+    @staticmethod
+    def _reap(proc, deadline):
+        proc.wait(timeout=max(0, deadline - time.monotonic()))
+        try:
+            proc.stdin.close()
+        finally:
+            proc.stdout.close()
+            close_process_handle(proc)
+
     def close(self):
-        deadline = time.monotonic() + self.reclaim_timeout
-        self.closing.set()
-        with self.lock:
-            for slot in self.slots:
-                self._kill(slot)
-        for slot in self.slots:
-            if slot.thread:
-                slot.thread.join(max(0, deadline - time.monotonic()))
-            if slot.proc:
-                self._kill(slot)
-                try:
-                    slot.proc.wait(timeout=max(0, deadline - time.monotonic()))
-                    slot.proc.stdin.close()
-                    slot.proc.stdout.close()
-                except subprocess.TimeoutExpired:
-                    self.fatal_error = "查询关闭超过共用回收预算"
-        self.monitor.join(max(0, deadline - time.monotonic()))
-        self.job.close()
-        if any(s.thread and s.thread.is_alive() for s in self.slots):
-            self.fatal_error = "查询 IPC 线程关闭超过共用回收预算"
-        if self.fatal_error:
-            raise RuntimeError(self.fatal_error)
+        with self.close_lock:
+            if self.closing.is_set():
+                return
+            deadline = time.monotonic() + self.reclaim_timeout
+            errors = [self.fatal_error] if self.fatal_error else []
+            try:
+                with self.lock:
+                    self.close_deadline = deadline
+                    self.closing.set()
+                    for slot in self.slots:
+                        try:
+                            self._kill(slot)
+                        except Exception as exc:
+                            errors.append(f"通知 {slot.source} 查询终止失败: {exc}")
+                for slot in self.slots:
+                    with self.lock:
+                        thread = slot.thread
+                    if thread:
+                        thread.join(max(0, deadline - time.monotonic()))
+                        if thread.is_alive():
+                            errors.append(f"{slot.source} 查询 IPC 线程超过共用回收预算")
+                            with self.lock:
+                                if not slot.future.done():
+                                    slot.future.set_result(QueryResult(
+                                        ResolvedRoom(slot.raw, RoomStatus.UNKNOWN), "service_interrupted"))
+                            continue
+                    with self.lock:
+                        proc = slot.proc
+                        slot.thread, slot.future, slot.raw = None, None, None
+                    if proc is not None:
+                        try:
+                            self._reap(proc, deadline)
+                        except Exception as exc:
+                            errors.append(f"{slot.source} 空闲查询进程回收失败: {exc}")
+                        else:
+                            with self.lock:
+                                slot.proc = None
+                self.monitor.join(max(0, deadline - time.monotonic()))
+                if self.monitor.is_alive():
+                    errors.append("查询监控线程超过共用回收预算")
+            finally:
+                self.job.close()
+            if self.fatal_error and self.fatal_error not in errors:
+                errors.append(self.fatal_error)
+            if errors:
+                raise RuntimeError("；".join(errors))
 
 
 def child_main():

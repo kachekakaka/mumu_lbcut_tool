@@ -30,7 +30,7 @@ export type Sender = (requestId: string) => Promise<Receipt>
 export type DoneCallback = (op: Operation) => void
 
 export interface OperationDeps {
-  getCommand: (commandId: string) => Promise<Command>
+  getCommand: (commandId: string, signal: AbortSignal) => Promise<Command>
   newId: () => string
   refresh: () => void
   sleep?: (ms: number) => Promise<void>
@@ -47,40 +47,69 @@ export const isActiveOperation = (op: Operation) => ACTIVE.includes(op.state)
 export function createOperations(deps: OperationDeps) {
   const list = reactive<Operation[]>([])
   const senders = new Map<number, Sender>()
-  const callbacks = new Map<number, DoneCallback>()
-  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
+  const callbacks = new Map<number, { run: DoneCallback; owner?: symbol }>()
+  const tracking = new Map<number, AbortController>()
   const pollMs = deps.pollMs ?? 1000
   let seq = 0
 
-  function finish(op: Operation) {
-    deps.refresh()
-    deps.notify?.(op)
-    callbacks.get(op.seq)?.(op)
+  function release(op: Operation) {
+    tracking.get(op.seq)?.abort()
+    tracking.delete(op.seq)
+    senders.delete(op.seq)
+    callbacks.delete(op.seq)
   }
 
-  async function follow(op: Operation) {
-    while (op.commandId) {
+  function finish(op: Operation) {
+    const callback = callbacks.get(op.seq)
+    release(op)
+    let count = 0
+    for (let i = 0; i < list.length; i++) {
+      if (!tracking.has(list[i].seq) && ++count > 30) list.splice(i--, 1)
+    }
+    deps.refresh()
+    deps.notify?.(op)
+    callback?.run(op)
+  }
+
+  function sleep(ms: number, signal: AbortSignal) {
+    if (deps.sleep) return deps.sleep(ms)
+    return new Promise<void>((resolve) => {
+      const complete = () => {
+        clearTimeout(timer)
+        signal.removeEventListener('abort', complete)
+        resolve()
+      }
+      const timer = setTimeout(complete, ms)
+      signal.addEventListener('abort', complete, { once: true })
+    })
+  }
+
+  async function follow(op: Operation, signal: AbortSignal) {
+    while (op.commandId && !signal.aborted) {
       try {
-        const command = await deps.getCommand(op.commandId)
+        const command = await deps.getCommand(op.commandId, signal)
+        if (signal.aborted) return
         op.command = command
         op.state = command.status
         op.followError = false
         if (!FOLLOWING.includes(command.status)) break
       } catch (error) {
+        if (signal.aborted) return
         if (error instanceof ApiError && error.code === 'command_not_found') {
           op.state = 'unknown'
           op.errorCode = error.code
           op.errorMessage = error.message
-          break
+          return
         }
         op.followError = true
       }
-      await sleep(op.followError ? pollMs * 2 : pollMs)
+      await sleep(op.followError ? pollMs * 2 : pollMs, signal)
     }
-    finish(op)
+    if (!signal.aborted) finish(op)
   }
 
   async function submit(op: Operation) {
+    const controller = tracking.get(op.seq)!
     op.state = 'submitting'
     op.errorCode = null
     op.errorMessage = null
@@ -88,6 +117,7 @@ export function createOperations(deps: OperationDeps) {
     try {
       receipt = await senders.get(op.seq)!(op.requestId)
     } catch (error) {
+      if (controller.signal.aborted) return
       if (error instanceof ApiError && error.code !== 'network_error') {
         op.state = 'rejected'
         op.errorCode = error.code
@@ -98,26 +128,26 @@ export function createOperations(deps: OperationDeps) {
         op.errorCode = 'network_error'
         op.errorMessage = '网络中断，无法确认是否已提交'
       }
-      finish(op)
+      if (op.state === 'rejected') finish(op)
+      else deps.notify?.(op)
       return
     }
+    if (controller.signal.aborted) return
+    senders.delete(op.seq)
     op.commandId = receipt.command_id
     op.state = receipt.status
-    await follow(op)
+    await follow(op, controller.signal)
   }
 
-  function start(kind: string, subject: string, title: string, send: Sender, onDone?: DoneCallback): Operation {
+  function start(kind: string, subject: string, title: string, send: Sender, onDone?: DoneCallback, owner?: symbol): Operation {
     list.unshift({
       seq: ++seq, kind, subject, title, requestId: deps.newId(), state: 'submitting', commandId: null, command: null,
       errorCode: null, errorMessage: null, createdAt: (deps.now ?? Date.now)() / 1000, followError: false,
     })
     const op = list[0]
+    tracking.set(op.seq, new AbortController())
     senders.set(op.seq, send)
-    if (onDone) callbacks.set(op.seq, onDone)
-    for (const old of list.splice(30)) {
-      senders.delete(old.seq)
-      callbacks.delete(old.seq)
-    }
+    if (onDone) callbacks.set(op.seq, { run: onDone, owner })
     void submit(op)
     return op
   }
@@ -133,7 +163,25 @@ export function createOperations(deps: OperationDeps) {
     return list.some((op) => op.subject === subject && (!kind || op.kind === kind) && isActiveOperation(op))
   }
 
-  return { list, start, retry, busy }
+  function endTracking(op: Operation) {
+    if (op.state !== 'unknown' && !op.followError) return
+    release(op)
+    const index = list.findIndex((item) => item.seq === op.seq)
+    if (index >= 0) list.splice(index, 1)
+  }
+
+  function detachOwner(owner: symbol) {
+    for (const [seq, callback] of callbacks) {
+      if (callback.owner === owner) callbacks.delete(seq)
+    }
+  }
+
+  function dispose() {
+    for (const op of list) release(op)
+    list.splice(0)
+  }
+
+  return { list, start, retry, busy, endTracking, detachOwner, dispose }
 }
 
 export type Level = 'success' | 'info' | 'warning' | 'error'

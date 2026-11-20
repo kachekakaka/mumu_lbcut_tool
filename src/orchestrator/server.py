@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 import ipaddress
 import logging
+import sqlite3
 from pathlib import Path
 import signal
 import socket
@@ -97,10 +98,15 @@ class Runtime:
         finally:
             self.request_close()
             self.ready.set()
-            self.on_exit()
             try:
-                if self.scheduler:
-                    self.scheduler.close()
+                try:
+                    self.on_exit()
+                finally:
+                    if self.scheduler:
+                        if isinstance(self.failure, sqlite3.Error):
+                            self.scheduler.close(preserve_ledger=True)
+                        else:
+                            self.scheduler.close()
             except BaseException as exc:
                 self.failure = self.failure or exc
                 logger.exception("调度收尾失败")
@@ -146,7 +152,10 @@ def create_app(config, runtime=None):
             await asyncio.to_thread(runtime.start)
             yield
         finally:
-            await asyncio.to_thread(runtime.close)
+            try:
+                await app.state.finish_login_actions()
+            finally:
+                await asyncio.to_thread(runtime.close)
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.runtime = runtime

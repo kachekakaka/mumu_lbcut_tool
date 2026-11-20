@@ -179,6 +179,7 @@ def test_adb_device_client_cwd(fake_mumu_env):
     captured_cmds = []
 
     def mock_run_cmd(cmd, timeout=None, check=False, cwd=None, env=None, kill_tree_on_timeout=True):
+        assert not kill_tree_on_timeout
         captured_cmds.append((list(cmd), cwd))
         from src.worker.executor import CommandResult
         return CommandResult(exit_code=0, stdout="device\n", stderr="", duration=0.01)
@@ -195,12 +196,13 @@ def test_adb_device_client_cwd(fake_mumu_env):
         assert connect_call[1] == adb_exe.parent
 
     # 验证通用执行器 run_command 的默认 cwd 仍为 None，未被全局篡改
-    with patch("subprocess.Popen") as mock_popen:
+    with patch("subprocess.Popen") as mock_popen, \
+         patch("src.worker.executor.read_windows_output", return_value=(b"ok", b"")):
         mock_proc = MagicMock()
         mock_proc.communicate.return_value = (b"ok", b"")
         mock_proc.returncode = 0
         mock_popen.return_value = mock_proc
-        run_command(["cmd.exe", "/c", "echo", "test"])
+        run_command(["cmd.exe", "/c", "echo", "test"], kill_tree_on_timeout=False)
         assert mock_popen.call_args[1]["cwd"] is None
 
     assert os.getcwd() == orig_cwd
@@ -330,15 +332,15 @@ def test_continuous_pipeline_scrcpy_cwd_and_env(fake_mumu_env, tmp_path):
         mock_p.stdout.readline.return_value = b""
         return mock_p
 
-    frag = MagicMock()
-    frag.path.exists.return_value = True
-    frag.path.stat.return_value.st_size = 2048
+    def media_arrived():
+        (pipe.directory / 'part_000001.mp4').write_bytes(b'x' * 2048)
+        return True
+    pipe.wait_hook = media_arrived
 
     with patch("subprocess.Popen", side_effect=mock_popen), \
          patch("src.worker.continuous_pipeline.NamedPipeBridge"), \
          patch("src.worker.continuous_pipeline.StreamMonitor"), \
          patch("src.worker.continuous_pipeline.PipelineLogDrainer"), \
-         patch.object(pipe, "fragments", return_value=[frag]), \
          patch.object(pipe, "is_recording", return_value=True):
         pipe.start(timeout_sec=0.1)
 

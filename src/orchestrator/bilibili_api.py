@@ -28,6 +28,10 @@ from .upload_core_runtime import CoreRuntime
 BASE = "/api/v1/bilibili"
 
 
+class LoginAbandoned(Exception):
+    """调用方离开，日志仍由本服务收尾。"""
+
+
 class Settings(DTO):
     python: str
     data_dir: str
@@ -59,6 +63,18 @@ def install_accounts(app, config, runtime=None):
     tokens = {}
     limit = asyncio.Semaphore(12)
     requested_deployment = ContextVar("account_deployment", default=None)
+    active_actions = {}
+    accepting_actions = True
+    uploads = None
+
+    async def finish_actions():
+        nonlocal accepting_actions
+        accepting_actions = False
+        await asyncio.gather(*active_actions.values(), return_exceptions=True)
+        if uploads:
+            await uploads.finish_cleanups()
+
+    app.state.finish_login_actions = finish_actions
 
     @app.middleware("http")
     async def protect(req, handler):
@@ -241,35 +257,50 @@ def install_accounts(app, config, runtime=None):
         )
         return Response(image, media_type="image/png")
 
-    @router.post("/operations")
-    async def action(req: Request, op: Action):
+    async def run_action(op, key, s, cancelled):
         target = op.target
-        if (target or op.action != "create") and not re.fullmatch(
-            r"[\w-]{1,128}", target or "", re.ASCII
-        ):
-            raise BridgeError("invalid_target", "账号或会话标识无效", 422)
-        s = await bound(op.deployment)
         path, body = PREFIX, {"platform": "bilibili", "account_id": target}
         if op.action != "create":
             path, body = f"{PREFIX}/{target}/{op.action}", {}
-        key = req.state.key
-        # 发送权登记后立即进入异常收尾区，避免中途取消留下本进程仍持有的发送权。
-        row, retry = store.begin(op.deployment, key, op.action, target)
+        row, retry = await asyncio.to_thread(store.begin, op.deployment, key, op.action, target)
         if "status" in row:
             return {k: row[k] for k in ("key", "session", "status", "error")}
+
+        async def remote(*args, **kwargs):
+            if cancelled.is_set():
+                raise LoginAbandoned
+            call_task = asyncio.create_task(call(*args, **kwargs))
+            cancel_task = asyncio.create_task(cancelled.wait())
+            try:
+                await asyncio.wait((call_task, cancel_task), return_when=asyncio.FIRST_COMPLETED)
+                if call_task.done():
+                    return call_task.result()
+                raise LoginAbandoned
+            finally:
+                cancel_task.cancel()
+                if not call_task.done():
+                    call_task.cancel()
+                    await asyncio.gather(call_task, return_exceptions=True)
+
+        sent = False
         try:
+            if cancelled.is_set():
+                raise LoginAbandoned
             if op.action == "create" and not s["available"]:
                 raise BridgeError(
                     "engine_interaction_incompatible", "当前引擎暂不能创建扫码会话"
                 )
             if op.action != "create" and not retry:
                 current = session_view(
-                    await call(s["port"], f"{PREFIX}/{target}"), target
+                    await remote(s["port"], f"{PREFIX}/{target}"), target
                 )
                 if not current["can_" + op.action]:
                     raise BridgeError("action_unavailable", "当前会话不能执行此操作")
+            if cancelled.is_set():
+                raise LoginAbandoned
+            sent = True
             view = session_view(
-                await call(s["port"], path, body=body, key=key),
+                await remote(s["port"], path, body=body, key=key),
                 target if op.action != "create" else None,
             )
             sid = view["session_id"]
@@ -281,7 +312,10 @@ def install_accounts(app, config, runtime=None):
             if view["outcome"]:
                 await asyncio.to_thread(store.terminal, op.deployment, sid)
             return {"key": key, "status": status_value, "session": sid}
-        except BaseException as exc:
+        except LoginAbandoned:
+            await asyncio.to_thread(store.finish, key, "unknown" if sent or retry else "not_sent",
+                                    error="unknown" if sent or retry else None)
+        except Exception as exc:
             code = exc.code if isinstance(exc, BridgeError) else "unknown"
             rejected = not retry and code in (
                 "action_unavailable",
@@ -291,11 +325,49 @@ def install_accounts(app, config, runtime=None):
                 "login_finalizing",
                 "login_session_not_found",
             )
-            store.finish(key, "rejected" if rejected else "unknown", error=code)
+            await asyncio.to_thread(store.finish, key, "rejected" if rejected else "unknown", error=code)
             raise
+
+    @router.post("/operations")
+    async def action(req: Request, op: Action):
+        target = op.target
+        if (target or op.action != "create") and not re.fullmatch(
+            r"[\w-]{1,128}", target or "", re.ASCII
+        ):
+            raise BridgeError("invalid_target", "账号或会话标识无效", 422)
+        s = await bound(op.deployment)
+        key = req.state.key
+        while key in active_actions:
+            previous = active_actions[key]
+            await asyncio.gather(asyncio.shield(previous), return_exceptions=True)
+        if not accepting_actions:
+            raise BridgeError("service_unavailable", "本机账号服务正在关闭", 503)
+        cancelled = asyncio.Event()
+        task = active_actions[key] = asyncio.create_task(run_action(op, key, s, cancelled))
+
+        def settled(done):
+            if active_actions.get(key) is done:
+                active_actions.pop(key)
+            if not done.cancelled():
+                done.exception()
+
+        task.add_done_callback(settled)
+        async def watch_disconnect():
+            while (await req.receive())["type"] != "http.disconnect":
+                pass
+            cancelled.set()
+        disconnect = asyncio.create_task(watch_disconnect())
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        finally:
+            disconnect.cancel()
+            await asyncio.gather(disconnect, return_exceptions=True)
 
     if runtime is not None:
         from .segment_upload_api import install_segment_uploads
 
-        install_segment_uploads(router, config, runtime, core)
+        uploads = install_segment_uploads(router, config, runtime, core)
     app.include_router(router)

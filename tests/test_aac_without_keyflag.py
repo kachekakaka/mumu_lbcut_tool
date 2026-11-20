@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -79,19 +80,42 @@ data=pathlib.Path(sys.argv[1]).read_bytes()
 with open(sys.argv[2],'wb',buffering=0) as out:
     for offset in range(0,len(data),1024):
         out.write(data[offset:offset+1024])
-        time.sleep(9*min(1024,len(data)-offset)/len(data))
+        time.sleep(float(sys.argv[3])*min(1024,len(data)-offset)/len(data))
 ''', encoding='utf-8')
-    def producer(pipe, directory):
-        return subprocess.Popen([sys.executable, str(script), str(source), pipe], stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True, encoding='utf-8', creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+    def producer_for(path, seconds):
+        def launch(pipe, directory):
+            return subprocess.Popen([sys.executable, str(script), str(path), pipe, str(seconds)], stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, encoding='utf-8', creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+        return launch
     pipeline = ContinuousPipeline('synthetic', tmp_path/'recordings', Path('scrcpy.exe'), Path('adb.exe'),
-                                  2, ffmpeg_exe=media_tools.ffmpeg, producer_factory=producer)
+                                  2, ffmpeg_exe=media_tools.ffmpeg, producer_factory=producer_for(source, 9))
+    release = threading.Event()
+    entering = threading.Event()
     try:
         pipeline.start()
+        initial = pipeline.monitor.analyzer
+        spawn = pipeline.monitor.analyzer_factory
+        def slow_start():
+            entering.set()
+            assert release.wait(5)
+            return spawn()
+        pipeline.monitor.analyzer_factory = slow_start
+        initial.fail('测试分析进程重启')
+        assert entering.wait(4)
+        forwarded = pipeline.bridge.bytes_forwarded
+        deadline = time.monotonic() + 1
+        time.sleep(.25)
+        while pipeline.bridge.bytes_forwarded <= forwarded and time.monotonic() < deadline:
+            time.sleep(.01)
+        assert pipeline.bridge.bytes_forwarded > forwarded
+        assert pipeline.monitor.analyzer is None and initial.proc.poll() is not None
+        release.set()
         deadline = time.monotonic()+20
         while pipeline._proc.poll() is None and time.monotonic() < deadline:
             time.sleep(.1)
         assert pipeline.stop(), pipeline.failure_details()
+        events = pipeline.monitor.drain_events()
+        assert len({e['analyzer_pid'] for e in events if e['action'] == 'analyzer_started'}) >= 2
         fragments = pipeline.fragments()
         assert len(fragments) >= 3 and all(f.closed for f in fragments)
         for selector in ('a:0', 'v:0'):
@@ -104,9 +128,35 @@ with open(sys.argv[2],'wb',buffering=0) as out:
                 assert dts == sorted(dts)
                 actual.extend(packet['data'] for packet in items)
             assert actual == original
+        from src.worker.stream_monitor import MkvClusterTracker
+        sample = source.read_bytes()
+        clusters = MkvClusterTracker().feed(sample)
+        assert len(clusters) >= 3
+        start, end = clusters[1][0], clusters[2][0]
+        for operation, changed in (
+            ('dropped', sample[:start] + sample[end:]),
+            ('duplicated', sample[:end] + sample[start:]),
+        ):
+            damaged = tmp_path / f'{operation}.mkv'
+            damaged.write_bytes(changed)
+            control = ContinuousPipeline('synthetic', tmp_path/operation, 'scrcpy.exe', 'adb.exe', 2,
+                ffmpeg_exe=media_tools.ffmpeg, producer_factory=producer_for(damaged, 2))
+            try:
+                control.start()
+                assert control._proc.wait(10) == 0
+                assert control.stop(), control.failure_details()
+                pieces = control.fragments()
+                assert pieces and all(piece.closed for piece in pieces)
+                for stream in ('a:0','v:0'):
+                    original = [p['data'] for p in packets(source, stream)]
+                    interrupted = [p['data'] for piece in pieces for p in packets(piece.path, stream)]
+                    assert interrupted and interrupted != original
+            finally:
+                control.stop()
         for fragment in fragments:
             result = subprocess.run([ff, '-v', 'error', '-i', str(fragment.path), '-map', '0:v:0', '-map', '0:a:0',
                 '-fps_mode', 'passthrough', '-enc_time_base:v', 'demux', '-f', 'null', '-'], capture_output=True, timeout=15)
             assert result.returncode == 0 and not result.stderr, result.stderr
     finally:
+        release.set()
         pipeline.stop()

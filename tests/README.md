@@ -27,7 +27,7 @@ python -m pytest tests -q -p no:cacheprovider --basetemp "$TestRoot/work" --juni
 | 文件 | 验证边界 |
 | --- | --- |
 | `test_bilibili_bridge.py`、`test_bilibili_host.py`、`web/tests/bilibili.test.ts` | 合成 Core 回包、SQLite 占用与恢复、本机访问限制、并发续领；Windows 专属 venv 验证双主控启动同一无窗口子进程。真实手机扫码单独验收。 |
-| `test_segment_uploads.py` | 独立 SQLite、切换部署、并发确认、步骤和代次失效、提交后移走录像并查完分页、拒绝后的修订和旧弹窗失效。Core 回包由测试控制。 |
+| `test_segment_uploads.py` | 独立 SQLite、切换部署、并发确认、步骤和代次失效、提交后移走录像并查完分页、拒绝后的修订和旧弹窗失效。真实 ASGI 路由覆盖争议片隔离、登记与提交间的冲突、领取取消和等锁时的响应。Core 回包由测试控制。 |
 | `test_script_worker_process.py` | 真 Windows 子进程、合成媒体和实际 Ctrl+Break；脚本正常停止/最终片判定及忽略信号后的有界强制回收，不操作设备 |
 | `test_script_safety.py` | 脚本导入/帮助/预览无设备副作用，独立输出、离线解析、严格实例映射、有界客户端、取消及验收反例；设备/网络为替身，专属睡眠进程测试超时不涉及 MuMu；不能替代实机验收 |
 | `test_ui_dump_runtime.py`、`test_room_locator.py`、`test_navigation_budget.py` | 32 位 UI 导出命令、路径注入拒绝、精确 serial 和指标归类；非零/缺入口/超时不误读或点击，唯一文件及预算约束；设备为替身 |
@@ -37,13 +37,25 @@ python -m pytest tests -q -p no:cacheprovider --basetemp "$TestRoot/work" --juni
 | `test_console_query_process.py` | 真实受控子进程；分阶段阻塞、IPC 截断、重复超时、容量与解析器进程复用、回收失败。网络阻塞为合成注入，不调用外网 |
 | `test_console_lifecycle.py` | 独立 Windows 宿主；端口占用、双主控、初始化/调度异常、Ctrl+C/Ctrl+Break、强杀时仅回收查询 Job；浏览器替身发起真实 HTTP 请求，覆盖慢初始化、健康旧服务冲突、缺前端、打开失败及阻塞时仍可退出。模拟录制子进程不等于真实 MuMu |
 | `test_console_browser.py` | CLI 默认值及传参、IPv4/IPv6 访问地址、HTTP 启动顺序、关闭/失败守卫、单次派发、线程和系统打开失败；浏览器调用为替身，不弹出真实浏览器 |
-| `test_real_process_delivery.py` | 真实 Worker 控制句柄、HTTP/CLI、合成媒体和事件收尾；模拟器与导航边界被替换 |
+| `test_real_process_delivery.py` | 真实 Worker 控制句柄、HTTP/CLI、合成媒体和事件收尾。覆盖 Popen 后未写 PID 的主控退出、旧实例占用、两段回放及 SQLite 等锁、超时和提交故障后的服务恢复。模拟器与导航为隔离边界。 |
 | `test_room_scanner.py`、`test_minimal_loop_regression.py` | 逐目标收取、容量不足不分配序号、UNKNOWN 保留可信状态及任务去重 |
 | `test_pinned_media_tools.py` | 固定路径、旧版与不同构建拒绝、配套配置不一致拒绝、依赖失败前不启动设备；进程执行为替身 |
-| `test_aac_without_keyflag.py` | 合成无关键标记 AAC 输入、旧命令丢音轨负对照、真实命名管道分段、所有编码包逐字节一致、逐流 DTS 单调、所有分段完整解码；不是 MuMu 实机 |
+| `test_aac_without_keyflag.py` | 独立源 MKV、真实命名管道和分析器重启，逐流比较全部编码包、检查 DTS 和完整解码。负对照包括移除 AAC 兼容参数、传输时丢失或重复媒体块。 |
 | `test_continuous_real_transport.py`、`test_stream_monitor_media.py` | 固定版本真实媒体传输、总时长封口与分析分支重建；循环输入可能有 AAC padding，CSV 相邻端点不替代逐包无漏失校验 |
 | `test_runtime_identity.py` | 运行期双样本、冲突宽限与失证期限、开录证据过期、同 Activity 错房恢复、迟到观察、风险回标与受控边界重建；固定时钟及设备注入不能替代实机时延验收 |
 | `test_quality_delivery.py`、`test_worker_events.py` | 质量事件编号／无编号重投、日志回放同编号、正常迟到回标、未知／未完成切片完整性异常、原任务与新任务隔离、事务回滚；调度队列不中断由 `test_scheduler_integration.py` 补充 |
+| `test_worker_executor.py`、`test_mumu_client.py`、`test_dep_manager.py` | Windows 独占命令回收树、共享客户端继承管道、无效或失效 HWND、跨进程安装锁、残缺工具与中途退出。 |
+| `test_continuous_and_overlay.py`、`test_live_surface_probe.py` | 实际采集命令参数、空页面探针与尾片、清单增量读取和替换。逐轮统计 32 至 1,024 条历史下的访问量和处理时延。 |
+
+### 旧测试承接入口
+
+| 精简的旧断言 | 当前入口及会检出的退化 |
+| --- | --- |
+| `StreamEndDetector`、`HealthMonitor` 及旧命名格式 | `test_scheduler_integration.py` 交错未知与确认下播，误停会失败。真实分析与看门狗见 `test_stream_monitor_media.py`、`test_worker_controller.py`，冻结或停涨没触发应有动作会失败。成品隔离以 Controller 两次运行后实际文件可读为准。 |
+| 通过 `shutil.which` 模拟缺 ffprobe、重复短尾与归档保护 | `test_pinned_media_tools.py` 从真实依赖入口移除固定 ffprobe，并核对未启动设备。`test_segment_integrity.py` 用真实 ffprobe 检出无效媒体、接受短尾并保护已存在的成品。 |
+| 源码文本中的采集参数和清理位置 | `test_continuous_and_overlay.py` 截获生产入口的两条命令，缺少 scrcpy 参数或强制帧率会失败。`test_identity_stability.py` 记录实际 ADB 输入，额外点击会失败。 |
+| 多个同义查询阻塞名、顺序拿锁和混合故障集合 | `test_console_query_process.py` 保留无响应与半行两种超时，随后须能查询成功。真正错房由 Controller 入口验证，损坏媒体由固定 ffprobe 验证。两个同时存活的进程争用实例锁见 `test_naming_lock_observability.py`。 |
+| 旧切片上传状态列 | `web/tests/upload.test.ts` 挂载现行切片页，验证正常片可安排、冲突片保留原单查询及刷新失败保留状态。`test_segment_uploads.py` 覆盖旧弹窗确认和派发竞争。旧模拟状态配色在同文件保留一组参数。 |
 
 质量标记的 HTTP 非法时间投影、固定时钟跨 24 小时窗口和任务摘要见 `test_console_api.py` 的 `test_quality_*`。原始风险经存储写入，实际列表请求必须成功；单片是内部查询入口，使用同一响应模型验证，不假定存在单片 GET 接口。历史实施和页面联验结果见 [T20 验证记录](../docs/证据/验证/20261117-T20质量标记去重与汇总实施验证.md)。
 

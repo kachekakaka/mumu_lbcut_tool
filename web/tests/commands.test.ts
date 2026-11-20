@@ -1,7 +1,17 @@
 import { describe, expect, it, vi } from 'vitest'
+import { flushPromises, mount } from '@vue/test-utils'
+import ElementPlus from 'element-plus'
 import { ApiError } from '../src/api/client'
 import type { Command } from '../src/api/types'
 import { createOperations, describeOperation, type OperationDeps } from '../src/commands'
+import { ops as drawerOperations } from '../src/operations'
+import OperationsDrawer from '../src/components/OperationsDrawer.vue'
+
+const drawerRequest = vi.hoisted(() => vi.fn<(id: string, signal: AbortSignal) => Promise<Command>>())
+vi.mock('../src/operations', async () => {
+  const { createOperations } = await import('../src/commands')
+  return { ops: createOperations({ getCommand: drawerRequest, newId: () => 'drawer-test', refresh: () => {} }) }
+})
 
 function command(status: string, extra: Partial<Command> = {}): Command {
   return {
@@ -114,6 +124,77 @@ describe('命令追踪', () => {
     await settle()
     expect(op.state).toBe('succeeded')
     expect(op.followError).toBe(false)
+  })
+
+  it('31 个在途命令保留原记录，完成后只裁剪已结束历史', async () => {
+    const queries = new Map<string, (result: Command) => void>()
+    const callbacks = vi.fn()
+    drawerRequest.mockImplementation((id) => new Promise((resolve) => queries.set(id, resolve)))
+    const view = mount(OperationsDrawer, {
+      props: { modelValue: true },
+      global: { plugins: [ElementPlus], stubs: { ElDrawer: { template: '<section><slot/></section>' } } },
+    })
+    try {
+      for (let i = 0; i < 31; i++) {
+        drawerOperations.start('record', String(i), `开录 ${i}`,
+          async () => ({ command_id: String(i), status: 'pending' }), callbacks)
+      }
+      await flushPromises()
+      expect(drawerOperations.list).toHaveLength(31)
+      expect(view.findAll('.op-card')).toHaveLength(31)
+      expect(view.findAll('.op-card').at(-1)?.text()).toContain('开录 0')
+      expect(drawerOperations.busy('0')).toBe(true)
+      expect(queries.size).toBe(31)
+      queries.forEach((resolve) => resolve(command('succeeded')))
+      await flushPromises()
+      expect(callbacks).toHaveBeenCalledTimes(31)
+      expect(view.findAll('.op-card')).toHaveLength(30)
+      expect(drawerOperations.busy('0')).toBe(false)
+    } finally {
+      drawerOperations.dispose()
+      view.unmount()
+    }
+  })
+
+  it('结束跟踪中断查询，忽略迟到回包并释放已销毁页面的回调', async () => {
+    const call = vi.fn()
+    let resolve!: (result: Command) => void
+    let signal!: AbortSignal
+    let rejectFirst = true
+    const owner = Symbol()
+    const ops = createOperations({
+      getCommand: vi.fn(async (_id: string, abort: AbortSignal) => {
+        signal = abort
+        if (rejectFirst) {
+          rejectFirst = false
+          throw new ApiError(0, 'network_error', '')
+        }
+        return new Promise<Command>((done) => { resolve = done })
+      }),
+      newId: () => 'original-key',
+      refresh: vi.fn(),
+      sleep: async () => undefined,
+    })
+    const send = vi.fn(async () => ({ command_id: 'cmd-1', status: 'pending' }))
+    const op = ops.start('record', 'a', '开录', send, call, owner)
+    await settle()
+    expect(op.followError).toBe(true)
+    ops.detachOwner(owner)
+    ops.endTracking(op)
+    expect(signal.aborted).toBe(true)
+    resolve(command('succeeded'))
+    await settle()
+    expect(op.state).toBe('pending')
+    expect(send).toHaveBeenCalledTimes(1)
+    expect(call).not.toHaveBeenCalled()
+    expect(ops.list).toHaveLength(0)
+
+    const unknown = ops.start('record', 'b', '开录', async () => { throw new ApiError(0, 'network_error', '') }, call)
+    await settle()
+    expect(unknown.state).toBe('unknown')
+    ops.endTracking(unknown)
+    expect(ops.retry(unknown)).toBe(false)
+    expect(ops.list).toHaveLength(0)
   })
 
   it('批量新增部分失败不显示为全部成功', () => {

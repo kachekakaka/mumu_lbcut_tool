@@ -1,6 +1,8 @@
 """切片安排、原单恢复和安全状态投影。"""
 
 import asyncio
+from contextlib import contextmanager, nullcontext
+import logging
 import json
 import os
 from pathlib import Path
@@ -21,6 +23,7 @@ DEFINITE_REJECTIONS = {
     "engine_incompatible", "work_id_mismatch", "no_targets", "b18_not_permitted",
 }
 FINAL = {"SUCCEEDED", "FAILED", "CANCELLED", "EXPIRED"}
+logger = logging.getLogger(__name__)
 
 
 def file_snapshot(path, root):
@@ -134,11 +137,42 @@ def observation(task, worker):
 
 
 class SegmentUploads:
-    def __init__(self, store, core, segment, output_dir, *, writable=lambda: True):
+    def __init__(self, store, core, segment, output_dir, *, writable=lambda: True, guard=None):
         self.store, self.core, self.segment, self.output_dir = store, core, segment, output_dir
         self.writable = writable
         self.dialogs = {}
         self.poll_limit = asyncio.Semaphore(4)
+        self.guard = guard
+        self.claim_cleanups = set()
+
+    @contextmanager
+    def send_guard(self, job, index):
+        self.require_writable()
+        try:
+            with self.guard(job, index) if self.guard else nullcontext():
+                self.require_writable()
+                yield
+        except ControlError as exc:
+            raise BridgeError(exc.code, str(exc), exc.status) from None
+
+    async def claim(self, record_id, **options):
+        pending = asyncio.create_task(asyncio.to_thread(self.store.claim, record_id, **options))
+        try:
+            return await asyncio.shield(pending)
+        except asyncio.CancelledError:
+            async def release_late():
+                try:
+                    if row := await pending:
+                        await asyncio.to_thread(self.store.release, row)
+                except Exception:
+                    logger.exception("取消后回收投稿领取失败，原租期到期后可重试")
+            cleanup = asyncio.create_task(release_late())
+            self.claim_cleanups.add(cleanup)
+            cleanup.add_done_callback(self.claim_cleanups.discard)
+            raise
+
+    async def finish_cleanups(self):
+        await asyncio.gather(*self.claim_cleanups, return_exceptions=True)
 
     def current_segment(self, job, index):
         try:
@@ -176,15 +210,15 @@ class SegmentUploads:
 
     async def context(self, job, index, revise=None):
         self.require_writable()
-        segment, source = self.current_segment(job, index)
+        segment, source = await asyncio.to_thread(self.current_segment, job, index)
         binding = await self.core.binding()
         modes, limits = await self.core.capabilities(binding)
         worker = await self.core.health(binding)
         accounts = await self.core.accounts(binding)
-        present = self.store.for_segments([(job, index)])
+        present = await asyncio.to_thread(self.store.for_segments, [(job, index)])
         rows = {r["account_id"]: r for r in present if r["deployment"] == binding["deployment"]}
         if revise:
-            row = self.store.get(revise)
+            row = await asyncio.to_thread(self.store.get, revise)
             if (row["job_id"], row["segment_index"], row["deployment"]) != (job, index, binding["deployment"]):
                 raise BridgeError("binding", "请连接这条安排的原部署后再修订")
             if not revisable(row, self.store.clock()):
@@ -229,7 +263,8 @@ class SegmentUploads:
         expected = ctx["revisions"][account_id]
         job, index, revise = ctx["job"], ctx["index"], ctx["revise"]
         source = ctx["source"]
-        existing = next((r for r in self.store.for_segments([(job, index)])
+        present = await asyncio.to_thread(self.store.for_segments, [(job, index)])
+        existing = next((r for r in present
                          if r["deployment"] == binding["deployment"] and r["account_id"] == account_id), None)
         if not existing or (revise and existing["revision"] == expected):
             modes, limits = await self.core.capabilities(binding)
@@ -238,14 +273,15 @@ class SegmentUploads:
             accounts = await self.core.accounts(binding)
             if not any(a.id == account_id and a.remote_user_id == account["remote_user_id"] for a in accounts):
                 raise BridgeError("invalid_account", "账号已停用、阻塞或身份变化，请重新核对")
-            _, current = self.current_segment(job, index)
+            _, current = await asyncio.to_thread(self.current_segment, job, index)
             if current != source or source["quality_flags"] and not quality_confirmed:
                 raise BridgeError("segment_changed", "录像或质量提示需重新核对后确认")
         await self.core.verify(binding)
         self.require_writable()
         frozen = {**source, "parameters": parameters, "account": account}
-        row, dispatch = self.store.confirm(
+        row, dispatch = await asyncio.to_thread(self.store.confirm,
             key, job, index, binding["deployment"], frozen, expected, revise, freeze_requests,
+            guard=lambda: self.send_guard(job, index),
         )
         if dispatch:
             return await self.drive(row["id"], row["revision"], binding)
@@ -285,13 +321,13 @@ class SegmentUploads:
             raise BridgeError("task_ambiguous", "作品下有多条匹配任务，请核对原单")
         return next(iter(found), None)
 
-    def link(self, row, task_id):
-        return self.store.finish(row, stage="task", task_id=task_id, attempts=0,
-                                 lease_until=0, problem=None, next_check=0)
+    async def link(self, row, task_id):
+        return await asyncio.to_thread(self.store.finish, row, stage="task", task_id=task_id, attempts=0,
+                                       lease_until=0, problem=None, next_check=0)
 
     async def drive(self, record_id, revision, binding=None):
         self.require_writable()
-        while row := self.store.claim(record_id, dispatch=True, revision=revision, force=True):
+        while row := await self.claim(record_id, dispatch=True, revision=revision, force=True):
             if row["stage"] == "task":
                 await self.refresh_claim(row, binding)
                 break
@@ -301,11 +337,11 @@ class SegmentUploads:
                     original = binding or await self.core.binding(row["deployment"])
                     if row["stage"] == "submit" and row["attempts"]:
                         if task_id := await self.lookup(original, row):
-                            if self.link(row, task_id):
+                            if await self.link(row, task_id):
                                 continue
                             break
                     frozen = json.loads(row["frozen"])
-                    _, current = self.current_segment(row["job_id"], row["segment_index"])
+                    _, current = await asyncio.to_thread(self.current_segment, row["job_id"], row["segment_index"])
                     if current != {k: frozen[k] for k in ("file", "quality_flags")}:
                         raise BridgeError("segment_changed", "录像或质量提示已变化，请核对原安排")
                     modes, limits = await self.core.capabilities(original)
@@ -317,14 +353,16 @@ class SegmentUploads:
                     if not any(a.id == row["account_id"] and a.remote_user_id == frozen["account"]["remote_user_id"] for a in accounts):
                         raise BridgeError("invalid_account", "原账号目前不可用，请核对原部署")
                     self.require_writable()
-                    sent = self.store.mark_sent(row)
+                    sent = await asyncio.to_thread(self.store.mark_sent, row,
+                        guard=lambda: self.send_guard(row["job_id"], row["segment_index"]))
                     if not sent:
                         break
                     if row["stage"] == "register":
                         result = await self.core.register(original, frozen["registration"], row["register_key"])
                         if result["work_id"] != row["work_id"]:
                             raise protocol()
-                        if self.store.finish(row, stage="submit", attempts=0, lease_until=0, problem=None):
+                        if await asyncio.to_thread(self.store.finish, row, stage="submit", attempts=0,
+                                                   lease_until=0, problem=None):
                             continue
                     else:
                         result = await self.core.submit(original, row["work_id"], frozen["submission"], row["submit_key"])
@@ -333,7 +371,7 @@ class SegmentUploads:
                         task = result["tasks"][0]
                         if type(task["created"]) is not bool or not matches(row, task["snapshot"]):
                             raise protocol()
-                        if self.link(row, identifier(task["task_id"])):
+                        if await self.link(row, identifier(task["task_id"])):
                             continue
             except (BridgeError, TimeoutError, KeyError, TypeError, AttributeError) as exc:
                 code = exc.code if isinstance(exc, BridgeError) else "core_timeout" if isinstance(exc, TimeoutError) else "protocol"
@@ -341,11 +379,12 @@ class SegmentUploads:
                     sent and row["attempts"] == 0 and isinstance(exc, BridgeError)
                     and exc.status in (400, 409, 422) and code in DEFINITE_REJECTIONS
                 )
-                self.store.finish(row, problem=code, rejected=int(rejected), next_check=self.store.clock() + 5)
+                await asyncio.to_thread(self.store.finish, row, problem=code, rejected=int(rejected),
+                                        next_check=self.store.clock() + 5)
             finally:
-                self.store.release(row)
+                await asyncio.to_thread(self.store.release, row)
             break
-        return self.public(self.store.get(record_id), detail=True)
+        return self.public(await asyncio.to_thread(self.store.get, record_id), detail=True)
 
     async def refresh_claim(self, row, binding=None):
         try:
@@ -354,9 +393,9 @@ class SegmentUploads:
                 if row["stage"] != "task":
                     task_id = await self.lookup(original, row)
                     if task_id is None:
-                        self.store.finish(row, next_check=self.store.clock() + 10)
+                        await asyncio.to_thread(self.store.finish, row, next_check=self.store.clock() + 10)
                         return
-                    if self.link(row, task_id):
+                    if await self.link(row, task_id):
                         await self.refresh(row["id"], force=True)
                     return
                 task = await self.core.task(original, row["task_id"])
@@ -376,21 +415,21 @@ class SegmentUploads:
                     raise protocol()
                 now = self.store.clock()
                 next_check = float("inf") if value["status"] in FINAL else now + 4
-                self.store.finish(row, observed=encode(value | {"version": version}), observed_at=now,
-                                  problem=None, next_check=next_check)
+                await asyncio.to_thread(self.store.finish, row, observed=encode(value | {"version": version}),
+                                        observed_at=now, problem=None, next_check=next_check)
         except (BridgeError, TimeoutError, KeyError, TypeError, AttributeError) as exc:
             code = exc.code if isinstance(exc, BridgeError) else "core_timeout" if isinstance(exc, TimeoutError) else "protocol"
-            self.store.finish(row, problem=code, next_check=self.store.clock() + 15)
+            await asyncio.to_thread(self.store.finish, row, problem=code, next_check=self.store.clock() + 15)
         finally:
-            self.store.release(row)
+            await asyncio.to_thread(self.store.release, row)
 
     async def refresh(self, record_id, *, force=False):
-        if row := self.store.claim(record_id, dispatch=False, force=force):
+        if row := await self.claim(record_id, dispatch=False, force=force):
             await self.refresh_claim(row)
-        return self.store.get(record_id)
+        return await asyncio.to_thread(self.store.get, record_id)
 
     async def summaries(self, segments):
-        rows = self.store.for_segments(segments)
+        rows = await asyncio.to_thread(self.store.for_segments, segments)
         now = self.store.clock()
         due = [row for row in rows if row["lease_until"] <= now and row["next_check"] <= now
                and not row["rejected"] and (row["stage"] == "task" or row["stage"] == "submit" and row["attempts"])]

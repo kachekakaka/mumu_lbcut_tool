@@ -17,7 +17,8 @@ export const api = {
   job: (jobId: string) => get<JobDetail>(`/api/jobs/${id(jobId)}`),
   jobLog: (jobId: string, lines: number) => get<JobLog>(`/api/jobs/${id(jobId)}/log`, { lines }),
   segments: (q: Query) => get<Page<Segment>>('/api/segments', q),
-  command: (commandId: string) => get<Command>(`/api/commands/${id(commandId)}`),
+  command: (commandId: string, signal?: AbortSignal) =>
+    request<Command>('GET', `/api/commands/${id(commandId)}`, { signal }).then((r) => r.data),
 
   addTargets: (targets: string[], manualOnly: boolean, requestId: string) =>
     write('POST', '/api/targets', requestId, { targets, manual_only: manualOnly, allow_unconfirmed_identity: false }),

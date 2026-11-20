@@ -228,7 +228,7 @@ class WorkerController:
                 eff_mode = self.config.window_mode
                 if self.config.background_mode and eff_mode == "foreground":
                     eff_mode = "hidden"
-                mumu.optimize_performance_for_recording(
+                displayed = mumu.optimize_performance_for_recording(
                     self.config.vmindex,
                     mute=True,
                     disable_dynamic_fps=True,
@@ -237,6 +237,8 @@ class WorkerController:
                     pos_y=self.config.window_pos_y,
                     stop_event=self.stop_event,
                 )
+                if displayed is False:
+                    logger.warning("实例 %s 未能应用窗口显示模式 %s", self.config.vmindex, eff_mode)
             except InterruptedError:
                 raise
             except Exception as e:

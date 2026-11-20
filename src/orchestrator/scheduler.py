@@ -5,6 +5,7 @@ import logging
 import os
 from pathlib import Path
 import queue
+import sys
 import threading
 import time
 import uuid
@@ -15,7 +16,7 @@ from src.orchestrator.instance_pool import InstancePool
 from src.orchestrator.models import WorkerLaunchSpec
 from src.orchestrator.room_scanner import ObservationDispatcher
 from src.orchestrator.room_query_process import QueryProcesses
-from src.orchestrator.storage import NEEDS_FIX, Store, ControlError, identity_admission
+from src.orchestrator.storage import NEEDS_FIX, Store, ControlError, identity_admission, validate_worker_event
 from src.worker.room_locator import valid_identity_id
 from src.orchestrator.worker_process import WorkerProcessHandle
 
@@ -65,30 +66,55 @@ class HostLease:
 def inspect_job_process(job: dict) -> str:
     """只核验归属，不接管或终止任何未知进程。返回 alive/absent/unknown。"""
     pid, born = job.get("pid"), job.get("process_created")
+    key, journal = job["id"], job.get("event_log_path")
+
+    def belongs(cmd):
+        if not journal or not any(a == "-m" and b == "src.worker.cli" for a, b in zip(cmd, cmd[1:])):
+            return False
+        flags = dict(zip(cmd, cmd[1:]))
+        return (flags.get("--job-id") == key and flags.get("--vmindex") == str(job["vmindex"])
+                and os.path.normcase(flags.get("--event-log", "")) == os.path.normcase(journal))
+
+    uncertain = False
     if pid:
         try:
             p = psutil.Process(pid)
-            cmd = p.cmdline()
-            if born is not None and abs(p.create_time() - born) < .01:
-                if "--job-id" in cmd and cmd[cmd.index("--job-id") + 1] == job["id"] and "src.worker.cli" in cmd:
+            if born is None or abs(p.create_time() - born) < .01:
+                if belongs(p.cmdline()):
                     return "alive"
-                return "unknown"
+                uncertain = born is not None
         except psutil.NoSuchProcess:
             pass
-        except (psutil.AccessDenied, IndexError):
-            return "unknown"
+        except psutil.AccessDenied:
+            uncertain = True
     # 覆盖启动后、持久化 PID 前主控崩溃的窗口，以及遗留 scrcpy 子进程。
-    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+    launch_at = job.get("launch_intent_at")
+    python_name = Path(sys.executable).name.casefold()
+    for proc in psutil.process_iter(["pid", "name", "cmdline", "create_time"], ad_value=None):
         try:
-            cmd = proc.info.get("cmdline") or []
-            if "--job-id" in cmd and cmd[cmd.index("--job-id") + 1] == job["id"]:
+            cmd = proc.info.get("cmdline")
+            name = (proc.info.get("name") or "").casefold()
+            if cmd is None:
+                created = proc.info.get("create_time")
+                if journal and name == python_name and launch_at is not None and (
+                    created is None or abs(created - launch_at) <= 2
+                ):
+                    uncertain = True
+                continue
+            if belongs(cmd):
                 return "alive"
-            if (proc.info.get("name") or "").lower().startswith("scrcpy"):
-                if any(arg.startswith("--record=") and job["id"] in arg for arg in cmd):
-                    return "alive"
-        except (psutil.Error, IndexError):
+            if name.startswith("scrcpy") and any(
+                arg.startswith("--record=" + r"\\.\pipe\mumu_capture_" + key + "_") for arg in cmd
+            ):
+                return "alive"
+            if name.startswith(("ffmpeg", "ffprobe")) and any(
+                key in Path(arg).parts or arg == f"comment=mumu_capture_{key}"
+                for arg in cmd[1:] if not arg.startswith("-")
+            ):
+                return "alive"
+        except psutil.Error:
             continue
-    return "absent"
+    return "unknown" if uncertain else "absent"
 
 
 class Scheduler:
@@ -118,6 +144,8 @@ class Scheduler:
         self._events: queue.Queue = queue.Queue(maxsize=8192)
         self._event_pending = None
         self._handles, self._closing, self._verifying = {}, {}, {}
+        self._replays = {}
+        self._replay_contexts = {}
         self._scan_requested = []
         self._next_scan = 0.0
         self._refresh_future, self._refresh_started = None, 0.0
@@ -154,7 +182,22 @@ class Scheduler:
                 except queue.Empty:
                     break
             job_id, event = self._event_pending
+            if isinstance(event, str):
+                if event:
+                    self._replays[job_id] = 0
+                    self._replay_contexts[job_id] = event
+                else:
+                    self.store.finish_worker(job_id, self.clock(), self._handles[job_id].poll_exit_code())
+                    self._forget_worker(job_id)
+                self._event_pending = None
+                continue
             # 数据库失败时保留当前事件，不静默丢弃；主循环异常会停止本主控创建的 Worker。
+            try:
+                validate_worker_event(job_id, event)
+            except ValueError as exc:
+                logger.warning("任务 %s 收到无效 Worker 事件：%s", job_id, exc)
+                self._event_pending = None
+                continue
             self.store.record_event(job_id, event, self.clock())
             login_notice = (event.get("event") == "stall_detected" or
                             (event.get("event") == "capture_startup" and event.get("action") == "rejected"))
@@ -168,28 +211,37 @@ class Scheduler:
 
     def _collect(self):
         self._drain_events()
+        for job_id, context in list(self._replay_contexts.items()):
+            job = self.store.row("SELECT * FROM jobs WHERE id=?", (job_id,))
+            if self.process_probe(job) == "absent":
+                self._finish_orphan(job, self._handles[job_id].poll_exit_code(), context)
+            else:
+                self.store.mark_waiting_exit(job_id, self.clock(), quarantine=True,
+                                             reason="worker_recording_process_still_present")
+                self._forget_worker(job_id)
         for job_id, future in list(self._closing.items()):
-            if not future.done():
+            if future is None or not future.done():
                 continue
             handle = self._handles[job_id]
             reason = ""
             try:
-                code = future.result()
+                future.result()
                 complete = handle.events_complete
             except Exception as exc:
-                code = handle.poll_exit_code()
-                code = code if code is not None else 30
                 reason = f"event_collection_incomplete: {exc}"
                 complete = False
-            self._drain_events()
-            terminal = handle.terminal_event or {}
-            reason = reason or terminal.get("reason", "")
-            hold = handle.is_alive() or handle.forced_stop or not complete
-            self.store.finish_job(job_id, code, self.clock(), complete, reason, hold_instance=hold)
-            if code == 20:
-                self._force_refresh = True
-            self._closing.pop(job_id)
-            self._handles.pop(job_id)
+            if handle.is_alive() or (not complete and not getattr(handle, "delivery_closed", True)):
+                self.store.mark_waiting_exit(job_id, self.clock(), quarantine=True,
+                    reason=reason or "worker_delivery_still_open")
+                self._closing[job_id] = self._stoppers.submit(handle.stop, 60.0)
+                continue
+            if handle.forced_stop or not complete:
+                reason = reason or ("worker_forced_stop" if handle.forced_stop else "worker_delivery_incomplete")
+            try:
+                self._events.put_nowait((job_id, reason))
+            except queue.Full:
+                continue
+            self._closing[job_id] = None
         for job_id, handle in list(self._handles.items()):
             if job_id in self._closing:
                 continue
@@ -198,6 +250,15 @@ class Scheduler:
                 self._closing[job_id] = self._stoppers.submit(handle.stop, 60.0)
             elif not handle.is_alive():
                 self._closing[job_id] = self._stoppers.submit(handle.wait, 10.0)
+
+    def _forget_worker(self, job_id):
+        job = self.store.row("SELECT exit_code FROM jobs WHERE id=?", (job_id,))
+        if job and job["exit_code"] == 20:
+            self._force_refresh = True
+        self._closing.pop(job_id, None)
+        self._handles.pop(job_id, None)
+        self._replays.pop(job_id, None)
+        self._replay_contexts.pop(job_id, None)
 
     def _stop_job(self, job_id: str, reason: str):
         self.store.request_stop(job_id, reason)
@@ -247,7 +308,8 @@ class Scheduler:
                 continue
             with self.store.transaction():
                 job = self.store.row("SELECT * FROM jobs WHERE id=?", (subject,)) if source == "verify" else None
-                if source == "verify" and (not job or job["status"] != "starting" or job["session_key"] != meta["session_key"]):
+                if source == "verify" and (self._shutdown or not job or job["status"] != "starting" or job["event_log_path"]
+                                           or job["session_key"] != meta["session_key"]):
                     continue
                 accepted = self.store.apply_observation(meta, result.room, self.ended_interval)
             if source != "verify" or not accepted:
@@ -391,19 +453,32 @@ class Scheduler:
 
     def _reconcile_targets(self):
         now = self.clock()
-        for target in self.store.rows("SELECT * FROM targets ORDER BY created_at"):
-            active = self.store.row("SELECT * FROM jobs WHERE target_id=? AND status IN ('pending','starting','running','stopping','needs_reconcile')", (target["id"],))
+        for target in self.store.rows("""WITH candidates AS (
+                SELECT id FROM targets WHERE enabled=1
+                UNION ALL
+                SELECT t.id FROM jobs active JOIN targets t ON t.id=active.target_id
+                    WHERE active.status IN ('pending','starting','running','stopping','needs_reconcile')
+                      AND t.enabled=0
+            )
+            SELECT t.*,j.id AS active_id,j.status AS active_status,
+            j.session_key AS active_session,j.stop_reason AS active_stop
+            FROM candidates c JOIN targets t ON t.id=c.id
+            LEFT JOIN jobs j ON j.target_id=t.id
+                AND j.status IN ('pending','starting','running','stopping','needs_reconcile')
+            ORDER BY t.created_at,t.rowid"""):
+            active = target["active_id"]
             if active:
-                if active["status"] == "needs_reconcile":
+                if target["active_status"] == "needs_reconcile":
                     continue
-                if not target["enabled"]:
-                    self._stop_job(active["id"], "target_removed")
+                if target["active_status"] == "stopping":
+                    if active in self._handles and active not in self._closing:
+                        self._stop_job(active, target["active_stop"] or "manual_stop")
+                elif not target["enabled"]:
+                    self._stop_job(active, "target_removed")
                 elif target["trusted_status"] == "ended":
-                    self._stop_job(active["id"], "anchor_offline")
-                elif target["session_key"] != active["session_key"]:
-                    self._stop_job(active["id"], "live_session_changed")
-                elif active["status"] == "stopping" and active["id"] in self._handles:
-                    self._stop_job(active["id"], active["stop_reason"] or "manual_stop")
+                    self._stop_job(active, "anchor_offline")
+                elif target["session_key"] != target["active_session"]:
+                    self._stop_job(active, "live_session_changed")
                 continue
             if self._shutdown or not target["enabled"]:
                 continue
@@ -417,13 +492,14 @@ class Scheduler:
 
     def _dispatch(self):
         now = self.clock()
-        for job in self.store.rows("SELECT * FROM jobs WHERE status='stopping' AND pid IS NULL"):
-            if job["id"] not in self._handles:
+        for job in self.store.rows("SELECT * FROM jobs WHERE status='stopping' AND pid IS NULL AND event_log_path IS NULL"):
+            if job["id"] not in self._handles and job["id"] not in self._waiting_exit and job["id"] not in self._replays:
+                self._verifying.pop(job["id"], None)
                 self.store.finish_job(job["id"], 0, now, True, "cancelled_before_launch")
         if self._shutdown:
             return
         # 被新观测淘汰的启动复核留在 starting，下轮重新获取有界查询槽位。
-        for job in self.store.rows("SELECT * FROM jobs WHERE status='starting' AND pid IS NULL ORDER BY created_at,rowid"):
+        for job in self.store.rows("SELECT * FROM jobs WHERE status='starting' AND pid IS NULL AND event_log_path IS NULL ORDER BY created_at,rowid"):
             if job["id"] not in self._verifying and job["id"] not in self._handles:
                 target = self.store.row("SELECT * FROM targets WHERE id=?", (job["target_id"],))
                 reason = self._identity_reason(target)
@@ -453,6 +529,8 @@ class Scheduler:
                 self._boots[vmindex] = self._queries.submit(self.pool.boot_instance, vmindex, self._boot_stop)
 
     def _launch(self, job: dict, target: dict, room: ResolvedRoom):
+        if self._shutdown:
+            return
         job_id = job["id"]
         reason = self._identity_reason(target)
         if not valid_identity_id(room.room_id) or not valid_identity_id(room.anchor_uid):
@@ -469,23 +547,28 @@ class Scheduler:
             navigation_timeout_sec=self.navigation_timeout)
         # 先保存启动意图和产物关联，覆盖 Popen 后写 PID 前的异常窗口。
         with self.store.transaction() as db:
-            db.execute("UPDATE jobs SET room_id=?,event_log_path=? WHERE id=?", (room.room_id, str(journal), job_id))
+            saved = db.execute("""UPDATE jobs SET room_id=?,event_log_path=?,launch_intent_at=?
+                WHERE id=? AND status='starting' AND event_log_path IS NULL""",
+                               (room.room_id, str(journal), self.clock(), job_id))
+            if not saved.rowcount:
+                return
         handle = self.handle_factory(spec=spec, on_event=lambda event, key=job_id: self._events.put_nowait((key, event)))
         self._handles[job_id] = handle
         try:
             handle.start()
-            self.store.mark_launched(job_id, handle, str(journal), self.clock())
         except Exception as exc:
             logger.exception("Worker 启动失败")
             if handle.is_alive():
-                self.store.request_stop(job_id, "launch_persistence_failed")
-                self._closing[job_id] = self._stoppers.submit(handle.stop, 60.0)
+                raise
             else:
                 self._handles.pop(job_id, None)
                 # 启动失败计入失败次数，使退避间隔逐次加长。
                 with self.store.transaction() as db:
                     db.execute("UPDATE targets SET attempts=attempts+1 WHERE id=?", (target["id"],))
                 self.store.finish_job(job_id, 30, self.clock(), True, f"launch_failed: {exc}")
+        else:
+            # 写 PID 失败必须进入服务的存储故障收尾，句柄仍归本主控。
+            self.store.mark_launched(job_id, handle, str(journal), self.clock())
 
     def reconcile(self, selected_job: str | None = None):
         sql = "SELECT * FROM jobs WHERE status IN ('starting','running','stopping','needs_reconcile')"
@@ -494,62 +577,79 @@ class Scheduler:
             sql += " AND id=?"
             params = (selected_job,)
         for job in self.store.rows(sql, params):
-            if job["id"] in self._handles or job["id"] in self._verifying:
+            job_id = job["id"]
+            if job_id in self._handles or job_id in self._verifying or job_id in self._replays:
                 continue
-            status = self.process_probe(job)
-            if status == "absent":
-                self._waiting_exit.pop(job["id"], None)
-                self._finish_orphan(job)
-            elif status == "alive":
-                # 新主控不在旧进程的控制台，发不出 Ctrl+Break；等 Worker 发现主控断开后自行封口。
-                if job["id"] not in self._waiting_exit:
-                    self._waiting_exit[job["id"]] = self.clock() + OLD_WORKER_EXIT_WAIT_SEC
-                    self.store.mark_waiting_exit(job["id"])
-            else:
-                self._waiting_exit.pop(job["id"], None)
-                self.store.finish_job(job["id"], 30, self.clock(), False,
-                                      "unowned_process_requires_reconciliation", hold_instance=True)
+            if not job["event_log_path"] and not job["pid"] and job["status"] in ("starting", "stopping"):
+                self.store.finish_job(job_id, 0, self.clock(), True, "cancelled_before_launch")
+                continue
+            self._check_old_worker(job)
+
+    def _check_old_worker(self, job):
+        job_id, now = job["id"], self.clock()
+        status = self.process_probe(job)
+        deadline = job["old_worker_deadline"]
+        if status == "absent":
+            self._waiting_exit.pop(job_id, None)
+            self.store.mark_waiting_exit(job_id, now, reason="replaying_worker_events")
+            self._replays[job_id] = 0
+        elif status == "alive" and (deadline is None or now < deadline):
+            self._waiting_exit[job_id] = deadline if deadline is not None else now + OLD_WORKER_EXIT_WAIT_SEC
+            if job["error_reason"] != "waiting_old_worker_exit":
+                self.store.mark_waiting_exit(job_id, now, deadline=self._waiting_exit[job_id])
+        else:
+            self._waiting_exit.pop(job_id, None)
+            reason = "old_worker_did_not_exit" if status == "alive" else "unowned_process_requires_reconciliation"
+            if job["error_reason"] != reason:
+                self.store.mark_waiting_exit(job_id, now, reason=reason, quarantine=True)
 
     def _watch_old_workers(self):
         now = self.clock()
         if not self._waiting_exit or now < self._next_waiting_probe:
             return
         self._next_waiting_probe = now + OLD_WORKER_PROBE_INTERVAL_SEC
-        for job_id, deadline in list(self._waiting_exit.items()):
+        for job_id in list(self._waiting_exit):
             job = self.store.row("SELECT * FROM jobs WHERE id=?", (job_id,))
             if not job or job["status"] != "stopping":
                 self._waiting_exit.pop(job_id)
                 continue
-            status = self.process_probe(job)
-            if status == "absent":
-                self._waiting_exit.pop(job_id)
-                self._finish_orphan(job)
-            elif status != "alive" or now >= deadline:
-                self._waiting_exit.pop(job_id)
-                reason = "old_worker_did_not_exit" if status == "alive" else "unowned_process_requires_reconciliation"
-                self.store.finish_job(job_id, 30, now, False, reason, hold_instance=True)
+            self._check_old_worker(job)
 
-    def _finish_orphan(self, job: dict):
-        """进程已消失：重放 NDJSON 补齐事件，按其终止事件记录结果；不抑制本场，由退避规则续录。"""
-        complete, terminal = True, None
+    def _finish_orphan(self, job, process_code=None, context=""):
+        """每轮有界补账。坏行按物理行跳过，提交后才推进读取位置。"""
+        job_id = job["id"]
+        offset = self._replays.get(job_id, 0)
         path = Path(job["event_log_path"]) if job["event_log_path"] else None
-        if path and path.exists():
-            try:
-                with path.open(encoding="utf-8") as stream:
-                    for line in stream:
-                        if line.strip():
-                            event = json.loads(line)
-                            self.store.record_event(job["id"], event, self.clock())
-                            if event.get("event") in ("worker_stopped", "worker_failed"):
-                                terminal = event
-            except (OSError, ValueError):
-                complete = False
-        code = terminal.get("exit_code") if terminal else None
-        code = 30 if code is None else int(code)
-        reason = (terminal or {}).get("reason") or "interrupted_host_restart"
-        stopped_at = (terminal or {}).get("timestamp")
-        self.store.finish_job(job["id"], code, self.clock(), complete and terminal is not None, reason,
-                              ended_at=stopped_at if isinstance(stopped_at, (int, float)) else None)
+        try:
+            if path is None:
+                raise FileNotFoundError
+            with path.open("rb") as stream:
+                stream.seek(offset)
+                for _ in range(1000):
+                    line = stream.readline()
+                    if not line:
+                        break
+                    try:
+                        if not line.endswith(b"\n"):
+                            raise ValueError("残行")
+                        event = json.loads(line.decode("utf-8"))
+                        validate_worker_event(job_id, event)
+                    except ValueError as exc:
+                        logger.warning("任务 %s 日志字节 %s 无效：%s", job_id, offset, exc)
+                    else:
+                        self.store.record_event(job_id, event, self.clock(), replay=True)
+                    self._replays[job_id] = offset = stream.tell()
+                else:
+                    return
+        except FileNotFoundError:
+            logger.warning("任务 %s 事件日志缺失：%s", job_id, path)
+            context = "事件日志缺失" + (f"；{context}" if context else "")
+        except OSError as exc:
+            logger.warning("任务 %s 事件日志暂不可读：%s", job_id, exc)
+            self._replays[job_id] = offset
+            return
+        self.store.finish_worker(job_id, self.clock(), process_code, context)
+        self._forget_worker(job_id)
 
     def tick(self):
         self._collect()
@@ -565,11 +665,14 @@ class Scheduler:
         self._scan()
         self._instances()
         self._watch_old_workers()
+        for job_id in list(self._replays):
+            if job_id not in self._handles:
+                self._finish_orphan(self.store.row("SELECT * FROM jobs WHERE id=?", (job_id,)))
         self._reconcile_targets()
         self._dispatch()
         self._collect()
 
-    def close(self, timeout_sec: float = 70.0):
+    def close(self, timeout_sec: float = 70.0, *, preserve_ledger=False):
         """即使存储故障也先收尾本主控的子进程，不碰其他任务。"""
         if self._closed:
             return
@@ -578,23 +681,27 @@ class Scheduler:
         shutdown_errors = []
         query_cleanup = ThreadPoolExecutor(max_workers=1, thread_name_prefix="query-cleanup")
         query_closed = query_cleanup.submit(self.room_queries.close)
-        try:
-            self.store.interrupt_commands(self.clock())
-        except Exception as exc:
-            shutdown_errors.append(str(exc))
-        try:
-            unlaunched = [j["id"] for j in self.store.rows("SELECT id FROM jobs WHERE status='starting' AND pid IS NULL")]
-        except Exception as exc:
-            shutdown_errors.append(str(exc))
-            unlaunched = list(self._verifying)
+        unlaunched = []
+        if not preserve_ledger:
+            try:
+                self.store.interrupt_commands(self.clock())
+                unlaunched = [j["id"] for j in self.store.rows("""SELECT id FROM jobs
+                    WHERE status='starting' AND pid IS NULL AND event_log_path IS NULL""")
+                    if j["id"] not in self._handles]
+            except Exception as exc:
+                shutdown_errors.append(str(exc))
+        self._verifying.clear()
         for job_id in unlaunched:
             try:
                 self.store.request_stop(job_id, "scheduler_shutdown")
                 self.store.finish_job(job_id, 0, self.clock(), True, "cancelled_before_launch")
             except Exception as exc:
                 shutdown_errors.append(str(exc))
-        self._verifying.clear()
         for job_id in list(self._handles):
+            if preserve_ledger:
+                if job_id not in self._closing:
+                    self._closing[job_id] = self._stoppers.submit(self._handles[job_id].stop, 60.0)
+                continue
             try:
                 self._stop_job(job_id, "scheduler_shutdown")
             except Exception as exc:
@@ -604,25 +711,29 @@ class Scheduler:
         deadline = time.monotonic() + timeout_sec
         try:
             while self._closing and time.monotonic() < deadline:
-                try:
-                    self._collect()
-                except Exception as exc:
-                    # 数据库不可写时，NDJSON 日志仍是对账证据；不得因此跳过进程停止。
-                    shutdown_errors.append(str(exc))
+                if not preserve_ledger:
+                    try:
+                        self._collect()
+                    except Exception as exc:
+                        shutdown_errors.append(str(exc))
+                        preserve_ledger = True
+                if preserve_ledger:
+                    # 日志由子进程和独立读线程写，存储异常后由下一任主控补账。
                     for job_id, future in list(self._closing.items()):
-                        if future.done():
-                            try:
+                        if future is not None and not future.done():
+                            continue
+                        try:
+                            if future is not None:
                                 future.result()
-                            except Exception as stop_exc:
-                                shutdown_errors.append(str(stop_exc))
-                            handle = self._handles.get(job_id)
-                            if handle is not None and not handle.is_alive():
-                                self._closing.pop(job_id)
-                                self._handles.pop(job_id, None)
+                        except Exception as exc:
+                            shutdown_errors.append(str(exc))
+                        if not self._handles[job_id].is_alive():
+                            self._closing.pop(job_id)
+                            self._handles.pop(job_id)
                 time.sleep(.05)
             if self._closing or self._handles:
                 shutdown_errors.append("shutdown_incomplete: 存在未收齐或未退出的任务，需对账")
-                for job_id in self._handles:
+                for job_id in () if preserve_ledger else self._handles:
                     try:
                         self.store.finish_job(job_id, 30, self.clock(), False,
                                               "shutdown_incomplete", hold_instance=True)
@@ -642,10 +753,11 @@ class Scheduler:
                 except Exception:
                     logger.exception("停服收取实例 %s 开机结果失败", vmindex)
                     ok = False
-                try:
-                    self.store.finish_boot(vmindex, ok, self.clock(), cancelled=True)
-                except Exception as exc:
-                    shutdown_errors.append(str(exc))
+                if not preserve_ledger:
+                    try:
+                        self.store.finish_boot(vmindex, ok, self.clock(), cancelled=True)
+                    except Exception as exc:
+                        shutdown_errors.append(str(exc))
                 self._boots.pop(vmindex)
             self._queries.shutdown(wait=False, cancel_futures=True)
             self._stoppers.shutdown(wait=False, cancel_futures=True)

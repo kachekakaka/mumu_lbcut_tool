@@ -84,7 +84,7 @@ class Jobs(Timed):
 class Segments(Timed):
     target_id: str | None = Field(default=None, max_length=128)
     job_id: str | None = Field(default=None, max_length=128)
-    status: Literal["started", "finished", "aborted"] | None = None
+    status: Literal["started", "finished", "aborted", "conflicted"] | None = None
     has_quality_flags: bool | None = None
 
 

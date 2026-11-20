@@ -6,6 +6,7 @@ export interface RequestOptions {
   body?: unknown
   headers?: Record<string, string>
   timeoutMs?: number
+  signal?: AbortSignal
 }
 
 export interface Response<T> {
@@ -49,6 +50,9 @@ export async function request<T>(method: string, path: string, options: RequestO
     return mock.mockRequest<T>(method, path, options)
   }
   const controller = new AbortController()
+  const abort = () => controller.abort()
+  if (options.signal?.aborted) abort()
+  else options.signal?.addEventListener('abort', abort, { once: true })
   const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? 10000)
   let response: globalThis.Response
   let text: string
@@ -67,6 +71,7 @@ export async function request<T>(method: string, path: string, options: RequestO
     throw new ApiError(0, 'network_error', '无法连接服务')
   } finally {
     clearTimeout(timer)
+    options.signal?.removeEventListener('abort', abort)
   }
   let data: unknown = null
   try {

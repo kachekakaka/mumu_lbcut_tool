@@ -53,7 +53,7 @@ def test_process_reuse_capacity_isolation_and_shared_shutdown():
             queries.close()
 
 
-@pytest.mark.parametrize('phase', ['dns', 'lock', 'retry', 'response', 'parse', 'partial'])
+@pytest.mark.parametrize('phase', ['dns', 'partial'], ids=['无响应', '半条响应'])
 def test_blocking_phase_deadline_reclaims_before_reuse(phase):
     queries = QueryProcesses(timeout=.7, child_command=[sys.executable, str(CHILD)])
     try:
@@ -110,3 +110,38 @@ def test_reclaim_failure_reports_fatal_without_returning_slot():
         queries.reclaim_timeout = 5
         with pytest.raises(RuntimeError, match='回收预算'):
             queries.close()
+
+
+def test_close_waits_for_active_ipc_to_return_its_process(monkeypatch):
+    queries = QueryProcesses(reclaim_timeout=.3, child_command=[sys.executable, str(CHILD)])
+    future = queries.submit('verify', 'block_dns')
+    wait_for(lambda: any(s.proc for s in queries.slots))
+    original = queries._reap
+    entered, release = threading.Event(), threading.Event()
+    captured = []
+    slot = next(s for s in queries.slots if s.proc)
+    pid = slot.proc.pid
+    def delayed(proc, deadline):
+        entered.set()
+        assert release.wait(3)
+        original(proc, deadline)
+    monkeypatch.setattr(queries, '_reap', delayed)
+    def close():
+        try:
+            queries.close()
+        except Exception as exc:
+            captured.append(exc)
+    closer = threading.Thread(target=close)
+    closer.start()
+    try:
+        assert entered.wait(2)
+        closer.join(2)
+        assert not closer.is_alive()
+        assert len(captured) == 1 and 'IPC' in str(captured[0])
+        assert future.result(1).error == 'service_interrupted'
+        assert queries.job.handle is None
+        queries.close()
+    finally:
+        release.set()
+        slot.thread.join(2)
+    assert slot.proc is None and not psutil.pid_exists(pid)

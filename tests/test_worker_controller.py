@@ -15,6 +15,26 @@ def test_normal_rotations_and_verified_small_media(monkeypatch, tmp_path, valid_
     assert len(h.pipelines) == 1 and not h.pipelines[0].alive
 
 
+def test_controller_runs_publish_separate_readable_outputs(monkeypatch, tmp_path, valid_media, media_tools):
+    from pathlib import Path
+    from src.worker.segment_verifier import verify_segment_file
+
+    outputs = []
+    for _ in range(2):
+        with monkeypatch.context() as scope:
+            harness = build_worker(scope, tmp_path, valid_media, total=1, segment=30)
+            assert harness.controller.run() == 0
+        terminal, = assert_paired(harness.events())
+        path = Path(terminal['file_path'])
+        assert path.parent == harness.controller.task_output_dir
+        outputs.append(path)
+    first, second = outputs
+    assert first.parent.parent == second.parent.parent and first.parent != second.parent
+    for path in outputs:
+        check = verify_segment_file(path, ffprobe_exe=media_tools.ffprobe, allow_short_tail=True)
+        assert check.is_valid and check.has_video and check.has_audio
+
+
 @pytest.mark.parametrize('reason,code', [('login_blocked', 15), ('navigation_failed', 17),
                                         ('render_timeout', 16), ('device_unavailable', 20)])
 def test_preflight_classification(monkeypatch, tmp_path, valid_media, reason, code):

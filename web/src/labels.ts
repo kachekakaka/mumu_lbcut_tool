@@ -40,8 +40,8 @@ export const ACTIVE_JOB_STATUSES = ['pending', 'starting', 'running', 'stopping'
 export const HISTORY_JOB_STATUSES = ['finished', 'finished_with_warnings', 'failed', 'cancelled']
 export const STOPPABLE_JOB_STATUSES = ['pending', 'starting', 'running']
 
-export const SEGMENT_STATUS: Record<string, string> = { started: '录制中', finished: '完成', aborted: '中止' }
-const SEGMENT_TAG: Record<string, TagType> = { started: 'primary', finished: 'success', aborted: 'danger' }
+export const SEGMENT_STATUS: Record<string, string> = { started: '录制中', finished: '完成', aborted: '中止', conflicted: '终态冲突' }
+const SEGMENT_TAG: Record<string, TagType> = { started: 'primary', finished: 'success', aborted: 'danger', conflicted: 'danger' }
 
 export const TRUSTED_STATUS: Record<string, string> = { live: '在播', ended: '已下播', unknown: '未知' }
 const TRUSTED_TAG: Record<string, TagType> = { live: 'success', ended: 'info', unknown: 'warning' }
@@ -60,6 +60,7 @@ export const STOP_REASON: Record<string, string> = {
   scheduler_shutdown: '调度服务关闭',
   interrupted_host_restart: '主机重启中断',
   waiting_old_worker_exit: '等待旧 Worker 退出',
+  replaying_worker_events: '正在补记录制事件',
   old_worker_did_not_exit: '旧 Worker 未退出',
   unowned_process_requires_reconciliation: '未知归属进程需对账',
 }
@@ -236,6 +237,7 @@ export const WORKER_REASON: Record<string, string> = {
   worker_exception: 'Worker 异常',
   worker_failed: 'Worker 失败',
   event_collection_incomplete: '事件收集不完整',
+  segment_terminal_conflict: '切片终态冲突',
   retrying: '录制失败，等待重试',
   needs_reconcile: '任务需要对账',
   segment_quality: '切片存在质量标记',

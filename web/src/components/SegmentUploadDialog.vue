@@ -54,7 +54,7 @@ function show(row: Segment, existing?: Arrangement) {
 }
 
 async function openForm(revise?: string) {
-  if (!selected.value) return
+  if (selected.value?.status !== 'finished') return
   const row = selected.value
   context.value = undefined
   revision.value = !!revise
@@ -158,8 +158,8 @@ defineExpose({ show })
       <el-button v-if="context" type="primary" :disabled="!canConfirm" :loading="busy" @click="confirm">{{ revision ? '确认修订并安排' : '确认安排' }}</el-button>
       <template v-else-if="detail">
         <el-button :disabled="busy" @click="reload()">查询原单</el-button>
-        <el-button v-if="detail.can_continue" type="primary" :disabled="busy" @click="reload(true)">继续原安排</el-button>
-        <el-button v-if="detail.can_revise" :disabled="busy" @click="openForm(detail.id)">修订原安排</el-button>
+        <el-button v-if="detail.can_continue && selected?.status === 'finished'" type="primary" :disabled="busy" @click="reload(true)">继续原安排</el-button>
+        <el-button v-if="detail.can_revise && selected?.status === 'finished'" :disabled="busy" @click="openForm(detail.id)">修订原安排</el-button>
       </template>
     </template>
   </el-dialog>

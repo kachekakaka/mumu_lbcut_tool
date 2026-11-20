@@ -1,6 +1,11 @@
 """测试统一命令超时执行器与单调时钟流程截止时间 (Ticket 02)。"""
+import json
+import os
 import sys
 import time
+import threading
+
+import psutil
 import pytest
 from src.worker.executor import (
     run_command,
@@ -59,15 +64,57 @@ def test_monotonic_deadline_budget_and_expiry():
         expired_deadline.check_not_expired()
 
 
-def test_readonly_client_timeout_does_not_wait_for_tree_scan(monkeypatch):
-    def unexpected_scan(pid):
-        pytest.fail('只读客户端超时不应调用进程树扫描')
-    monkeypatch.setattr('src.worker.executor._kill_process_tree',unexpected_scan)
-    started=time.monotonic()
-    with pytest.raises(CommandTimeoutError):
-        run_command([sys.executable,'-c','import time; time.sleep(10)'],timeout=.3,
-                    kill_tree_on_timeout=False)
-    assert time.monotonic()-started<1.5
+@pytest.mark.skipif(os.name != 'nt', reason='验证 Windows Job 和继承管道')
+@pytest.mark.parametrize('owned', [True, False], ids=['独占进程树', '共享服务'])
+def test_timeout_reclaims_only_owned_processes_and_releases_pipes(tmp_path, owned):
+    grand = "import pathlib,sys,time; time.sleep(2); pathlib.Path(sys.argv[1]).write_text('ready'); time.sleep(15)"
+    child = (
+        "import json,subprocess,sys,time; p=subprocess.Popen([sys.executable,'-c',sys.argv[1],sys.argv[2]]);"
+        "print(json.dumps({'grandchild':p.pid}),flush=True); "
+        "print('grandchild inherits stderr',file=sys.stderr,flush=True); time.sleep(15)"
+    )
+    root = (
+        "import json,os,subprocess,sys,time; p=subprocess.Popen([sys.executable,'-c',sys.argv[1],*sys.argv[2:]]);"
+        "print(json.dumps({'root':os.getpid(),'child':p.pid}),flush=True); time.sleep(15)"
+    )
+    marker = tmp_path / 'shared-response.txt'
+    baseline = set(threading.enumerate())
+    with pytest.raises(CommandTimeoutError) as captured:
+        run_command([sys.executable, '-u', '-c', root, child, grand, str(marker)],
+                    timeout=1.2, kill_tree_on_timeout=owned)
+    pids = {name: pid for line in captured.value.stdout.splitlines() for name, pid in json.loads(line).items()}
+    assert len(pids) == 3 and len(set(pids.values())) == 3
+
+    def assert_exited(pid):
+        # Windows PID 可能仍被内核登记。等待进程对象确认退出。
+        try:
+            psutil.Process(pid).wait(.3)
+        except psutil.NoSuchProcess:
+            pass
+
+    try:
+        assert 'inherits stderr' in captured.value.stderr
+        assert_exited(pids['root'])
+        if owned:
+            assert_exited(pids['child'])
+            assert_exited(pids['grandchild'])
+            assert not marker.exists()
+        else:
+            until = time.monotonic() + 3
+            while not marker.exists() and time.monotonic() < until:
+                time.sleep(.02)
+            assert marker.read_text() == 'ready'
+            with pytest.raises(psutil.TimeoutExpired):
+                psutil.Process(pids['grandchild']).wait(.05)
+        assert set(threading.enumerate()) == baseline
+    finally:
+        for pid in (pids['child'], pids['grandchild']):
+            try:
+                process = psutil.Process(pid)
+                process.kill()
+                process.wait(3)
+            except psutil.NoSuchProcess:
+                pass
 
 
 def test_monotonic_deadline_dynamic_subcommand_clipping():

@@ -179,16 +179,22 @@ class WorkerEventEmitter:
         self._fallback = None
         self._recent: deque[str] = deque(maxlen=self.RECENT_LIMIT)
         self._lock = threading.Lock()
+        self._event_seq = 0
 
     def set_context(self, **values):
-        self.context.update(values)
+        with self._lock:
+            if "run_id" in values and values["run_id"] != self.context.get("run_id"):
+                self._event_seq = 0
+                self._recent.clear()
+            self.context.update(values)
 
     def emit(self, event_obj: BaseWorkerEvent, context=None):
         """发射单行 JSON。"""
-        payload = {**self.context, **(context or {}), **asdict(event_obj)}
-        line = json.dumps(payload, ensure_ascii=False) + "\n"
         lost_now = False
         with self._lock:
+            self._event_seq += 1
+            payload = {**self.context, **(context or {}), **asdict(event_obj), "event_seq": self._event_seq}
+            line = json.dumps(payload, ensure_ascii=False) + "\n"
             if not self.stream_lost:
                 try:
                     self.stream.write(line)
@@ -218,7 +224,12 @@ class WorkerEventEmitter:
                 self._fallback.write(line)
             self._fallback.flush()
         except OSError:
-            self._fallback = None
+            if self._fallback is not None:
+                try:
+                    self._fallback.close()
+                except OSError:
+                    pass
+                self._fallback = None
 
     def _write_fallback(self, line: str):
         if self._fallback is None:
@@ -227,6 +238,10 @@ class WorkerEventEmitter:
             self._fallback.write(line)
             self._fallback.flush()
         except OSError:
+            try:
+                self._fallback.close()
+            except OSError:
+                pass
             self._fallback = None
 
     def close(self):

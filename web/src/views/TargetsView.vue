@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '../api'
@@ -24,6 +24,8 @@ const filters = reactive({
 const focus = computed(() => String(route.query.focus ?? ''))
 const items = ref<Target[]>([])
 const addOpen = ref(false)
+const callbackOwner = Symbol('targets')
+onUnmounted(() => ops.detachOwner(callbackOwner))
 const { page, size, total, query, fit } = usePager()
 
 usePageLoader(async () => {
@@ -59,12 +61,13 @@ function notices(t: Target): { type: 'warning' | 'danger' | 'info'; text: string
 }
 
 function record(t: Target) {
-  ops.start('record', t.id, `立即开录：${name(t)}`, (key) => api.record(t.id, key), (op) => {
+  const targetId = t.id
+  ops.start('record', targetId, `立即开录：${name(t)}`, (key) => api.record(targetId, key), (op) => {
     const result = op.command?.result
     if (op.state === 'succeeded' && result?.outcome === 'existing' && result.job_id && route.path === '/targets') {
       void router.push({ path: '/jobs', query: { job: String(result.job_id) } })
     }
-  })
+  }, callbackOwner)
   ElMessage.info('已提交开录，后端会重新确认开播')
 }
 

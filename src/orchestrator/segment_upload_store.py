@@ -1,6 +1,6 @@
 """手动安排及每个步骤的派发权。与录制调度使用独立的数据库。"""
 
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, nullcontext
 import json
 import sqlite3
 from threading import Lock
@@ -62,19 +62,21 @@ class ArrangementStore:
         self._initialized = False
 
     @contextmanager
-    def connect(self, write=False):
+    def connect(self, write=False, guard=nullcontext):
         with self._lock:
             if not self._initialized:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
                 with closing(sqlite3.connect(self.path, timeout=2)) as db:
+                    db.execute("PRAGMA journal_mode=WAL")
                     db.executescript(SCHEMA)
                 self._initialized = True
-        with closing(sqlite3.connect(self.path, timeout=2)) as db, db:
+        with closing(sqlite3.connect(self.path, timeout=2)) as db:
             db.row_factory = sqlite3.Row
             db.execute("PRAGMA foreign_keys=ON")
             if write:
                 db.execute("BEGIN IMMEDIATE")
-            yield db
+            with guard(), db:
+                yield db
 
     def get(self, record_id):
         with self.connect() as db:
@@ -98,11 +100,11 @@ class ArrangementStore:
                 [value for pair in segments for value in pair],
             )]
 
-    def confirm(self, key, job, index, deployment, frozen, expected, revise, freeze_requests):
+    def confirm(self, key, job, index, deployment, frozen, expected, revise, freeze_requests, *, guard=nullcontext):
         account = frozen["account"]["id"]
         intent = encode({"job": job, "index": index, "deployment": deployment,
                          "account": account, "input": confirmed_input(frozen), "revise": revise})
-        with self.connect(write=True) as db:
+        with self.connect(write=True, guard=guard) as db:
             old = db.execute(
                 """SELECT * FROM arrangements
                    WHERE job_id=? AND segment_index=? AND deployment=? AND account_id=?""",
@@ -179,8 +181,8 @@ class ArrangementStore:
         args = (row["id"], row["stage"], row["generation"], row["revision"])
         return (sql + " AND lease_until>?", (*args, self.clock())) if live else (sql, args)
 
-    def mark_sent(self, row):
-        with self.connect(write=True) as db:
+    def mark_sent(self, row, *, guard=nullcontext):
+        with self.connect(write=True, guard=guard) as db:
             where, args = self._fence(row)
             return db.execute(
                 f"UPDATE arrangements SET attempts=attempts+1 WHERE {where}", args

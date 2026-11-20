@@ -10,6 +10,7 @@ import csv
 import ctypes
 import ctypes.wintypes as W
 import io
+import math
 import logging
 import os
 from pathlib import Path
@@ -30,10 +31,11 @@ SEGMENT_TIME_DELTA = 0.05
 
 class NamedPipeBridge:
     """有界内存的单写者字节桥；不创建长期增长的中间录像文件。"""
-    def __init__(self):
+    def __init__(self, job_id=None):
         if os.name != 'nt':
             raise RuntimeError('连续采集命名管道当前只支持 Windows')
-        self.name = r'\\.\pipe\mumu_capture_' + uuid.uuid4().hex
+        prefix = str(job_id) + '_' if job_id and re.fullmatch(r'[0-9a-f]{32}', job_id) else ''
+        self.name = r'\\.\pipe\mumu_capture_' + prefix + uuid.uuid4().hex
         self.bytes_forwarded = 0
         self.error = None
         self.done = threading.Event()
@@ -123,9 +125,14 @@ def read_fragment_manifest(directory: Path) -> dict[int, Fragment]:
     path = directory / 'segments.csv'
     if not path.exists():
         return result
-    text = path.read_text(encoding='utf-8')
-    complete = text[:text.rfind('\n')+1]
-    for row in csv.reader(io.StringIO(complete)):
+    data = path.read_bytes()
+    complete = data[:data.rfind(b'\n')+1]
+    return _parse_fragment_rows(directory, complete)
+
+
+def _parse_fragment_rows(directory, complete):
+    result = {}
+    for row in csv.reader(io.StringIO(complete.decode('utf-8'))):
         if len(row) != 3:
             raise ValueError('分装完成清单格式错误')
         name, start, end = row
@@ -168,6 +175,12 @@ class ContinuousPipeline:
         self.progress = {}
         self.command = []
         self._fragments = {}
+        self._manifest_id = None
+        self._manifest_offset = 0
+        self._manifest_tail = b''
+        self._last_cut_pts = 0.0
+        self.timeline_invalid = False
+        self.manifest_rebuilt = False
         self.current_file_path = None
         self.current_segment_index = 0
 
@@ -175,7 +188,7 @@ class ContinuousPipeline:
         if self._proc or self._mux:
             raise RuntimeError('连续采集实例不可重用')
         self.directory.mkdir(parents=True, exist_ok=False)
-        self.bridge = NamedPipeBridge()
+        self.bridge = NamedPipeBridge(self.output_dir.parent.name)
         flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0
         self._mux_log = (self.directory/'segmenter.stderr.log').open('xb')
         limit = []
@@ -233,8 +246,8 @@ class ContinuousPipeline:
                     raise InterruptedError('启动连续采集时收到停止请求')
                 if not self.is_recording():
                     raise RuntimeError('连续采集启动失败: '+self.failure_details())
-                fragments=self.fragments()
-                if any(f.path.exists() and f.path.stat().st_size>1024 for f in fragments):
+                first = self.directory / f'part_{self.start_index:06d}.mp4'
+                if first.is_file() and first.stat().st_size > 1024:
                     self.first_media_observed_at=time.time()
                     return
                 time.sleep(.05)
@@ -252,17 +265,71 @@ class ContinuousPipeline:
             log.info('[capture] %s',line)
 
     def fragments(self):
-        completed=read_fragment_manifest(self.directory)
-        for path in sorted(self.directory.glob('part_*.mp4')):
-            match=re.fullmatch(r'part_(\d+)\.mp4',path.name)
-            if match:
-                idx=int(match.group(1))
-                self._fragments.setdefault(idx,Fragment(idx,path,False))
-        self._fragments.update(completed)
-        if self._fragments:
-            newest=self._fragments[max(self._fragments)]
-            self.current_segment_index,self.current_file_path=newest.index,newest.path
+        self.fragment_updates()
         return [self._fragments[i] for i in sorted(self._fragments)]
+
+    def fragment_updates(self, full=False):
+        """只读取新增 CSV 字节并探查下一片；结束或清单换代时核对目录。"""
+        path = self.directory / 'segments.csv'
+        try:
+            manifest = path.open('rb')
+        except FileNotFoundError:
+            full = full or self._manifest_id is not None
+            self._manifest_id = None
+            self._manifest_offset = 0
+            self._manifest_tail = b''
+            completed = {}
+        else:
+            with manifest:
+                info = os.fstat(manifest.fileno())
+                identity = (info.st_dev, info.st_ino)
+                full = full or (self._manifest_id is not None and (
+                    identity != self._manifest_id or info.st_size < self._manifest_offset))
+                offset = 0 if full else self._manifest_offset
+                manifest.seek(offset)
+                data = (b'' if full else self._manifest_tail) + manifest.read()
+                last_newline = data.rfind(b'\n') + 1
+                completed = _parse_fragment_rows(self.directory, data[:last_newline]) if last_newline else {}
+                self._manifest_id = identity
+                self._manifest_offset = manifest.tell()
+                self._manifest_tail = data[last_newline:]
+
+        self.manifest_rebuilt = full
+        if full:
+            self._last_cut_pts = 0.0
+            current = {}
+            for raw in self.directory.glob('part_*.mp4'):
+                if match := re.fullmatch(r'part_(\d+)\.mp4', raw.name):
+                    idx = int(match.group(1))
+                    current[idx] = Fragment(idx, raw, False)
+            current.update(completed)
+            # 已观察的未封片即使原文件消失，收尾仍须为它写入终态。
+            for idx, old in self._fragments.items():
+                if idx not in current:
+                    current[idx] = Fragment(idx, old.path, False)
+            self._fragments = current
+            self.current_segment_index = max(current, default=0)
+        else:
+            current = dict(completed)
+            # CSV 可以一次封好数片，打开的文件一定紧接最后已出现的序号。
+            last = max(self.current_segment_index, max(completed, default=0))
+            next_index = last + 1 if last else self.start_index
+            candidate = self.directory / f'part_{next_index:06d}.mp4'
+            if candidate.is_file():
+                current[next_index] = Fragment(next_index, candidate, False)
+                last = next_index
+            self._fragments.update(current)
+            self.current_segment_index = last
+        if self.current_segment_index:
+            self.current_file_path = self._fragments[self.current_segment_index].path
+        for idx in sorted(completed):
+            f = completed[idx]
+            if (not math.isfinite(f.start_pts) or not math.isfinite(f.end_pts)
+                    or f.start_pts < 0 or f.end_pts < max(f.start_pts, self._last_cut_pts)):
+                self.timeline_invalid = True
+            elif f.closed:
+                self._last_cut_pts = f.end_pts
+        return [current[i] for i in sorted(current)]
 
     def is_recording(self):
         return bool(self._proc and self._mux and self._proc.poll() is None
@@ -293,8 +360,7 @@ class ContinuousPipeline:
     def get_current_segment_elapsed(self):
         media=self.media_time()
         if media is None:return 0.0
-        cut=max((f.end_pts for f in self._fragments.values() if f.closed and f.end_pts is not None),default=0.0)
-        return max(0.0,media-cut)
+        return max(0.0,media-self._last_cut_pts)
 
     def reached_total_duration(self):
         """分装器按 -t 正常结束即为录满总时长；其他原因退出仍按采集故障处理。"""

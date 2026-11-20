@@ -3,6 +3,8 @@
 import asyncio
 from copy import deepcopy
 import json
+import sqlite3
+import threading
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -443,4 +445,198 @@ def test_upload_endpoints_share_local_only_and_page_credentials(tmp_path):
                     assert (await c.get(root + "/segment-uploads", params=params,
                                         headers=headers | {"Origin": "http://other"})).status_code == 403
 
+    asyncio.run(scenario())
+
+
+@pytest.fixture
+def routed_upload(tmp_path, monkeypatch):
+    from src.orchestrator import segment_upload_api
+    from src.orchestrator.storage import Store
+
+    core = Core()
+    monkeypatch.setattr(segment_upload_api, 'PostingCore', lambda _: core)
+    store = Store(tmp_path / 'scheduler.sqlite3')
+    job = 'a' * 32
+    target = store.add_target('fixture', now=1)
+    with store.transaction() as db:
+        db.execute("INSERT INTO jobs(id,target_id,session_key,status,created_at) VALUES(?,?,'s','finished',1)",
+                   (job, target))
+    for index in (1, 2):
+        clip = tmp_path / f'clip-{index}.mp4'
+        clip.write_bytes(b'synthetic mp4')
+        store.record_event(job, dict(event='segment_started', segment_index=index, file_path=str(clip)), 1)
+        store.record_event(job, dict(event='segment_finished', segment_index=index, file_path=str(clip)), 2)
+    app = FastAPI()
+    @app.get('/test-light')
+    async def light():
+        return {'ready': True}
+    install_accounts(app, SimpleNamespace(data_dir=tmp_path, core_profile=None, port=8000, output_dir=tmp_path),
+                     SimpleNamespace(state='running', store=store))
+    uploads = ArrangementStore(tmp_path / 'upload-core' / 'segment-uploads.sqlite3')
+    transport = httpx.ASGITransport(app=app, client=('127.0.0.1', 50000))
+    yield store, job, core, uploads, transport
+    store.close()
+
+
+UPLOAD_BASE = '/api/v1/bilibili'
+UPLOAD = UPLOAD_BASE + '/segment-uploads'
+
+
+async def upload_client_ready(client):
+    client.headers['X-Mumu-Page'] = (await client.get(UPLOAD_BASE + '/bootstrap')).json()['token']
+
+
+@pytest.mark.parametrize('boundary', ['confirm', 'register', 'submit', 'already_sent'])
+def test_http_conflict_fences_new_sends_and_keeps_original_query(routed_upload, monkeypatch, boundary):
+    store, job, core, uploads, transport = routed_upload
+    entered, release = threading.Event(), threading.Event()
+    mark = ArrangementStore.mark_sent
+    def fenced(self, row, **kwargs):
+        if row['segment_index'] == 1 and row['stage'] == boundary:
+            entered.set()
+            assert release.wait(5)
+        return mark(self, row, **kwargs)
+    monkeypatch.setattr(ArrangementStore, 'mark_sent', fenced)
+
+    def conflict():
+        store.record_event(job, dict(event='segment_aborted', segment_index=1, file_path='second.mp4'), 3)
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=transport, base_url='http://127.0.0.1:8000') as c:
+            await upload_client_ready(c)
+            async def context(index):
+                return (await c.get(UPLOAD + f'/context/{job}/{index}')).json()
+            def send(dialog):
+                return c.post(UPLOAD, json=dict(ticket=dialog['ticket'], account_id=ACCOUNT.id,
+                    parameters=PARAMETERS, quality_confirmed=False), headers={'Idempotency-Key': str(uuid4())})
+            dialog = await context(1)
+            if boundary == 'confirm':
+                conflict()
+                assert (await send(dialog)).status_code == 409
+            elif boundary == 'already_sent':
+                first = (await send(dialog)).json()
+                conflict()
+                details = await c.get(UPLOAD + '/' + first['id'])
+                assert details.json()['task_id'] == first['task_id']
+            else:
+                submit = asyncio.create_task(send(dialog))
+                try:
+                    assert await asyncio.to_thread(entered.wait, 3)
+                    assert len(uploads.for_segments([(job, 1)])) == 1
+                    conflict()
+                finally:
+                    release.set()
+                result = (await submit).json()
+                assert result['problem'] == 'segment_unfinished' and result['task_id'] is None
+            assert (await c.get(UPLOAD + f'/context/{job}/1')).status_code == 409
+            posts = [item[0] for item in core.trace if item[0].startswith('POST')]
+            assert posts == {'confirm': [], 'register': [], 'submit': ['POST register'],
+                             'already_sent': ['POST register', 'POST submit']}[boundary]
+            rows = uploads.for_segments([(job, 1)])
+            assert len(rows) == (0 if boundary == 'confirm' else 1)
+            second = await send(await context(2))
+            assert second.status_code == 200 and second.json()['task_id']
+            assert [item[0] for item in core.trace if item[0].startswith('POST')][len(posts):] == [
+                'POST register', 'POST submit']
+    asyncio.run(scenario())
+
+
+def test_upload_sqlite_lock_does_not_block_asgi_or_timer(routed_upload, monkeypatch):
+    _, job, core, uploads, transport = routed_upload
+    entered = threading.Event()
+    confirm_original = ArrangementStore.confirm
+    def confirm_seen(self, *args, **kwargs):
+        entered.set()
+        return confirm_original(self, *args, **kwargs)
+    monkeypatch.setattr(ArrangementStore, 'confirm', confirm_seen)
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=transport, base_url='http://127.0.0.1:8000') as c:
+            await upload_client_ready(c)
+            dialog = (await c.get(UPLOAD + f'/context/{job}/1')).json()
+            lock = sqlite3.connect(uploads.path)
+            lock.execute('BEGIN IMMEDIATE')
+            try:
+                request = asyncio.create_task(c.post(UPLOAD, json=dict(
+                    ticket=dialog['ticket'], account_id=ACCOUNT.id, parameters=PARAMETERS, quality_confirmed=False),
+                    headers={'Idempotency-Key': str(uuid4())}))
+                assert await asyncio.to_thread(entered.wait, 2)
+                timer = asyncio.create_task(asyncio.sleep(.025))
+                response = await c.get('/test-light')
+                await timer
+                assert response.json() == {'ready': True} and not request.done() and not core.trace
+                await asyncio.sleep(.32)
+            finally:
+                lock.rollback()
+                lock.close()
+            assert (await request).json()['task_id']
+            assert len(core.tasks) == 1
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('position', ['before_claim', 'after_claim'])
+def test_cancelled_http_claim_releases_only_its_generation(routed_upload, monkeypatch, position):
+    _, job, core, uploads, transport = routed_upload
+    original = ArrangementStore.claim
+    entered, release, cleaned = threading.Event(), threading.Event(), threading.Event()
+    now = [100.0]
+    abandoned = []
+
+    def delayed(store, record, **kwargs):
+        store.clock = lambda: now[0]
+        if abandoned or not kwargs['dispatch']:
+            return original(store, record, **kwargs)
+        abandoned.append(None)
+        if position == 'before_claim':
+            entered.set()
+            assert release.wait(4)
+        row = original(store, record, **kwargs)
+        abandoned[0] = row['generation']
+        if position == 'after_claim':
+            entered.set()
+            assert release.wait(4)
+        return row
+
+    original_release = ArrangementStore.release
+    def release_claim(store, row):
+        try:
+            return original_release(store, row)
+        finally:
+            if row['generation'] == abandoned[0]:
+                cleaned.set()
+    monkeypatch.setattr(ArrangementStore, 'claim', delayed)
+    monkeypatch.setattr(ArrangementStore, 'release', release_claim)
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=transport, base_url='http://127.0.0.1:8000') as c:
+            await upload_client_ready(c)
+            dialog = (await c.get(UPLOAD + f'/context/{job}/1')).json()
+            request = asyncio.create_task(c.post(UPLOAD, json=dict(ticket=dialog['ticket'],
+                account_id=ACCOUNT.id, parameters=PARAMETERS, quality_confirmed=False),
+                headers={'Idempotency-Key': str(uuid4())}))
+            try:
+                assert await asyncio.to_thread(entered.wait, 3)
+                request.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await request
+                original_row, = uploads.for_segments([(job, 1)])
+                assert not core.trace
+                if position == 'before_claim':
+                    release.set()
+                    assert await asyncio.to_thread(cleaned.wait, 2)
+                else:
+                    now[0] += 19
+                response = await c.post(UPLOAD + '/' + original_row['id'] + '/continue',
+                    json={'revision': original_row['revision']}, headers={'Idempotency-Key': str(uuid4())})
+                linked = response.json()
+                assert linked['task_id'] and linked['id'] == original_row['id']
+                fresh = uploads.get(linked['id'])
+                assert fresh['generation'] > abandoned[0]
+                release.set()
+                assert await asyncio.to_thread(cleaned.wait, 2)
+                assert uploads.get(linked['id']) == fresh
+                assert [entry[0] for entry in core.trace if entry[0].startswith('POST')] == [
+                    'POST register', 'POST submit']
+            finally:
+                release.set()
     asyncio.run(scenario())

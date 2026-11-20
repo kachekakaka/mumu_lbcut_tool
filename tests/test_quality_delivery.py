@@ -134,13 +134,29 @@ def test_quality_transaction_rolls_back_and_retry_is_possible(store, caplog, inc
     assert store.row("SELECT status FROM jobs WHERE id='job'")['status'] == ('failed' if incomplete else 'finished_with_warnings')
 
 
-def test_conflicting_terminal_event_rolls_back_time_and_event(store):
-    segment(store)
-    before = snapshot(store)
-    with pytest.raises(ValueError, match='冲突终态'):
-        store.record_event('job', dict(event='segment_aborted', event_id='conflict', segment_index=1,
-                           timestamp=100, file_path='clip.mp4'), 100)
-    assert snapshot(store) == before
+@pytest.mark.parametrize('first, second', [
+    ('segment_finished', 'segment_aborted'),
+    ('segment_aborted', 'segment_finished'),
+    ('segment_finished', 'segment_finished'),
+])
+def test_conflicting_terminal_event_keeps_both_events_and_removes_formal_path(store, first, second):
+    store.record_event('job', dict(event='segment_started', segment_index=1, file_path='raw.mp4'), 1)
+    store.record_event('job', dict(event=first, event_id='original', segment_index=1,
+                                  file_path='first.mp4', reason='原终态'), 2)
+    event = dict(event=second, event_id='conflict', segment_index=1,
+                 timestamp=100, file_path='second.mp4', reason='冲突终态')
+    for _ in range(2):
+        store.record_event('job', event, 100)
+    payloads = [json.loads(row['payload']) for row in store.rows(
+        "SELECT payload FROM events WHERE kind IN ('segment_finished','segment_aborted') ORDER BY rowid")]
+    assert [(p['event'],p['event_id'],p['file_path'],p['reason']) for p in payloads] == [
+        (first,'original','first.mp4','原终态'), (second,'conflict','second.mp4','冲突终态')]
+    segment_row = store.row("SELECT status,file_path,reason FROM segments")
+    assert segment_row == dict(status='conflicted', file_path=None, reason='segment_terminal_conflict')
+    store.finish_job('job', 0, 101, True, 'completed')
+    job = store.row("SELECT status,error_reason,collection_complete FROM jobs")
+    assert job['status'] == 'failed' and job['collection_complete'] == 0
+    assert '切片 1 终态冲突' in job['error_reason']
 
 
 def test_warning_before_start_still_finishes_with_warnings(store):

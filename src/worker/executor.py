@@ -6,9 +6,13 @@ from dataclasses import dataclass
 import logging
 import os
 from pathlib import Path
+import signal
 import subprocess
-import sys
 import time
+
+import psutil
+from src.mvp.command import decode_output, read_windows_output, run_client
+from src.mvp.windows_job import WindowsJob, close_process_handle
 
 logger = logging.getLogger("WorkerExecutor")
 
@@ -75,20 +79,6 @@ class MonotonicDeadline:
         return min(max_allowed, remaining)
 
 
-def _kill_process_tree(pid: int) -> None:
-    """Windows 下通过 taskkill 强杀目标进程及其所有子孙进程。"""
-    try:
-        subprocess.run(
-            ["taskkill", "/F", "/T", "/PID", str(pid)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=3.0,
-            check=False
-        )
-    except Exception:
-        pass
-
-
 def run_command(
     cmd: list[str],
     timeout: float | None = None,
@@ -118,26 +108,22 @@ def run_command(
     if env:
         merged_env.update(env)
 
+    proc = None
+    owned_job = WindowsJob() if kill_tree_on_timeout and os.name == "nt" else None
     try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            cwd=str(cwd) if cwd else None,
-            env=merged_env,
-        )
-    except Exception as e:
-        logger.error(f"启动子进程失败: {' '.join(cmd)}, 错误: {e}")
-        raise
-
-    try:
-        stdout_data, stderr_data = proc.communicate(timeout=timeout)
-        duration = time.monotonic() - start_mono
-        exit_code = proc.returncode
-
+        if not kill_tree_on_timeout and timeout is not None:
+            result = run_client(cmd, timeout=timeout, cwd=cwd, env=merged_env)
+            stdout_data, stderr_data, exit_code = result.stdout, result.stderr, result.returncode
+        else:
+            # CREATE_SUSPENDED：在首条应用程序指令执行前建立归属。
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
+                cwd=cwd, env=merged_env, creationflags=0x00000004 if owned_job else 0,
+                start_new_session=kill_tree_on_timeout and os.name != "nt")
+            if owned_job:
+                owned_job.assign(proc)
+                psutil.Process(proc.pid).resume()
+            out, err = read_windows_output(proc, timeout) if os.name == "nt" else proc.communicate(timeout=timeout)
+            stdout_data, stderr_data, exit_code = decode_output(out), decode_output(err), proc.returncode
         if check and exit_code != 0:
             raise subprocess.CalledProcessError(
                 returncode=exit_code,
@@ -150,30 +136,36 @@ def run_command(
             exit_code=exit_code,
             stdout=stdout_data,
             stderr=stderr_data,
-            duration=duration,
+            duration=time.monotonic() - start_mono,
         )
 
-    except subprocess.TimeoutExpired:
-        cleanup = '执行子进程树强杀' if kill_tree_on_timeout else '结束本次命令客户端'
-        logger.warning(f"外部命令超时 (时限 {timeout}s)，{cleanup}: {' '.join(cmd)} (PID: {proc.pid})")
-        try:
-            proc.kill()
-        except Exception:
-            pass
-        if kill_tree_on_timeout:
-            _kill_process_tree(proc.pid)
-        try:
-            stdout_data, stderr_data = proc.communicate(timeout=.2 if not kill_tree_on_timeout else 1)
-        except subprocess.TimeoutExpired:
-            # 只读客户端不等待其他进程持有的管道；本次观察仍按超时处理。
-            stdout_data, stderr_data = '', ''
-            for name in ('stdout', 'stderr'):
-                reader = getattr(proc, name + '_thread', None)
-                if reader is None or not reader.is_alive():
-                    getattr(proc, name).close()
+    except subprocess.TimeoutExpired as exc:
+        logger.warning("外部命令超时（%.3f 秒）：%s", timeout, " ".join(cmd))
+        if proc and kill_tree_on_timeout and os.name != "nt":
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
         raise CommandTimeoutError(
             cmd=cmd,
             timeout=timeout or 0.0,
-            stdout=stdout_data,
-            stderr=stderr_data
-        )
+            stdout=decode_output(exc.output),
+            stderr=decode_output(exc.stderr)
+        ) from exc
+    finally:
+        try:
+            if owned_job:
+                try:
+                    owned_job.terminate_and_wait()
+                finally:
+                    owned_job.close()
+        finally:
+            if proc:
+                try:
+                    if proc.poll() is None:
+                        proc.kill()
+                    proc.wait(timeout=.5)
+                finally:
+                    proc.stdout.close()
+                    proc.stderr.close()
+                    close_process_handle(proc)

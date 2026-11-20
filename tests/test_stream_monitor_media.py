@@ -129,6 +129,7 @@ class QualitySession:
                                          SimpleNamespace(ffmpeg='ffmpeg', ffprobe='ffprobe'))
         self.session.pipe = SimpleNamespace(monitor=monitor)
         self.session.ledger[1] = {'epoch': self.session.epoch, 'terminal': False}
+        self.session.latest_segment_index = 1
 
     def flags(self):
         return [e['flag'] for e in map(json.loads, self.stream.getvalue().splitlines())

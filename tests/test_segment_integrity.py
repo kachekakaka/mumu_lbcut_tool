@@ -11,14 +11,14 @@ from src.worker.segment_verifier import (
 )
 
 
-def test_verify_segment_file_rejects_zero_or_tiny_file(tmp_path):
+def test_verify_segment_file_rejects_zero_or_tiny_file(tmp_path, media_tools):
     """0 字节或极小截断文件必须判定为无效损坏文件。"""
     tiny_file = tmp_path / "tiny.mp4"
     tiny_file.write_bytes(b"\x00" * 50)  # 50 字节
 
-    result = verify_segment_file(tiny_file, min_size_bytes=1024)
+    result = verify_segment_file(tiny_file, min_size_bytes=1024, ffprobe_exe=media_tools.ffprobe)
     assert not result.is_valid
-    assert result.reject_reason  # 依据容器解析失败，而非固定大小门槛
+    assert 'ffprobe' in result.reject_reason and '固定媒体工具' not in result.reject_reason
 
 
 def test_verify_segment_file_rejects_missing_audio(tmp_path):

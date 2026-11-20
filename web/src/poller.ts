@@ -71,13 +71,23 @@ export async function refreshNow(): Promise<void> {
   }
 }
 
+function onVisibilityChange() {
+  if (!document.hidden) void refreshNow()
+}
+
 export function startPolling() {
   if (started) return
   started = true
-  document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) void refreshNow()
-  })
+  document.addEventListener('visibilitychange', onVisibilityChange)
   void refreshNow()
+}
+
+export function stopPolling() {
+  started = false
+  rerun = false
+  if (timer) clearTimeout(timer)
+  timer = null
+  document.removeEventListener('visibilitychange', onVisibilityChange)
 }
 
 /** 注册当前页面的数据读取；同一时间只有一个页面读取在轮询中。 */

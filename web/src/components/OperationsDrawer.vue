@@ -57,6 +57,9 @@ const levelType = { success: 'success', info: 'info', warning: 'warning', error:
       >
         用同一请求编号重试
       </el-button>
+      <el-button v-if="op.state === 'unknown' || op.followError" size="small" @click="ops.endTracking(op)">
+        结束本页跟踪
+      </el-button>
     </el-card>
   </el-drawer>
 </template>

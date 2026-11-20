@@ -1,6 +1,8 @@
 """本机桥接集成，用合成 Core 控制丢包点与会话结果。"""
 
 import asyncio
+import sqlite3
+import threading
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -233,3 +235,117 @@ def test_request_survives_sender_process_exit(tmp_path):
     reopened = LoginStore(path)
     assert reopened.begin("deployment", str(uuid4()), "create", None)[0]["key"] == key
     assert reopened.begin("deployment", key, "create", None) == ({"key": key}, True)
+
+
+@pytest.mark.parametrize("pause", ["before_begin", "after_begin", "after_remote", "confirmed"])
+def test_cancel_http_keeps_single_owner_until_login_log_has_settled(service, monkeypatch, pause):
+    app, fake = service
+    entered, resume = threading.Event(), threading.Event()
+    finishing, finish_gate = threading.Event(), threading.Event()
+    first = [True]
+    begin = LoginStore.begin
+    finish = LoginStore.finish
+    original_call = fake.call
+    sends = set()
+
+    def delayed_begin(store, *args):
+        gate_this_time, first[0] = first[0], False
+        if gate_this_time and pause == "before_begin":
+            entered.set()
+            assert resume.wait(4)
+        result = begin(store, *args)
+        if gate_this_time and pause == "after_begin":
+            entered.set()
+            assert resume.wait(4)
+        return result
+
+    def delayed_finish(store, *args, **kwargs):
+        if args[1] in ("unknown", "not_sent") or pause == "confirmed" and args[1] == "linked":
+            finishing.set()
+            assert finish_gate.wait(4)
+        return finish(store, *args, **kwargs)
+
+    async def delayed_call(port, path, *, body=None, key=None, **kwargs):
+        if body is not None:
+            new_key = key not in sends
+            sends.add(key)
+            if new_key and pause == "after_remote":
+                entered.set()
+                await asyncio.Event().wait()
+        return await original_call(port, path, body=body, key=key, **kwargs)
+
+    monkeypatch.setattr(LoginStore, "begin", delayed_begin)
+    monkeypatch.setattr(LoginStore, "finish", delayed_finish)
+    monkeypatch.setattr(api, "call", delayed_call)
+
+    async def scenario():
+        async with client(app) as c:
+            await connect(c)
+            key = str(uuid4())
+            def send():
+                return c.post("operations", json={"action": "create", "target": None, "deployment": "test"},
+                              headers={"Idempotency-Key": key})
+            try:
+                request = asyncio.create_task(send())
+                assert await asyncio.to_thread((finishing if pause == "confirmed" else entered).wait, 3)
+                request.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await request
+                resume.set()
+                assert await asyncio.to_thread(finishing.wait, 3)
+                repeated = asyncio.create_task(send())
+                await asyncio.sleep(.03)
+                assert not repeated.done()
+                assert len(sends) == int(pause in ("after_remote", "confirmed"))
+                finish_gate.set()
+                result = (await asyncio.wait_for(repeated, 4)).json()
+                assert result == {"key": key, "status": "linked", "session": fake.sid} or result == {
+                    "key": key, "status": "linked", "session": fake.sid, "error": None,
+                }
+                entries = (await c.get("operations")).json()["items"]
+                assert len(entries) == 1 and entries[0]["status"] == "linked" and sends == {key}
+                assert fake.keys == [key]
+            finally:
+                resume.set()
+                finish_gate.set()
+                await app.state.finish_login_actions()
+
+    asyncio.run(scenario())
+
+
+def test_login_write_lock_does_not_block_asgi_or_timer(service, monkeypatch, tmp_path):
+    app, fake = service
+    started = threading.Event()
+    begin = LoginStore.begin
+    def track(store, *args):
+        started.set()
+        return begin(store, *args)
+    monkeypatch.setattr(LoginStore, 'begin', track)
+
+    @app.get('/test-light')
+    async def light():
+        return {'ready': True}
+
+    async def scenario():
+        async with client(app) as c:
+            await connect(c)
+            assert (await c.get('operations')).status_code == 200
+            path = tmp_path / 'upload-core' / 'account-login-bridge.sqlite3'
+            key = str(uuid4())
+            lock = sqlite3.connect(path)
+            lock.execute('BEGIN IMMEDIATE')
+            try:
+                request = asyncio.create_task(c.post('operations',
+                    json={'action': 'create', 'target': None, 'deployment': 'test'}, headers={'Idempotency-Key': key}))
+                assert await asyncio.to_thread(started.wait, 2)
+                timer = asyncio.create_task(asyncio.sleep(.025))
+                response = await c.get('http://127.0.0.1:8000/test-light')
+                await timer
+                assert response.json() == {'ready': True} and not request.done() and not fake.keys
+                await asyncio.sleep(.32)
+            finally:
+                lock.rollback()
+                lock.close()
+            assert (await request).json()['session'] == fake.sid
+            assert fake.keys == [key]
+    asyncio.run(scenario())

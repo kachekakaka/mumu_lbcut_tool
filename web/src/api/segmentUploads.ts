@@ -101,6 +101,7 @@ export const problemText = (code: string) => ({
   invalid_account: '请核对原账号是否停用、阻塞或身份变化',
   invalid_path: 'Core 无法访问原录像',
   segment_file_unavailable: '原录像当前不可读',
+  segment_unfinished: '切片当前无法安排上传',
   segment_changed: '录像或质量提示已变化，请核对',
   unsupported_option: 'Core 拒绝了当前发布范围或投稿参数',
   task_ambiguous: '找到多条匹配任务，需核对 Core',

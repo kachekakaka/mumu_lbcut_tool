@@ -1,5 +1,7 @@
 """MuMuClient 模块单元测试。"""
 import unittest
+import ctypes
+import os
 from unittest.mock import patch, MagicMock, ANY
 import subprocess
 import threading
@@ -7,6 +9,25 @@ from pathlib import Path
 
 import pytest
 from src.mvp.mumu_client import MuMuClient
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='Windows HWND')
+@pytest.mark.parametrize('valid, moved', [(False, False), (True, False), (True, True)])
+def test_window_mode_observes_native_validation_and_layout_result(monkeypatch, caplog, valid, moved):
+    client = MuMuClient.__new__(MuMuClient)
+    client._run_manager = MagicMock(return_value='{"main_wnd":"0x00010002"}')
+    user32 = MagicMock()
+    user32.IsWindow.return_value = int(valid)
+    user32.SetWindowPos.return_value = int(moved)
+    monkeypatch.setattr(ctypes.windll, 'user32', user32)
+    caplog.set_level('INFO')
+    assert client.get_player_hwnd(2) == (0x10002 if valid else None)
+    assert client.apply_window_display_mode(2, 'bottom') is moved
+    assert user32.SetWindowPos.call_count == int(valid)
+    assert ('置底请求已提交' in caplog.text) is moved
+    if valid:
+        flags = user32.SetWindowPos.call_args.args[-1]
+        assert flags & 0x0010 and flags & 0x0002
 
 
 class TestMuMuClient(unittest.TestCase):

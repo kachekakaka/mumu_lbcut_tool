@@ -293,9 +293,9 @@ class MuMuClient:
                 hwnd = int(main_wnd_str, 16)
                 if os.name == "nt":
                     import ctypes
-                    if ctypes.windll.user32.IsWindow(hwnd):
-                        return hwnd
-                return hwnd
+                    if not ctypes.windll.user32.IsWindow(ctypes.c_void_p(hwnd)):
+                        return None
+                return hwnd or None
         except Exception as e:
             logger.debug(f"获取实例 {vmindex} 窗口句柄失败: {e}")
         return None
@@ -314,21 +314,21 @@ class MuMuClient:
             cmd.extend(["--size_w", str(size_w)])
         if size_h is not None:
             cmd.extend(["--size_h", str(size_h)])
-        self._run_manager(*cmd)
-
         if os.name == "nt":
             hwnd = self.get_player_hwnd(vmindex)
-            if hwnd:
-                import ctypes
-                SWP_NOZORDER = 0x0004
-                SWP_NOACTIVATE = 0x0010
-                SWP_ASYNCWINDOWPOS = 0x4000
-                flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS
-                if size_w is None or size_h is None:
-                    flags |= 0x0001  # SWP_NOSIZE
-                w = size_w or 0
-                h = size_h or 0
-                ctypes.windll.user32.SetWindowPos(hwnd, 0, pos_x, pos_y, w, h, flags)
+            if not hwnd:
+                logger.warning("实例 %s 的窗口布局失败，窗口句柄无效", vmindex)
+                return False
+            import ctypes
+            flags = 0x0004 | 0x0010 | 0x4000  # NOZORDER | NOACTIVATE | ASYNCWINDOWPOS
+            if size_w is None or size_h is None:
+                flags |= 0x0001  # NOSIZE
+            ok = ctypes.windll.user32.SetWindowPos(
+                ctypes.c_void_p(hwnd), None, pos_x, pos_y, size_w or 0, size_h or 0, flags)
+            logger.log(logging.INFO if ok else logging.WARNING, "实例 %s 的窗口布局%s",
+                       vmindex, "请求已提交" if ok else "失败")
+            return bool(ok)
+        self._run_manager(*cmd)
         return True
 
     def send_player_to_bottom(
@@ -349,11 +349,9 @@ class MuMuClient:
         2. 沉入所有普通窗口下方，不遮挡用户的日常办公/网页操作，也不抢占键盘鼠标焦点；
         3. 可根据调度平台需要指定桌面位置坐标（如安全复位到可视区域）。
         """
-        self.show_player_window(vmindex)
-        if pos_x is not None or pos_y is not None:
-            tx = pos_x if pos_x is not None else 0
-            ty = pos_y if pos_y is not None else 0
-            self.layout_player_window(vmindex, pos_x=tx, pos_y=ty)
+        if not self.show_player_window(vmindex):
+            return False
+        logger.info("已显示实例 %s 窗口", vmindex)
 
         if os.name == "nt":
             hwnd = self.get_player_hwnd(vmindex)
@@ -368,19 +366,21 @@ class MuMuClient:
                     flags |= 0x0002  # SWP_NOMOVE
                 tx = pos_x or 0
                 ty = pos_y or 0
-                ctypes.windll.user32.SetWindowPos(
-                    hwnd,
-                    HWND_BOTTOM,
+                ok = ctypes.windll.user32.SetWindowPos(
+                    ctypes.c_void_p(hwnd),
+                    ctypes.c_void_p(HWND_BOTTOM),
                     tx,
                     ty,
                     0,
                     0,
                     flags,
                 )
-                logger.info(f"已将实例 {vmindex} 窗口 (HWND: {hex(hwnd)}) 下沉置于其他窗口底层。")
-                return True
-        logger.info(f"已显示实例 {vmindex} 窗口（当前系统不支持或未获取到底层 HWND）。")
-        return True
+                if ok:
+                    logger.info("实例 %s 的窗口置底请求已提交", vmindex)
+                    return True
+            logger.warning("实例 %s 的窗口置底失败", vmindex)
+            return False
+        return self.layout_player_window(vmindex, pos_x or 0, pos_y or 0) if pos_x is not None or pos_y is not None else True
 
     def move_player_offscreen(
         self,
@@ -392,7 +392,8 @@ class MuMuClient:
 
         默认坐标为 (-3200, 0)，确保移出绝大多数常见主副屏幕可视区域。
         """
-        self.show_player_window(vmindex)
+        if not self.show_player_window(vmindex):
+            return False
         target_x = pos_x if pos_x is not None else -3200
         target_y = pos_y if pos_y is not None else 0
         logger.info(f"正在将实例 {vmindex} 窗口移出主工作区边缘至坐标 ({target_x}, {target_y})...")
@@ -458,9 +459,9 @@ class MuMuClient:
             effective_mode = "foreground"
 
         self.check_stop(stop_event)
-        self.apply_window_display_mode(vmindex, window_mode=effective_mode, pos_x=pos_x, pos_y=pos_y)
+        displayed = self.apply_window_display_mode(vmindex, window_mode=effective_mode, pos_x=pos_x, pos_y=pos_y)
         self.check_stop(stop_event)
-        return True
+        return displayed
 
     def get_adb_serial(self, vmindex: int) -> str:
         """只接受管理查询确认的地址，不计算默认端口。"""

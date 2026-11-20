@@ -95,6 +95,8 @@ class ContinuousSession:
         self.pipe=None
         self.ledger={}
         self.pending={}
+        self.latest_segment_index=0
+        self.held_fragment=None
         self.pool=ThreadPoolExecutor(max_workers=2,thread_name_prefix='segment-validation')
         self.probes=ThreadPoolExecutor(max_workers=1,thread_name_prefix='live-surface')
         self.surface_future=None
@@ -153,9 +155,12 @@ class ContinuousSession:
         risk=self.identity_risks.setdefault(self.epoch,dict(
             lower=lower,wall=self.identity.confirmed_at or getattr(self.pipe,'capture_launch_at',time.time()),
             flags=set(),marked=set()))
+        prior_flags = len(risk['flags'])
         risk['flags'].add('identity_unconfirmed')
         if mismatch:risk['flags'].add('identity_mismatch')
-        self.apply_identity_risks()
+        if len(risk['flags']) != prior_flags or lower < risk['lower']:
+            risk['lower'] = min(lower, risk['lower'])
+            self.apply_identity_risks(epoch=self.epoch)
 
     def identity_media_position(self):
         """进度缺失、非有限值或回退时整代保守标记，不继续使用旧下界。"""
@@ -169,13 +174,13 @@ class ContinuousSession:
         self.identity_media_highwater=max(media,self.identity_media_highwater or 0.0)
         return media
 
-    def apply_identity_risks(self):
-        for row in self.ledger.values():
-            if not row.get('closed'):continue
-            start,end=row.get('start_pts'),row.get('end_pts')
-            if start is None or end is None or not math.isfinite(start) or not math.isfinite(end) or start<0 or end<start:
-                self.identity_invalid_timeline.add(row['epoch'])
-        for index,row in self.ledger.items():
+    def apply_identity_risks(self, indices=None, epoch=None):
+        if indices is None:
+            entries = ((idx, row) for idx, row in self.ledger.items()
+                       if epoch is None or row['epoch'] == epoch)
+        else:
+            entries = ((idx, self.ledger[idx]) for idx in indices)
+        for index,row in entries:
             risk=self.identity_risks.get(row['epoch'])
             if not risk:continue
             if row['epoch'] in self.identity_invalid_timeline:risk['lower']=0.0
@@ -375,6 +380,8 @@ class ContinuousSession:
         c=self.c
         if c.stop_requested:raise InterruptedError('停止后禁止启动采集')
         self.epoch+=1
+        self.latest_segment_index=0
+        self.held_fragment=None
         self.identity_media_highwater=None
         self.epoch_ended=False
         self.quality_marks={}
@@ -382,6 +389,8 @@ class ContinuousSession:
         self.frame_rate_ok_since=None
         self.on_live_page=False
         c.current_generation_id+=1
+        self.bad_pages=0
+        self.probe_failures=0
         c.action_dispatcher.current_generation_id=c.current_generation_id
         start_index=max(self.ledger,default=0)+1
         self.pipe=self.pipeline_factory(serial=self.serial,output_dir=c.task_output_dir,
@@ -418,10 +427,20 @@ class ContinuousSession:
 
     def sync(self, ending=False, final=False, interrupted=''):
         if not self.pipe:return
+        was_invalid = self.epoch in self.identity_invalid_timeline
         self.identity_media_position()
         c=self.c
-        fragments=self.pipe.fragments()
-        latest=max((f.index for f in fragments),default=0)
+        fragments=self.pipe.fragment_updates(full=ending)
+        if getattr(self.pipe, 'manifest_rebuilt', False):
+            self.held_fragment = None
+        latest=max((f.index for f in fragments),default=self.latest_segment_index)
+        latest=self.latest_segment_index=max(self.latest_segment_index,latest)
+        if self.held_fragment and (ending or self.held_fragment.index < latest):
+            if not any(f.index == self.held_fragment.index for f in fragments):
+                fragments.insert(0,self.held_fragment)
+            self.held_fragment=None
+        if getattr(self.pipe,'timeline_invalid',False):
+            self.identity_invalid_timeline.add(self.epoch)
         for f in fragments:
             if f.index not in self.ledger:
                 self.ledger[f.index]={'path':f.path,'terminal':False,'submitted':False,
@@ -435,15 +454,28 @@ class ContinuousSession:
             row=self.ledger[f.index]
             row['closed']=f.closed
             row['start_pts'],row['end_pts']=f.start_pts,f.end_pts
-            self.apply_identity_risks()
+            if f.closed and (f.start_pts is None or f.end_pts is None or not math.isfinite(f.start_pts)
+                             or not math.isfinite(f.end_pts) or f.start_pts<0 or f.end_pts<f.start_pts):
+                self.identity_invalid_timeline.add(self.epoch)
             c.current_segment_index=max(c.current_segment_index,f.index)
             c._highest_segment_index=max(c._highest_segment_index,f.index)
             if f.index==latest:c.current_file_path=f.path
+        risk=self.identity_risks.get(self.epoch)
+        if risk:
+            if self.epoch in self.identity_invalid_timeline and (not was_invalid or risk['lower']>0):
+                self.apply_identity_risks(epoch=self.epoch)
+            else:
+                self.apply_identity_risks(f.index for f in fragments)
+        for f in fragments:
+            row=self.ledger[f.index]
             if row['terminal'] or row['submitted']:continue
             if ending and (not f.closed or (interrupted and f.index==latest)):
                 self.abort(f.index,interrupted or 'fragment_not_closed')
                 continue
-            if not f.closed or (f.index==latest and not ending):continue
+            if not f.closed:continue
+            if f.index==latest and not ending:
+                self.held_fragment=f
+                continue
             if len(self.pending)>=4:
                 raise RuntimeError('segment_validation_backlog')
             row['submitted']=True
@@ -588,9 +620,8 @@ class ContinuousSession:
                 elif now-self.frame_rate_ok_since>=60:
                     self.low_frame_rate=False
                     self.frame_rate_ok_since=None
-        current=[idx for idx,row in self.ledger.items() if row['epoch']==self.epoch]
-        if not current:return
-        latest=max(current)
+        latest=self.latest_segment_index
+        if not latest:return
         static=self.picture_static_sec()
         for flag,active,lookback in (('visual_check_unavailable',monitor.unavailable,0),
                                      ('low_frame_rate',self.low_frame_rate,60),
@@ -639,12 +670,19 @@ class ContinuousSession:
             self.surface_future=None
             if self.surface_gen!=c.current_generation_id:return
             activity=observation.get('activity','')
-            self.on_live_page='LivePlayActivity' in activity
-            if 'LivePlayActivity' not in activity:
-                self.bad_pages+=1
-                if self.bad_pages>=2:self.recover('runtime_left_live_page',True)
-            else:
+            if not activity or not observation.get('ui_available', True):
                 self.bad_pages=0
+                self.probe_failures+=1
+                if self.probe_failures==3:self.recover('surface_probe_unavailable',True)
+            elif 'LivePlayActivity' not in activity:
+                self.on_live_page=False
+                self.probe_failures=0
+                self.bad_pages+=1
+                if self.bad_pages==2:self.recover('runtime_left_live_page',True)
+            else:
+                self.on_live_page=True
+                self.bad_pages=0
+                self.probe_failures=0
                 kind=observation.get('overlay')
                 if kind:
                     self.invalidate_identity_probe()
@@ -692,8 +730,6 @@ class ContinuousSession:
                         else:self.recover('overlay_not_recovered',True)
                 elif observation.get('ui_available'):
                     self.last_clear_wall=observation.get('observed_at',time.time())
-            self.probe_failures=0 if activity else self.probe_failures+1
-            if self.probe_failures>=3:self.recover('surface_probe_unavailable',True)
         # 窗口状态探针约 0.4 秒且不经渲染链路；连续 3 次读不到前台才重新定位，即约 30 秒。
         if not c.stop_requested and self.surface_future is None and now-self.last_surface>=10:
             self.last_surface=now;self.surface_gen=c.current_generation_id

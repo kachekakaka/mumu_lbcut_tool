@@ -193,9 +193,12 @@ class WorkerProcessHandle:
         return self.proc.poll() if self.proc else None
 
     @property
+    def delivery_closed(self) -> bool:
+        return self._stdout_done.is_set() and self._callback_done.is_set()
+
+    @property
     def events_complete(self) -> bool:
-        return (self._stdout_done.is_set() and self._stderr_done.is_set()
-                and self._callback_done.is_set() and not self.event_errors)
+        return self.delivery_closed and self._stderr_done.is_set() and not self.event_errors
 
     @property
     def event_errors(self) -> list[str]:

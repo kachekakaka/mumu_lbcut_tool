@@ -50,6 +50,7 @@ def install_segment_uploads(router, config, runtime, core):
     service = SegmentUploads(
         ArrangementStore(config.data_dir / "upload-core" / "segment-uploads.sqlite3"),
         PostingCore(core), segment, config.output_dir, writable=lambda: runtime.state == "running",
+        guard=lambda job, index: runtime.store.segment_send_guard(job, index),
     )
 
     @router.get(BASE)
@@ -77,3 +78,5 @@ def install_segment_uploads(router, config, runtime, core):
     @router.post(BASE + "/{record_id}/continue")
     async def resume(record_id: UUID, body: Continue):
         return await service.drive(str(record_id), body.revision)
+
+    return service

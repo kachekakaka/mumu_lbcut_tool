@@ -135,10 +135,10 @@ onBeforeUnmount(()=>{ alive=false; close(); clearTimeout(timer) })
         <el-table-column label="操作"><template #default="{row}"><el-button :disabled="busy || !status.available || !!intent" @click="act('create',row.id)">重新登录</el-button></template></el-table-column>
       </el-table>
       <p v-for="s in sessions" :key="s.session_id"><el-button @click="observe(s.session_id)">查看登录进度 · {{ phases[s.phase] }}</el-button></p>
-      <details :open="operations.some(o=>['unknown','sending'].includes(o.status))"><summary>登录操作记录</summary>
-        <p v-for="o in operations" :key="o.key">{{ {create:'申请登录',cancel:'取消',resume:'恢复'}[o.action] }} · {{o.error || ({done:'已处理',linked:'已关联',unknown:'待确认',sending:'待核对',rejected:'被拒绝'}[o.status])}}
+      <details :open="operations.some(o=>['unknown','sending','not_sent'].includes(o.status))"><summary>登录操作记录</summary>
+        <p v-for="o in operations" :key="o.key">{{ {create:'申请登录',cancel:'取消',resume:'恢复'}[o.action] }} · {{o.error || ({done:'已处理',linked:'已关联',unknown:'待确认',sending:'待核对',rejected:'被拒绝',not_sent:'待发送'}[o.status])}}
           <el-button v-if="o.session" @click="observe(o.session)">查看结果</el-button>
-          <el-button v-else-if="['unknown','sending'].includes(o.status)" :disabled="busy" @click="act(o.action,o.target,{...o,deployment:status.deployment})">重试原请求</el-button>
+          <el-button v-else-if="['unknown','sending','not_sent'].includes(o.status)" :disabled="busy" @click="act(o.action,o.target,{...o,deployment:status.deployment})">重试原请求</el-button>
         </p>
       </details>
     </template>

@@ -1,11 +1,34 @@
-import { describe, expect, it } from 'vitest'
-import { mount } from '@vue/test-utils'
-import { nextTick } from 'vue'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { enableAutoUnmount, flushPromises, mount } from '@vue/test-utils'
 import ElementPlus from 'element-plus'
 import { createMemoryHistory, createRouter } from 'vue-router'
-import SegmentTable from '../src/components/SegmentTable.vue'
+import SegmentsView from '../src/views/SegmentsView.vue'
 import UploadStatus from '../src/components/UploadStatus.vue'
 import type { Segment } from '../src/api/types'
+import type { Arrangement } from '../src/api/segmentUploads'
+
+const stubs = vi.hoisted(() => ({
+  segments: vi.fn(), targets: vi.fn(), list: vi.fn(), show: vi.fn(),
+  loader: null as null | (() => Promise<void>),
+}))
+
+vi.mock('../src/api', () => ({ api: { segments: stubs.segments, targets: stubs.targets } }))
+vi.mock('../src/api/segmentUploads', async (original) => ({
+  ...await original<typeof import('../src/api/segmentUploads')>(),
+  segmentUploads: { list: stubs.list },
+}))
+vi.mock('../src/poller', async (original) => ({
+  ...await original<typeof import('../src/poller')>(),
+  usePageLoader: (loader: () => Promise<void>) => { stubs.loader = loader },
+}))
+
+enableAutoUnmount(afterEach)
+afterEach(() => {
+  vi.unstubAllGlobals()
+  vi.restoreAllMocks()
+  stubs.list.mockReset()
+  stubs.show.mockClear()
+})
 
 const segment: Segment = {
   job_id: 'job-1', target_id: 't1', nickname: '主播甲', target_raw: 'raw', segment_index: 1, status: 'finished',
@@ -14,32 +37,64 @@ const segment: Segment = {
   upload: { status: 'failed', attempts: 3, last_error: '网络超时', updated_at: 60 },
 }
 
-async function render(uploadEnabled: boolean) {
+const conflicted: Segment = { ...segment, segment_index: 2, status: 'conflicted', file_path: null }
+const saved: Arrangement = {
+  id: 'old', job_id: conflicted.job_id, segment_index: conflicted.segment_index,
+  stage: 'task', revision: 1, task_id: 'core-old', status: 'SUCCEEDED',
+  worker_online: true, observed_at: 60, problem: null, rejected: false, can_revise: false, can_continue: false,
+}
+
+async function render(hostname: string) {
+  vi.stubGlobal('location', { hostname, pathname: '/' })
+  stubs.targets.mockResolvedValue({ items: [] })
+  stubs.segments.mockResolvedValue({ items: [segment, conflicted], total: 2, offset: 0, limit: 50 })
   const router = createRouter({ history: createMemoryHistory(), routes: [{ path: '/:p(.*)', component: { template: '<div/>' } }] })
-  const wrapper = mount(SegmentTable, { props: { items: [segment], uploadEnabled }, global: { plugins: [ElementPlus, router] } })
-  await nextTick()
-  await nextTick()
+  await router.push('/')
+  const wrapper = mount(SegmentsView, {
+    global: {
+      plugins: [ElementPlus, router],
+      stubs: { SegmentUploadDialog: { template: '<div/>', setup(_, { expose }) { expose({ show: stubs.show }) } } },
+    },
+  })
+  await stubs.loader?.()
+  await flushPromises()
   return wrapper
 }
 
 describe('上传显示', () => {
-  it('上传未启用时不显示上传列', async () => {
-    const wrapper = await render(false)
+  it('远端切片页隐藏本机投递详情，质量标记仍可读', async () => {
+    const wrapper = await render('192.168.0.7')
     expect(wrapper.text()).toContain('质量标记')
     expect(wrapper.text()).toContain('brand_new_flag')
-    expect(wrapper.text()).not.toContain('上传状态')
+    expect(wrapper.text()).not.toContain('查看任务')
     expect(wrapper.text()).not.toContain('上传失败')
+    expect(stubs.list).not.toHaveBeenCalled()
   })
 
-  it('上传启用时按状态类别显示', async () => {
-    const wrapper = await render(true)
-    expect(wrapper.text()).toContain('上传状态')
-    expect(wrapper.text()).toContain('上传失败')
-    const tag = mount(UploadStatus, { props: { upload: { status: 'succeeded', attempts: 1, last_error: null, updated_at: 0 } }, global: { plugins: [ElementPlus] } })
-    expect(tag.find('.el-tag--success').exists()).toBe(true)
-    const pending = mount(UploadStatus, { props: { upload: { status: 'uploading', attempts: 1, last_error: null, updated_at: 0 } }, global: { plugins: [ElementPlus] } })
-    expect(pending.find('.el-tag--info').exists()).toBe(true)
-    const failed = mount(UploadStatus, { props: { upload: { status: 'failed', attempts: 3, last_error: 'x', updated_at: 0 } }, global: { plugins: [ElementPlus] } })
-    expect(failed.find('.el-tag--danger').exists()).toBe(true)
+  it('已封片可安排，冲突片只能查看原单，查询失败保留状态', async () => {
+    const now = vi.spyOn(Date, 'now').mockReturnValue(10000)
+    stubs.list.mockResolvedValueOnce({ items: [saved] }).mockRejectedValueOnce(new Error('断线'))
+    const wrapper = await render('127.0.0.1')
+    const rows = wrapper.findAll('.el-table__body tr')
+    expect(rows).toHaveLength(2)
+    const button = (row: number, label: string) => rows[row].findAll('button').find(btn => btn.text() === label)
+    await button(0, '安排上传')!.trigger('click')
+    expect(stubs.show).toHaveBeenLastCalledWith(segment)
+    expect(rows[1].text()).toContain('终态冲突')
+    expect(button(1, '安排上传') || button(1, '安排其他账号')).toBeUndefined()
+    await button(1, '查看任务')!.trigger('click')
+    expect(stubs.show).toHaveBeenLastCalledWith(conflicted, saved)
+    now.mockReturnValue(16000)
+    await stubs.loader?.()
+    await flushPromises()
+    expect(stubs.list).toHaveBeenCalledTimes(2)
+    expect(rows[1].text()).toContain('投稿成功')
+  })
+
+  it('模拟上传标签按状态配色', () => {
+    for (const [status, type] of [['succeeded', 'success'], ['uploading', 'info'], ['failed', 'danger']]) {
+      const tag = mount(UploadStatus, { props: { upload: { status, attempts: 1, last_error: null, updated_at: 0 } }, global: { plugins: [ElementPlus] } })
+      expect(tag.find(`.el-tag--${type}`).exists()).toBe(true)
+    }
   })
 })

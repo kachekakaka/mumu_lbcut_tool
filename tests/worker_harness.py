@@ -136,7 +136,7 @@ def build_worker(monkeypatch, tmp_path, valid_media, *, total=4, segment=2,
             return self.span()
         def get_current_segment_elapsed(self):
             return self.span() % segment
-        def fragments(self):
+        def fragment_updates(self, full=False):
             if self.alive:
                 # 截止点上的关键帧不会开出新片：录满时按总时长前一刻计算片数。
                 span = min(clock.monotonic() - self.begin, self.limit - 1e-6) if self.limit else clock.monotonic() - self.begin

@@ -18,7 +18,7 @@ def test_late_login_returns_to_navigation_without_runtime_recovery(monkeypatch,t
     start=h.pipeline_type.start
     def start_with_media(pipe):
         start(pipe)
-        pipe.fragments()  # 最终门禁拒绝时，已经写出的临时媒体也不能冒充正式切片。
+        pipe.fragment_updates()  # 最终门禁拒绝时，已经写出的临时媒体也不能冒充正式切片。
     monkeypatch.setattr(h.pipeline_type,'start',start_with_media)
     assert h.controller.run()==0
     events=h.events()

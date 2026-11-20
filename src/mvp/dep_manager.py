@@ -1,5 +1,7 @@
 """外部工具管理：媒体工具固定构建和目录，不使用系统 PATH 回退。"""
+from contextlib import contextmanager
 from dataclasses import dataclass
+import errno
 from pathlib import Path
 import os
 import shutil
@@ -8,6 +10,10 @@ import zipfile
 import json
 import logging
 import subprocess
+import tempfile
+import time
+from uuid import uuid4
+import psutil
 
 from src.mvp.config import SCRCPY_DIR, FFMPEG_DIR, FFMPEG_BUILD, get_adb_exe
 from src.mvp.command import run_client
@@ -16,6 +22,28 @@ logger = logging.getLogger(__name__)
 
 SCRCPY_RELEASE_API = "https://api.github.com/repos/Genymobile/scrcpy/releases/latest"
 SCRCPY_DEFAULT_WIN64_URL = "https://github.com/Genymobile/scrcpy/releases/download/v3.1/scrcpy-win64-v3.1.zip"
+
+
+@contextmanager
+def installation_lock(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as handle:
+        if os.name == "nt":
+            import msvcrt
+            deadline = time.monotonic() + 120
+            while True:
+                try:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError as exc:
+                    if exc.errno not in (errno.EACCES, errno.EAGAIN) or time.monotonic() >= deadline:
+                        raise
+                    time.sleep(.1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
 
 
 @dataclass(frozen=True)
@@ -28,8 +56,9 @@ class DependencyManager:
     """管理 scrcpy 及 ADB 等外部工具的检查与获取。"""
 
     def __init__(self, scrcpy_dir: Path = SCRCPY_DIR, ffmpeg_dir: Path = FFMPEG_DIR):
-        self.scrcpy_dir = scrcpy_dir
+        self.scrcpy_dir = Path(scrcpy_dir).resolve()
         self.scrcpy_exe_path = self.scrcpy_dir / "scrcpy.exe"
+        self._install_lock_path = self.scrcpy_dir.with_name(self.scrcpy_dir.name + ".install.lock")
         self.ffmpeg_dir = Path(ffmpeg_dir).resolve()
 
     def get_media_tools(self) -> MediaTools:
@@ -69,70 +98,59 @@ class DependencyManager:
 
     def is_scrcpy_ready(self) -> bool:
         """检查 scrcpy.exe 及 server 是否已就绪。"""
-        return self.scrcpy_exe_path.exists()
+        return not self._missing_scrcpy(self.scrcpy_dir)
+
+    @staticmethod
+    def _missing_scrcpy(directory):
+        return [directory / name for name in ("scrcpy.exe", "scrcpy-server")
+                if not (directory / name).is_file()]
 
     def ensure_scrcpy(self, force_download: bool = False) -> Path:
         """确保 scrcpy 可用；若不存在则自动下载解压。"""
-        if self.is_scrcpy_ready() and not force_download:
-            return self.scrcpy_exe_path
-
-        self.scrcpy_dir.mkdir(parents=True, exist_ok=True)
-        download_url = self._get_latest_win64_url()
-        zip_path = self.scrcpy_dir.parent / "scrcpy_temp.zip"
-
-        logger.info(f"正在下载 scrcpy 发布包: {download_url}")
-        try:
-            # 下载 zip
-            headers = {"User-Agent": "Mozilla/5.0"}
-            req = urllib.request.Request(download_url, headers=headers)
-            with urllib.request.urlopen(req, timeout=30) as resp, open(zip_path, "wb") as f:
-                shutil.copyfileobj(resp, f)
-
-            logger.info("下载完成，正在解压...")
-            # 解压
-            with zipfile.ZipFile(zip_path, "r") as zip_ref:
-                # 寻找内部根目录
-                namelist = zip_ref.namelist()
-                top_dirs = {name.split("/")[0] for name in namelist if "/" in name}
-                extract_temp = self.scrcpy_dir.parent / "_scrcpy_extract_tmp"
-                if extract_temp.exists():
-                    shutil.rmtree(extract_temp)
-                zip_ref.extractall(extract_temp)
-
-                # 搬运文件到目标目录
-                src_folder = extract_temp
-                if len(top_dirs) == 1:
-                    single_top = extract_temp / list(top_dirs)[0]
-                    if single_top.is_dir():
-                        src_folder = single_top
-
-                for item in src_folder.iterdir():
-                    dest = self.scrcpy_dir / item.name
-                    if dest.exists():
-                        if dest.is_dir():
-                            shutil.rmtree(dest)
-                        else:
-                            dest.unlink()
-                    shutil.move(str(item), str(dest))
-
-                if extract_temp.exists():
-                    shutil.rmtree(extract_temp)
-
-        finally:
-            if zip_path.exists():
-                zip_path.unlink()
-
-        if not self.is_scrcpy_ready():
-            raise RuntimeError(f"解压后未找到 {self.scrcpy_exe_path}，请检查发布包内容。")
-
-        logger.info(f"scrcpy 已就绪: {self.scrcpy_exe_path}")
+        with installation_lock(self._install_lock_path):
+            if self.scrcpy_dir.exists() and not force_download:
+                return self.require_scrcpy()
+            with tempfile.TemporaryDirectory(prefix=".scrcpy-install-", dir=self.scrcpy_dir.parent) as temp:
+                staging = Path(temp)
+                zip_path = staging / "release.zip"
+                extract_dir = staging / "extracted"
+                url = self._get_latest_win64_url()
+                logger.info("正在下载 scrcpy 发布包：%s", url)
+                request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(request, timeout=30) as response, zip_path.open("xb") as archive:
+                    shutil.copyfileobj(response, archive)
+                with zipfile.ZipFile(zip_path) as release:
+                    release.extractall(extract_dir)
+                items = list(extract_dir.iterdir())
+                bundle = items[0] if len(items) == 1 and items[0].is_dir() else extract_dir
+                if missing := self._missing_scrcpy(bundle):
+                    raise FileNotFoundError("scrcpy 发布包缺件：" + "、".join(p.name for p in missing))
+                self._install_scrcpy_bundle(bundle)
+        logger.info("scrcpy 已就绪：%s", self.scrcpy_exe_path)
         return self.scrcpy_exe_path
+
+    def _install_scrcpy_bundle(self, bundle):
+        backup = None
+        if self.scrcpy_dir.exists():
+            for process in psutil.process_iter(["exe"]):
+                if process.info.get("exe") and Path(process.info["exe"]) == self.scrcpy_exe_path:
+                    raise PermissionError(f"scrcpy 正在使用，无法更新：{self.scrcpy_exe_path}（PID {process.pid}）")
+            backup = self.scrcpy_dir.with_name(f".{self.scrcpy_dir.name}-previous-{uuid4().hex}")
+            # Windows 拒绝移动含正在使用文件的目录时，原目录与内容仍在原位。
+            self.scrcpy_dir.rename(backup)
+        try:
+            bundle.rename(self.scrcpy_dir)
+        except OSError:
+            if backup is not None:
+                backup.rename(self.scrcpy_dir)
+            raise
+        if backup is not None:
+            logger.info("原 scrcpy 目录已保留：%s", backup)
 
     def require_scrcpy(self) -> Path:
         """仅检查本地依赖，不下载或改写任何工具文件。"""
-        for path in (self.scrcpy_exe_path, self.scrcpy_dir / 'scrcpy-server'):
-            if not path.is_file():
-                raise FileNotFoundError(f'缺少本地采集工具：{path}')
+        if missing := self._missing_scrcpy(self.scrcpy_dir):
+            raise FileNotFoundError("缺少本地采集工具：" + "、".join(map(str, missing)))
         return self.scrcpy_exe_path
 
     def _get_latest_win64_url(self) -> str:

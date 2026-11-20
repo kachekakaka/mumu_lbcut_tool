@@ -115,6 +115,7 @@ def test_quality_stdout_and_journal_replay_share_event_id(tmp_path):
     stream = BrokenAfter(1)
     journal = tmp_path / 'quality.ndjson'
     emitter = WorkerEventEmitter(stream, fallback_path=journal)
+    emitter.set_context(job_id='j', run_id='run-j')
     emitter.emit(SegmentQualityWarningEvent(segment_index=1, flag='low_frame_rate', suspected_start_time=10))
     emitter.emit(SegmentQualityWarningEvent(segment_index=1, flag='low_frame_rate', suspected_start_time=10))
     emitter.close()

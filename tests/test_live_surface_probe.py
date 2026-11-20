@@ -2,6 +2,7 @@
 from pathlib import Path
 import time
 from types import SimpleNamespace
+import pytest
 
 from src.worker.live_overlay import PANEL_WINDOW, classify_live_surface, parse_windows
 from src.worker.navigator import WorkerNavigator
@@ -60,8 +61,7 @@ class FakeAdb:
     def __init__(self, states):
         self.states, self.calls = list(states), []
 
-    def run_adb(self, *args, timeout=5.0, check=False, kill_tree_on_timeout=True):
-        assert not kill_tree_on_timeout
+    def run_adb(self, *args, timeout=5.0, check=False):
         self.calls.append(args)
         assert args[:3] == ('shell', 'dumpsys', 'window'), args
         displays_text, windows_text = self.states[0]
@@ -111,3 +111,31 @@ def test_panel_that_survives_two_backs_is_failure():
     nav = navigator([(displays('121eb68'), OPEN)])
     assert not nav.dismiss_live_overlay(time.monotonic() + 10, lambda: False, require_observed_clear=True)
     assert len(nav.keys) == 2
+
+
+@pytest.mark.parametrize('observations, reason', [
+    ('??L', None), ('???L', 'surface_probe_unavailable'), ('OOL', 'runtime_left_live_page'),
+    ('?O?L', None),
+])
+def test_actual_surface_classification_controls_tail_and_recovery(monkeypatch, tmp_path, valid_media,
+                                                                observations, reason):
+    from src.worker.state_machine import WorkerState
+    from worker_harness import build_worker, assert_paired
+    login = 'mFocusedApp=ActivityRecord{1 u0 com.ss.android.ugc.aweme/.account.business.login.DYLoginActivity t83}'
+    states = {'?': ('', ''), 'L': (displays('515af50'), CLEAN), 'O': (displays('x', app=login), CLEAN)}
+    probe = navigator([states[name] for name in observations])
+    harness = build_worker(monkeypatch, tmp_path, valid_media, total=44, segment=60)
+    normal = harness.navigator_type.inspect_live_surface
+    def inspect(nav, **kwargs):
+        if harness.controller.state_machine.state == WorkerState.RECORDING:
+            return probe.inspect_live_surface()
+        return normal(nav, **kwargs)
+    monkeypatch.setattr(harness.navigator_type, 'inspect_live_surface', inspect)
+    assert harness.controller.run() == 0
+    emitted = harness.events()
+    assert [e['reason'] for e in emitted if e['event'] == 'stall_detected'] == ([reason] if reason else [])
+    assert len(harness.pipelines) == (2 if reason else 1)
+    terminals = assert_paired(emitted)
+    assert terminals[-1]['event'] == 'segment_finished' and terminals[-1]['is_final']
+    if reason is None:
+        assert len(terminals) == 1
