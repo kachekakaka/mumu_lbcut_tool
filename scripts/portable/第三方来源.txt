@@ -1,0 +1,7 @@
+Python 嵌入式发行版    https://www.python.org/downloads/windows/
+Python 依赖            https://pypi.org/，版本见 requirements-win311.lock，许可证见 python/Lib/site-packages
+scrcpy 5.0.1          https://github.com/Genymobile/scrcpy/releases/tag/v5.0.1
+FFmpeg 与 ffprobe    https://www.gyan.dev/ffmpeg/builds/，上游 https://ffmpeg.org/
+网页依赖              npm 锁文件源自录播仓库 web/package-lock.json；本次实际使用的组件见 app/web/dist/.vite/license.md
+F2 代码               app/src/mvp/vendor/NOTICE.md 和同目录 LICENSE
+本包用于内部录制。上传平台独立部署，其引擎和许可由上传平台包提供。

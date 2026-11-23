@@ -123,10 +123,12 @@ class Scheduler:
                  clock=time.time, process_probe=inspect_job_process,
                  scan_interval_sec: float = 30.0,
                  ended_interval_sec: float = 10.0, auto_scan: bool = True,
-                 segment_duration_sec: int = 1800, navigation_timeout_sec: float = 300.0):
+                 segment_duration_sec: int = 1800, navigation_timeout_sec: float = 300.0,
+                 require_local_tools: bool = False):
         from src.worker.room_locator import validate_navigation_timeout
         validate_navigation_timeout(navigation_timeout_sec)
         self.navigation_timeout = navigation_timeout_sec
+        self.require_local_tools = require_local_tools
         if instance_indices is not None and any(i < 0 for i in instance_indices):
             raise ValueError("实例索引不能为负数")
         self.store, self.clock = store, clock
@@ -597,7 +599,7 @@ class Scheduler:
             web_rid=room.web_rid, expected_anchor_uid=getattr(room, "anchor_uid", None),
             allow_unconfirmed_identity=bool(target["allow_unconfirmed"]), job_id=job_id,
             event_log_path=journal, log_path=journal.with_suffix(".log"), segment_duration_sec=self.segment_duration,
-            navigation_timeout_sec=self.navigation_timeout)
+            navigation_timeout_sec=self.navigation_timeout, require_local_tools=self.require_local_tools)
         # 先保存启动意图和产物关联，覆盖 Popen 后写 PID 前的异常窗口。
         with self.store.transaction() as db:
             saved = db.execute("""UPDATE jobs SET room_id=?,event_log_path=?,launch_intent_at=?

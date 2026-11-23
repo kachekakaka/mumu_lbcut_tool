@@ -14,7 +14,10 @@ class LockAcquisitionError(RuntimeError):
 
 def get_shared_lock_dir() -> Path:
     """稳定共享目录，不随某个 Worker 的 TEMP 或输出目录变化。"""
-    path = DEV_DIR / "runtime" / "instance-locks"
+    override = os.environ.get("MUMU_LBCUT_INSTANCE_LOCK_DIR")
+    path = Path(override) if override else DEV_DIR / "runtime" / "instance-locks"
+    if not path.is_absolute():
+        raise ValueError("实例锁目录需要绝对路径")
     path.mkdir(parents=True, exist_ok=True)
     return path
 

@@ -13,7 +13,7 @@ export default defineConfig(({ command, mode }) => {
     server: {
       proxy: { '/api': { target: env.CONSOLE_API_TARGET || 'http://127.0.0.1:8000' } },
     },
-    build: { outDir: 'dist', emptyOutDir: true, chunkSizeWarningLimit: 1600 },
+    build: { outDir: 'dist', emptyOutDir: true, chunkSizeWarningLimit: 1600, license: true },
     test: { environment: 'jsdom', include: ['tests/**/*.test.ts'], setupFiles: ['tests/setup.ts'] },
   }
 })

@@ -65,3 +65,4 @@ class WorkerLaunchSpec:
     job_id: str | None = None
     event_log_path: Path | None = None
     log_path: Path | None = None
+    require_local_tools: bool = False

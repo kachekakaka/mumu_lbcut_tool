@@ -36,7 +36,7 @@ class Slot:
 class QueryProcesses:
     def __init__(self, timeout=30.0, reclaim_timeout=5.0, child_command=None):
         self.timeout, self.reclaim_timeout = timeout, reclaim_timeout
-        self.command = child_command or [sys.executable, "-m", "src.orchestrator.room_query_process"]
+        self.command = child_command or [sys.executable, "-B", "-m", "src.orchestrator.room_query_process"]
         self.job = WindowsJob()
         self.slots = [Slot(source) for source, count in CAPACITY.items() for _ in range(count)]
         self.lock = threading.RLock()

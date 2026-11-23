@@ -57,7 +57,7 @@ class WorkerProcessHandle:
             raise RuntimeError("WorkerProcessHandle 不允许重复启动")
         from src.worker.room_locator import validate_navigation_timeout
         validate_navigation_timeout(self.spec.navigation_timeout_sec)
-        cmd = [self.python_exe, "-u", "-m", "src.worker.cli",
+        cmd = [self.python_exe, "-B", "-X", "utf8", "-u", "-m", "src.worker.cli",
                "--vmindex", str(self.spec.vmindex), "--target", self.spec.target,
                "--output-dir", str(self.spec.output_dir.resolve()),
                "--navigation-timeout", str(self.spec.navigation_timeout_sec),
@@ -69,6 +69,8 @@ class WorkerProcessHandle:
             cmd += ["--total-duration", str(self.spec.total_duration_sec)]
         if self.spec.allow_unconfirmed_identity:
             cmd += ["--allow-unconfirmed-identity"]
+        if self.spec.require_local_tools:
+            cmd.append("--require-local-tools")
         for flag, value in (("--window-pos-x", self.spec.window_pos_x),
                             ("--window-pos-y", self.spec.window_pos_y),
                             ("--target-kind", self.spec.target_kind),

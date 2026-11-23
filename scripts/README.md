@@ -1,6 +1,16 @@
 # 维护脚本
 
-本目录维护 8 个录制相关命令和 1 个只读文档检查入口；历史源码见[归档说明](../archive/scripts/README.md)。联网和设备入口须显式传入 `--execute`；省略时仅作本地预览，不报告设备空闲或运行依赖已就绪。
+本目录维护录制工具、文档检查与 Windows 制包入口。历史源码见[归档说明](../archive/scripts/README.md)。录制工具的联网和设备入口须显式传入 `--execute`，省略时仅作本地预览。
+
+## 制作 Windows 录播便携包
+
+在 Windows x64 构建机安装 PowerShell 7、Git、带 pip 的 64 位 Python 3.11 和可运行当前前端构建的 Node.js/npm。按项目约定备齐 scrcpy 5.0.1 及 Gyan FFmpeg/ffprobe 9.0.2 的工具和许可文件，在仓库根目录执行下列命令。每次使用新的候选号。
+
+```powershell
+pwsh -NoProfile -File scripts/build_windows_portable.ps1 -Candidate 1
+```
+
+可用 `-EmbedZip` 指定官方 Python 3.11.9 x64 嵌入式 ZIP，`-Wheelhouse` 指定与[依赖锁](portable/requirements-win311.lock)匹配的本地 wheels，`-ToolsDirectory` 指定包含两套工具的目录。默认从 python.org 和 pip 配置的包源获取前两项，从仓外 `tools` 取工具。前端在独立临时目录按 npm 锁文件构建。完成后控制台打印 ZIP 路径，成品位于仓外 `mumu_lbcut_tool_dists`。包内 `release.json` 可核对源码版本、工作区改动、依赖和配套上传包。使用入口见[便携包运行说明](../docs/最小调度运行说明.md#windows-便携包)。
 
 ## 入口与参数
 

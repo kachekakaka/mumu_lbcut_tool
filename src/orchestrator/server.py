@@ -39,6 +39,7 @@ class ServerConfig:
     max_runtime: float = 0.0
     static_root: Path = REPO_ROOT / "web" / "dist"
     open_browser: bool = False
+    require_local_tools: bool = False
 
     def validate(self):
         from src.worker.room_locator import validate_navigation_timeout
@@ -79,7 +80,8 @@ class Runtime:
             self.store = Store(self.config.data_dir / "orchestrator.sqlite3")
             self.scheduler = self.scheduler_factory(self.store, self.config.output_dir, self.config.instances,
                 scan_interval_sec=self.config.scan_interval, segment_duration_sec=self.config.segment_duration,
-                navigation_timeout_sec=self.config.navigation_timeout)
+                navigation_timeout_sec=self.config.navigation_timeout,
+                require_local_tools=self.config.require_local_tools)
             with self.lock:
                 if not self.stop.is_set():
                     self.state = "running"

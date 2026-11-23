@@ -49,6 +49,7 @@ def build_parser():
                      help="服务就绪后在运行服务的计算机上打开默认浏览器")
     run.add_argument("--instances", default=None, help="可选初始启用的实例，例如 2,3；不传则保留数据库配置")
     run.add_argument("--output-dir", type=Path, required=True)
+    run.add_argument("--require-local-tools", action="store_true", help="Worker 仅使用已部署的采集工具")
     run.add_argument("--navigation-timeout", type=float, default=300.0,
                      help="传给Worker的定位总时限（60～900秒），默认300秒")
     run.add_argument("--scan-interval", type=float, default=30.0)
@@ -70,7 +71,7 @@ def main(argv=None) -> int:
             config = ServerConfig(args.data_dir.resolve(), args.output_dir.resolve(), instances,
                 host=args.host, port=args.port, scan_interval=args.scan_interval, segment_duration=args.segment_duration,
                 navigation_timeout=args.navigation_timeout, max_runtime=args.max_runtime,
-                open_browser=args.open_browser)
+                open_browser=args.open_browser, require_local_tools=args.require_local_tools)
             if args.static_root is not None:
                 config.static_root = args.static_root.resolve()
             return run_server(config)
