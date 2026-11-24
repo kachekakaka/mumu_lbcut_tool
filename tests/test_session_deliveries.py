@@ -1,7 +1,9 @@
 """整场交付的标题、台账、排他和恢复。Core 网络回包可以受控。"""
 
 import asyncio
+from contextlib import asynccontextmanager, closing
 from datetime import datetime
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,14 +15,15 @@ from console_helpers import DeferredQueries, observe_room
 from src.mvp.room_resolver import ResolvedRoom, RoomStatus
 from src.orchestrator.room_query_process import QueryResult
 from src.orchestrator.scheduler import Scheduler
+from src.orchestrator import recording_archive
 from src.orchestrator.segment_uploads import SegmentUploads
 from src.orchestrator.session_deliveries import SessionDeliveries
 from src.orchestrator.storage import Store
-from upload_platform_fixture import ACCOUNT, Platform
+from upload_platform_fixture import ACCOUNT, DEPLOYMENT, Platform
 
 
 STARTED = datetime.fromisoformat("2026-11-20T20:09:00+08:00").timestamp()
-BINDING = {"deployment": "A", "category_id": 171,
+BINDING = {"deployment": DEPLOYMENT, "category_id": 171,
            "account": ACCOUNT}
 FIELDS = {"title": "测试主播｜2026-11-20 20:09｜直播回放", "description": "", "tags": ["直播回放", "测试主播"],
           "category_id": 171, "copyright": 2, "source": "转载", "publish_mode": "self_only"}
@@ -42,7 +45,9 @@ def add_job(store, target, observed, now):
 
 def emit(store, job, kind, stamp, **fields):
     seq = store.row("SELECT COUNT(*) AS n FROM events WHERE job_id=?", (job,))["n"] + 1
-    event = dict(event=kind, job_id=job, run_id=job, event_seq=seq, event_id=f"{job}:{seq}",
+    row = store.row("SELECT recording_root FROM jobs WHERE id=?", (job,))
+    event = dict(event=kind, job_id=job, run_id=f"run_1_{job}" if row["recording_root"] else job,
+                 event_seq=seq, event_id=f"{job}:{seq}",
                  timestamp=stamp, **fields)
     store.record_event(job, event, stamp)
     return event
@@ -64,6 +69,27 @@ def finish_clip(store, job, index, path, stamp, identity="verified"):
 def finish_worker(store, job, stamp, code=0):
     emit(store, job, "worker_stopped", stamp, exit_code=code)
     store.finish_worker(job, stamp, code)
+
+
+def capture(store, job, root, start_index=1, first_media=STARTED):
+    root.mkdir(exist_ok=True)
+    room_id, anchor_uid = store.row("SELECT room_id,anchor_uid FROM recording_admissions WHERE job_id=?", (job,)).values()
+    run = f"run_1_{job}"
+    with store.transaction() as db:
+        db.execute("UPDATE jobs SET recording_root=?,room_id=? WHERE id=?", (str(root), room_id, job))
+    directory = root / "_录制中" / job / run / f"capture_{start_index:032x}"
+    directory.mkdir(parents=True)
+    (directory / "capture.json").write_text(json.dumps({
+        "job_id": job, "run_id": run, "room_id": room_id, "anchor_uid": anchor_uid,
+        "directory": str(directory), "pattern": "part_%06d.mp4", "start_index": start_index,
+        "generation": start_index, "registered_at": first_media - 1,
+    }), encoding="utf-8")
+    (directory / "capture.verified").write_text(str(first_media), encoding="ascii")
+    return directory
+
+
+def binding_settings(data):
+    (data / "settings.json").write_text(json.dumps({"upload_deployment": DEPLOYMENT}), encoding="utf-8")
 
 
 def current(store, target):
@@ -155,9 +181,10 @@ def delivery(tmp_path):
     store.save_posting_settings(target, True, BINDING)
     root = tmp_path / "recordings"
     platform = Platform()
+    binding_settings(store.path.parent)
 
-    def services(**options):
-        runtime = SimpleNamespace(store=store, state="running")
+    def services(*, ledger=store, **options):
+        runtime = SimpleNamespace(store=ledger, state="running", config=SimpleNamespace(data_dir=ledger.path.parent))
         uploads = SegmentUploads(runtime, platform.client, root)
         return uploads, SessionDeliveries(runtime, uploads,
                                          verify_media=lambda path: SimpleNamespace(is_valid=path.read_bytes() != b"broken",
@@ -167,9 +194,11 @@ def delivery(tmp_path):
     store.close()
 
 
-def close_recording(store, target, root, *, multipart=False, flag=None, identity="verified", broken=False, unfinished=False):
+def close_recording(store, target, root, *, multipart=False, flag=None, identity="verified", broken=False,
+                    unfinished=False, defer_archive=False):
     a = add_job(store, target, room(), STARTED - 1)
-    path = root / a / "000001.mp4"
+    directory = capture(store, a, root)
+    path = directory / "part_000001.mp4"
     start_clip(store, a, 1, path, STARTED, identity)
     if flag:
         emit(store, a, "segment_quality_warning", STARTED, segment_index=1, flag=flag)
@@ -178,13 +207,14 @@ def close_recording(store, target, root, *, multipart=False, flag=None, identity
     if not unfinished:
         finish_clip(store, a, 1, path, STARTED + 2, identity)
     if multipart:
-        second = root / a / "000002.mp4"
+        second = directory / "part_000002.mp4"
         start_clip(store, a, 2, second, STARTED + 2)
         finish_clip(store, a, 2, second, STARTED + 4)
+        recording_archive.publish(store)
         finish_worker(store, a, STARTED + 5, code=20)
         assert current(store, target)["status"] == "recording"
         b = add_job(store, target, room(), STARTED + 6)
-        last = root / b / "000001.mp4"
+        last = capture(store, b, root, first_media=STARTED + 7) / "part_000001.mp4"
         start_clip(store, b, 1, last, STARTED + 7)
         finish_clip(store, b, 1, last, STARTED + 9)
     else:
@@ -192,9 +222,85 @@ def close_recording(store, target, root, *, multipart=False, flag=None, identity
     store.request_stop(b, "manual_stop")
     assert current(store, target)["status"] == "recording"
     finish_worker(store, b, STARTED + 10)
+    if not defer_archive:
+        recording_archive.publish(store)
     with store.transaction() as db:
         db.execute("UPDATE recording_sessions SET title_step='done' WHERE target_id=?", (target,))
     return a, b
+
+
+@pytest.mark.parametrize("reopen", [False, True], ids=["same-run", "reopen"])
+@pytest.mark.parametrize("archive_state", ["pending", "published"])
+def test_closing_waits_for_last_archive_before_automatic_submission(delivery, monkeypatch, reopen, archive_state):
+    store, target, root, core, services = delivery
+    _, job = close_recording(store, target, root, multipart=True, defer_archive=True)
+
+    def last_clip(ledger):
+        return ledger.row("SELECT * FROM segments WHERE job_id=? AND segment_index=1", (job,))
+
+    raw = Path(last_clip(store)["terminal_path"])
+    unlink = Path.unlink
+
+    def block_raw_removal(path, *args, **kwargs):
+        if path == raw:
+            raise PermissionError("测试中保持最后一片的暂存原片打开")
+        return unlink(path, *args, **kwargs)
+
+    @asynccontextmanager
+    async def background(ledger):
+        uploads, service = services(ledger=ledger)
+        stop = asyncio.Event()
+        loop = asyncio.create_task(service.run(stop))
+        try:
+            yield uploads
+        finally:
+            stop.set()
+            await loop
+
+    async def verify_delivery(ledger, uploads):
+        recording_archive.publish(ledger)
+        assert last_clip(ledger)["archive_state"] == "archived" and not raw.exists()
+        assert current(ledger, target)["status"] == "checking"
+        async with asyncio.timeout(8):
+            while current(ledger, target)["status"] != "delivered":
+                await asyncio.sleep(.02)
+        arrangement = current(ledger, target)["arrangement_id"]
+        saved = uploads.store.get(arrangement)
+        manifest = yaml.safe_load(Path(saved["manifest_path"]).read_bytes())
+        assert [v["path"] for v in manifest["assets"]["videos"]] == ["001.mp4", "002.mp4", "003.mp4"]
+        assert manifest["upload_units"][0]["videos"] == ["p1", "p2", "p3"]
+        for _ in range(2):
+            recording_archive.publish(ledger)
+            assert (await uploads.drive(arrangement, replay=True))["task_id"] == saved["task_id"]
+        assert current(ledger, target)["arrangement_id"] == arrangement
+        assert len(core.tasks) == 1
+        _, receipt = next(iter(core.tasks.values()))
+        assert receipt["task_ids"] == [saved["task_id"]]
+        assert sum(method == "POST" for method, *_ in core.trace) == 1
+
+    async def scenario():
+        async with background(store) as uploads:
+            with monkeypatch.context() as patch:
+                if archive_state == "published":
+                    # 模拟 Windows 文件句柄拒绝移除原片，走真实硬链接发布和收场逻辑。
+                    patch.setattr(Path, "unlink", block_raw_removal)
+                    recording_archive.publish(store)
+                    assert Path(last_clip(store)["file_path"]).samefile(raw)
+                assert last_clip(store)["archive_state"] == archive_state
+                await asyncio.sleep(.6)
+                waiting = current(store, target)
+                assert waiting["status"] == "waiting_archive" and waiting["binding"], waiting
+                assert waiting["arrangement_id"] is None
+                assert not list(root.rglob("upload.yaml")) and not core.tasks
+            if not reopen:
+                await verify_delivery(store, uploads)
+        if reopen:
+            store.close()
+            with closing(Store(store.path)) as ledger:
+                async with background(ledger) as uploads:
+                    await verify_delivery(ledger, uploads)
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("multipart", [False, True])
@@ -214,9 +320,9 @@ def test_order_only_includes_session_and_overlay_keeps_parts(delivery, multipart
         row = uploads.store.get(session["arrangement_id"])
         assert row["task_id"]
         path = Path(row["manifest_path"])
-        assert path == root / "sessions" / row["work_id"] / "upload.yaml"
+        assert path == Path(session["recording_directory"]) / "upload.yaml"
         manifest = yaml.safe_load(path.read_bytes())
-        paths = [a + "/000001.mp4"] + ([a + "/000002.mp4", b + "/000001.mp4"] if multipart else [])
+        paths = ["001.mp4", "002.mp4", "003.mp4"] if multipart else ["001.mp4"]
         assert [video["path"] for video in manifest["assets"]["videos"]] == paths
         assert manifest["upload_units"][0]["mode"] == ("multipart" if multipart else "independent")
         assert manifest["work"]["title"] == "测试主播｜2026-11-20 20:09｜直播回放"
@@ -224,7 +330,7 @@ def test_order_only_includes_session_and_overlay_keeps_parts(delivery, multipart
         records = uploads.store.for_segments(keys)
         assert {item["task_id"] for item in records} == {row["task_id"]}
         assert len(records) == len(keys)
-        assert all((root / name).is_file() for name in paths)
+        assert all((path.parent / name).is_file() for name in paths)
         assert neighbor.read_bytes() == b"adjacent stream"
         assert len(core.tasks) == 1
 
@@ -245,7 +351,7 @@ def test_bad_clip_keeps_original_and_never_creates_arrangement(delivery, clip, r
         asyncio.run(service.deliver(current(store, target)))
     session = current(store, target)
     assert session["status"] == "review" and reason in session["problem"]
-    assert not core.trace and len(list(root.glob("*/*.mp4"))) == 1
+    assert not core.trace and len(list(root.rglob("*.mp4"))) == 1
 
 
 @pytest.mark.parametrize("when", ["before_creation", "before_send", "in_flight"])
@@ -292,7 +398,7 @@ def test_manual_confirm_after_session_freeze_links_original_task(delivery):
 
     async def scenario():
         uploads, service = services()
-        preview = await uploads.preview(a, 1, "A", ACCOUNT, FIELDS)
+        preview = await uploads.preview(a, 1, DEPLOYMENT, ACCOUNT, FIELDS)
         await service.deliver(current(store, target))
         await service.deliver(current(store, target))
         session = current(store, target)
@@ -342,7 +448,7 @@ def test_automatic_delivery_finds_concurrent_identical_manual_order(delivery):
 
     async def scenario():
         uploads, service = services()
-        dialog = await uploads.preview(a, 1, "A", ACCOUNT, FIELDS)
+        dialog = await uploads.preview(a, 1, DEPLOYMENT, ACCOUNT, FIELDS)
         started, release = asyncio.Event(), asyncio.Event()
 
         async def block_receipt(request):
@@ -389,7 +495,7 @@ def test_frozen_manifest_resumes_with_original_work_and_colon_session(delivery, 
                 await service.deliver(session)
         saved = current(store, target)
         original = uploads.store.get(saved["arrangement_id"])
-        path = root / "sessions" / original["work_id"] / "upload.yaml"
+        path = Path(saved["recording_directory"]) / "upload.yaml"
         assert path.is_file() == file_written
         content = path.read_bytes() if file_written else None
         uploads, service = services()
@@ -413,7 +519,7 @@ def test_partial_overlap_points_to_conflicting_clip(delivery):
 
     async def scenario():
         uploads, service = services()
-        preview = await uploads.preview(a, 1, "A", ACCOUNT, FIELDS)
+        preview = await uploads.preview(a, 1, DEPLOYMENT, ACCOUNT, FIELDS)
         result = await uploads.confirm(preview["ticket"], True)
         assert result["task_id"]
         await service.deliver(current(store, target))

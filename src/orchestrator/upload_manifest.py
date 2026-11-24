@@ -23,7 +23,8 @@ def file_snapshot(path, root):
             info = os.fstat(handle.fileno())
         if not stat.S_ISREG(info.st_mode) or info.st_size <= 0:
             raise ValueError
-        return {"path": str(resolved), "size": info.st_size, "mtime_ns": info.st_mtime_ns}
+        return {"path": str(resolved), "size": info.st_size, "mtime_ns": info.st_mtime_ns,
+                "device": info.st_dev, "file_id": info.st_ino}
     except (OSError, ValueError, RuntimeError, TypeError):
         raise BridgeError("segment_file_unavailable", "正式录像不存在、不可读或不在录像输出目录内") from None
 
@@ -53,8 +54,8 @@ def manifest_for(root, work_id, frozen):
     }
 
 
-def manifest_path(root, work_id):
-    path = root / "sessions" / work_id / "upload.yaml"
+def manifest_path(root, segment=None):
+    path = (root / "投稿" / f"{segment:03d}" if segment is not None else root) / "upload.yaml"
     if root.drive.startswith("\\\\") or path.resolve() != path or path.is_symlink():
         raise BridgeError("invalid_path", "作品目录越界或包含重解析路径")
     return path
@@ -70,8 +71,8 @@ def read_yaml(path):
     return content
 
 
-def save_manifest(root, work_id, manifest, previous=None):
-    path = manifest_path(root, work_id)
+def save_manifest(root, manifest, previous=None, *, segment=None):
+    path = manifest_path(root, segment)
     content = yaml.safe_dump(manifest, allow_unicode=True, sort_keys=False).encode("utf-8")
     revision = version(content)
     if len(content) > 1024 * 1024:
@@ -82,10 +83,15 @@ def save_manifest(root, work_id, manifest, previous=None):
         original = None
     if original == content:
         return str(path), revision
-    if original is not None and version(original) != previous:
-        raise BridgeError("version_conflict", "现有作品 YAML 与冻结内容不同，已保留文件供核对")
+    if original is not None:
+        try:
+            same_work = yaml.safe_load(original)["work"]["id"] == manifest["work"]["id"]
+        except (yaml.YAMLError, KeyError, TypeError):
+            same_work = False
+        if not same_work or version(original) != previous:
+            raise BridgeError("version_conflict", "现有作品 YAML 属于其他作品或已被修改，已保留文件供核对")
     path.parent.mkdir(parents=True, exist_ok=True)
-    if manifest_path(root, work_id) != path:
+    if manifest_path(root, segment) != path:
         raise BridgeError("invalid_path", "作品目录已变化")
     with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".tmp", delete=False) as handle:
         temp = Path(handle.name)
@@ -95,8 +101,10 @@ def save_manifest(root, work_id, manifest, previous=None):
             os.fsync(handle.fileno())
             handle.close()
             if original is None:
-                # Windows 下 rename 不覆盖目标，保留中途出现的文件。
-                temp.rename(path)
+                try:
+                    os.link(temp, path)
+                except FileExistsError as exc:
+                    raise BridgeError("version_conflict", "作品 YAML 在保存期间已就位，已保留原件") from exc
             else:
                 if read_yaml(path) != original:
                     raise BridgeError("version_conflict", "作品 YAML 在保存期间已变化")

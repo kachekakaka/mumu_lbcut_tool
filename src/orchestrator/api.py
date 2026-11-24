@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool, ValidationError, 
 from starlette.exceptions import HTTPException
 
 from src.orchestrator.desktop import reveal_in_file_manager
+from src.orchestrator import recording_archive
 from src.orchestrator.storage import ControlError
 from src.orchestrator.queries import Queries
 
@@ -399,16 +400,34 @@ def install_api(app: FastAPI, runtime):
         file_path_raw = seg.get("file_path")
         if not file_path_raw:
             raise ControlError("segment_file_not_ready", "切片文件尚未落盘", 404)
-        output_root = runtime.config.output_dir.resolve()
-        file_path = FilePath(file_path_raw).resolve()
-        if not file_path.is_relative_to(output_root):
+        location = recording_archive.location(runtime.store, job_id, segment_index)
+        output_root = FilePath(location["recording_root"] or runtime.config.output_dir)
+        file_path = FilePath(file_path_raw)
+        if not output_root.is_dir():
+            raise ControlError("folder_not_found", f"原录像根不可用：{output_root}", 404)
+        if not recording_archive.stable(file_path) or not file_path.is_relative_to(output_root):
             raise ControlError("path_forbidden", "切片路径不在录像输出目录内", 403)
+        if location["recording_root"]:
+            if seg["status"] == "started":
+                with runtime.store.read_snapshot() as db:
+                    job = recording_archive.admitted_job(db, job_id)
+                try:
+                    record = recording_archive.capture_record(job, file_path.parent)
+                    if file_path.name != f"part_{segment_index:06d}.mp4" or segment_index < record["start_index"]:
+                        raise ValueError("切片不属于已登记的采集目录")
+                except (OSError, ValueError, KeyError, TypeError) as exc:
+                    raise ControlError("path_forbidden", "切片路径不在已登记的暂存目录内", 403) from exc
+            elif (location["archive_path"] != file_path_raw or not location["recording_directory"]
+                  or file_path.parent != FilePath(location["recording_directory"])
+                  or location["session_root"] != str(output_root)
+                  or location["archive_state"] not in ("published", "archived")):
+                raise ControlError("path_forbidden", "切片路径与场次归档记录不符", 403)
         if file_path.is_file():
             revealed = True
         elif file_path.parent.is_dir():
             revealed = False
         else:
-            raise ControlError("folder_not_found", "切片所在目录不存在", 404)
+            raise ControlError("folder_not_found", f"切片所在目录不存在：{file_path.parent}", 404)
         try:
             reveal_in_file_manager(file_path if revealed else file_path.parent, is_file=revealed)
         except Exception as exc:

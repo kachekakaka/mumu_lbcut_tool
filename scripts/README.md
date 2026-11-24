@@ -12,6 +12,8 @@ pwsh -NoProfile -File scripts/build_windows_portable.ps1 -Candidate 1
 
 可用 `-EmbedZip` 指定官方 Python 3.11.9 x64 嵌入式 ZIP，`-Wheelhouse` 指定与[依赖锁](portable/requirements-win311.lock)匹配的本地 wheels，`-ToolsDirectory` 指定包含两套工具的目录。默认从 python.org 和 pip 配置的包源获取前两项，从仓外 `tools` 取工具。前端在独立临时目录按 npm 锁文件构建。完成后控制台打印 ZIP 路径，成品位于仓外 `mumu_lbcut_tool_dists`。包内 `release.json` 可核对源码版本、工作区改动、依赖和配套上传包。使用入口见[便携包运行说明](../docs/最小调度运行说明.md#windows-便携包)。
 
+传入支持工作目录绑定的上传便携 ZIP 可制作整合候选，例如在上述命令后加 `-UploadZip $UploadZip`。整合候选文件名以 `-combined.zip` 结尾，由包根的「启动MuMu.cmd」启动。
+
 ## 入口与参数
 
 | 入口 | 必需参数 | 用途和执行副作用 |

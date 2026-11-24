@@ -8,7 +8,7 @@
 
 运行环境：Windows、Python 3.11、MuMu、scrcpy，以及固定的 Gyan FFmpeg/ffprobe 9.0.2 full build。媒体工具部署见 [运行说明](docs/最小调度运行说明.md#固定媒体工具部署)。Python 运行依赖见 `requirements.txt`，测试依赖见 `requirements-test.txt` 和 [测试入口](tests/README.md)。
 
-使用 Windows x64 录播便携包时，解压后双击启动，Python、网页和采集工具已随包提供。录播与上传可独立运行。[便携包运行说明](docs/最小调度运行说明.md#windows-便携包) · [制作候选 ZIP](scripts/README.md#制作-windows-录播便携包)
+Windows x64 整合包解压后双击「启动MuMu.cmd」，首次选择工作目录。Python、网页和采集工具随包提供。也可以使用独立录播包。[便携包运行说明](docs/最小调度运行说明.md#windows-便携包) · [制作候选 ZIP](scripts/README.md#制作-windows-录播便携包)
 
 ## 文档入口
 
@@ -23,6 +23,8 @@
 ## 项目目录与文件存放
 
 路径相对仓库根目录解析，不依赖本机固定盘符。标有“按需”的部分为约定位置，尚未创建；不预建空文档或占位目录。
+
+便携包默认使用解压目录的同级 `mumu_lbcut_tool_dev` 作为工作目录。可另选工作目录和专用录像根。[目录设计决定](docs/adr/0023-recording-workspace-and-session-directories.md)
 
 ```text
 项目父目录/
@@ -46,10 +48,14 @@
 | `scripts/`、`archive/scripts/` | 前者保存维护入口；后者保存已退役脚本的源码文本和用途说明，不作为可运行工具；既有现场产物的整理须另行确定 |
 | `../mumu_lbcut_tool_dev/mumu_lbcut_tool_tmp/` | 临时脚本、草稿、探针、构建中间文件、测试输入副本、输出、日志、截图、报告及验包解压副本 |
 | `../mumu_lbcut_tool_dev/mumu_lbcut_tool_dists/` | 打包生成的程序目录、安装包、便携包及发布压缩包；测试包同样放在这里，并在名称中注明测试用途 |
-| `../mumu_lbcut_tool_dev/runtime-console-unified/` | 统一投稿版默认调度数据库、交付关联与事件日志。用 `run --data-dir` 可指定其他独立目录 |
+| 包根 `workspace.json` | 指向选定的工作目录，仅保存绝对路径 `dataDirectory`。换包可以复制指针，开发机和制包产物不带指针 |
+| 工作目录 `runtime-console-unified/` | 录播端的调度数据库、录播设置、投稿部署绑定、交付关联与任务日志。源码版用 `run --data-dir` 可指定其他独立目录 |
+| 工作目录 `upload-platform/` | 整合包上传端的数据库、引擎私有状态和上传日志，由上传端管理 |
+| 工作目录 `recordings/` 或指定的录像根 | `_录制中/` 保存采集台账和过程媒体，正式录像为 `<主播>/<场次>/001.mp4`，异常中断原片用 `001-中断.mp4` 等编号 |
+| 正式录像的场次目录 | 安排投稿时生成整场 `upload.yaml` 或手动单片 `投稿/<片号>/upload.yaml`，两者引用本场原视频 |
+| `%LOCALAPPDATA%\MuMuLBCut` | 同一 Windows 用户共享的便携启动锁和实例锁 |
 | `../mumu_lbcut_tool_dev/runtime-console/` | 旧版调度与安排数据，保留原目录 |
 | `../mumu_lbcut_tool_dev/runtime/` | 保留旧运行数据及共享实例锁；新服务不读取旧库、不迁移或覆盖已有数据库 |
-| 用户指定的 `--output-dir` | 正式录像目录；按调度任务与 Worker run_id 分层，禁止覆盖已有录像 |
 | `../mumu_lbcut_tool_dev/tools/` | scrcpy 与固定媒体工具；ffmpeg/ffprobe 成套放入 `ffmpeg-9.0.2-full_build/bin/`，二进制不进 Git，具体部署见运行说明 |
 
 临时与测试材料按任务或批次分子目录，例如 `mumu_lbcut_tool_tmp/20261020-任务名称/`；同日多批次追加序号。打包产物使用独立目录或文件名，不覆盖已有版本。打包目录存放产物，验包运行和解压副本放入临时目录；打包产物不混入私人配置或测试运行数据。

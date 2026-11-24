@@ -11,8 +11,7 @@ import time
 from src.mvp.dep_manager import DependencyManager
 from src.worker.segment_verifier import verify_segment_file
 
-from .queries import quality_flags
-from .upload_manifest import file_snapshot, manifest_for, save_manifest
+from .upload_manifest import manifest_for, save_manifest
 from .upload_platform import BridgeError
 
 
@@ -32,7 +31,7 @@ class SessionDeliveries:
     def prepare(self, session):
         evidence = json.loads(session["evidence"])
         binding = json.loads(session["binding"])
-        root = self.uploads.output_dir.resolve()
+        root, asset_root = session["recording_root"], session["recording_directory"]
         clips, problems = [], []
         seen = set()
         verify = self.verify_media
@@ -48,19 +47,21 @@ class SessionDeliveries:
 
         for clip in evidence:
             try:
-                info = file_snapshot(clip["file_path"], root)
+                current = self.uploads.clip(clip["job_id"], clip["segment_index"])
+                info = current["file"]
                 path = Path(info["path"])
-                if not path.is_relative_to(root / clip["job_id"]):
-                    raise BridgeError("invalid_path", "文件位于其他录制任务目录")
+                if current["recording_root"] != root or current["asset_root"] != asset_root or (
+                    info["path"], current["session_index"]) != (clip["file_path"], clip["session_index"]):
+                    raise BridgeError("invalid_path", "文件与本场归档记录不符")
                 if path in seen:
                     raise BridgeError("invalid_path", "同一录像被多次引用")
                 seen.add(path)
                 result = verify(path)
                 if not result.is_valid:
                     raise BridgeError("invalid_media", result.reject_reason)
-                if file_snapshot(info["path"], root) != info:
+                if self.uploads.clip(clip["job_id"], clip["segment_index"]) != current:
                     raise BridgeError("segment_changed", "文件在校验期间发生变化")
-                clips.append({**clip, "file": info, "quality_flags": quality_flags(clip["risks"])})
+                clips.append(current)
             except BridgeError as exc:
                 problems.append(f"任务 {clip['job_id']} 第 {clip['segment_index']} 片：{exc.message}")
         name = (session["nickname"] or "").strip()
@@ -76,7 +77,7 @@ class SessionDeliveries:
             return
         title = "｜".join(filter(None, (name, session["title"], started, "直播回放")))
         frozen = {
-            "root": str(root), "clips": clips, "evidence": evidence,
+            "recording_root": root, "asset_root": asset_root, "clips": clips, "evidence": evidence,
             "account": binding["account"],
             "parameters": {
                 "title": title, "description": "", "tags": ["直播回放", name],
@@ -97,8 +98,8 @@ class SessionDeliveries:
 
     def write_manifest(self, row):
         frozen = json.loads(row["frozen"])
-        root = Path(frozen["root"])
-        path, revision = save_manifest(root, row["work_id"], manifest_for(root, row["work_id"], frozen))
+        root = Path(frozen["asset_root"])
+        path, revision = save_manifest(root, manifest_for(root, row["work_id"], frozen))
         reference = f"{row['auto_target']}:{row['auto_session']}"
         request = {
             "manifest_path": path, "asset_root": str(root), "expected_version": revision,

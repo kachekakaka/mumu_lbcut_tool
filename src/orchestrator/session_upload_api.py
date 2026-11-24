@@ -32,7 +32,7 @@ def install_session_uploads(router, uploads):
         saved = json.loads(row["binding"]) if row and row["binding"] else None
         result = {"enabled": bool(row and row["enabled"]), "saved": saved, "deployment": None, "accounts": []}
         try:
-            deployment = await uploads.core.binding()
+            deployment = await uploads.core.binding(uploads.expected_deployment())
             result.update(deployment=deployment, accounts=await uploads.core.accounts(deployment))
         except BridgeError as exc:
             result["problem"] = exc.message
@@ -45,6 +45,7 @@ def install_session_uploads(router, uploads):
         if body.enabled:
             if not (body.deployment and body.account_id and body.remote_user_id and body.category_id):
                 raise BridgeError("invalid_request", "开启自动投稿需选择部署、账号和分区", 422)
+            uploads.expected_deployment(body.deployment)
             account = await uploads.core.check_account(body.deployment, {
                 "id": body.account_id, "remote_user_id": body.remote_user_id,
             })

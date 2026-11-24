@@ -127,6 +127,8 @@ class WorkerProcessHandle:
                     try:
                         self._journal.write(json.dumps(event, ensure_ascii=False) + "\n")
                         self._journal.flush()
+                        if event["event"] in ("segment_started", "segment_finished", "segment_aborted"):
+                            os.fsync(self._journal.fileno())
                     except OSError:
                         self._error("event_journal_write_failed")
                 with self._lock:

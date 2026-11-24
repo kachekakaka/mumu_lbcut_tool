@@ -51,3 +51,4 @@ web/node_modules/
 web/dist/
 
 # 技术栈确定后按实际工具补充依赖与缓存规则
+/workspace.json

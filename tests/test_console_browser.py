@@ -15,7 +15,7 @@ from src.orchestrator import cli, server
     ('::1', 8123, 'http://[::1]:8123/segments'),
 ])
 def test_browser_url(tmp_path, host, port, expected):
-    config = server.ServerConfig(tmp_path, tmp_path, host=host, port=port)
+    config = server.ServerConfig(tmp_path / "data", tmp_path / "recordings", host=host, port=port)
     config.validate()
     assert server.browser_url(config) == expected
 

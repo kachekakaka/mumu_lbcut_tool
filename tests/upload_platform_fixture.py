@@ -12,11 +12,12 @@ from src.orchestrator.upload_platform import UploadPlatform
 
 
 ACCOUNT = {"id": str(uuid4()), "remote_user_id": "42", "display_name": "测试账号"}
+DEPLOYMENT = str(uuid4())
 
 
 class Platform:
     def __init__(self):
-        self.deployment = "A"
+        self.deployment = DEPLOYMENT
         self.account = ACCOUNT.copy()
         self.available = True
         self.private = True
@@ -34,7 +35,7 @@ class Platform:
     def read(self, paths):
         path = Path(paths["manifest_path"])
         root = Path(paths["asset_root"])
-        if (path.resolve() != path or not path.is_relative_to(root / "sessions")
+        if (path.resolve() != path or not path.is_relative_to(root)
             or path.name != "upload.yaml"):
             raise ValueError
         content = path.read_bytes()

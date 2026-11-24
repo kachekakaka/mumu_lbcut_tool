@@ -12,6 +12,7 @@ import uuid
 from src.mvp.room_resolver import ResolvedRoom
 from src.worker.room_locator import valid_identity_id
 from . import session_ledger
+from . import recording_archive
 
 
 logger = logging.getLogger(__name__)
@@ -31,7 +32,7 @@ ACTIVE = ("pending", "starting", "running", "stopping", "needs_reconcile")
 NEEDS_FIX = "needs_fix: "          # 目标无效，直到显式 record 查询确认 LIVE 后解除
 RETRY_BASE_SEC, RETRY_MAX_SEC = 5, 300
 BOOT_RETRY_BASE_SEC, BOOT_RETRY_MAX_SEC = 30, 300
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 # 这些停止原因已由目标状态决定后续（移除、确认下播、换场、主控正常退出），无需退避。
 SETTLED_STOPS = ("target_removed", "anchor_offline", "live_session_changed", "scheduler_shutdown")
 SCHEMA = """
@@ -59,7 +60,7 @@ CREATE TABLE IF NOT EXISTS jobs (
  command_json TEXT, event_log_path TEXT, created_at REAL NOT NULL, started_at REAL, ended_at REAL,
  stop_reason TEXT, error_reason TEXT, exit_code INTEGER, heartbeat_json TEXT,
  collection_complete INTEGER NOT NULL DEFAULT 0, reconcile_requested INTEGER NOT NULL DEFAULT 0,
- old_worker_deadline REAL, worker_reason TEXT, worker_run_id TEXT, launch_intent_at REAL
+ old_worker_deadline REAL, worker_reason TEXT, worker_run_id TEXT, launch_intent_at REAL, recording_root TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS one_active_target ON jobs(target_id)
  WHERE status IN ('pending','starting','running','stopping','needs_reconcile');
@@ -75,6 +76,7 @@ CREATE TABLE IF NOT EXISTS segments (
  raw_path TEXT, file_path TEXT, duration_sec REAL, file_size_mb REAL,
  is_final INTEGER NOT NULL DEFAULT 0, reason TEXT, risk_json TEXT,
  created_at REAL NOT NULL, started_at REAL, ended_at REAL, updated_at REAL NOT NULL,
+ session_index INTEGER, terminal_path TEXT, archive_path TEXT, archive_identity TEXT, archive_state TEXT,
  PRIMARY KEY(job_id, segment_index)
 );
 CREATE TABLE IF NOT EXISTS commands (
@@ -171,7 +173,7 @@ class Store:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         from .segment_upload_store import SCHEMA as DELIVERY_SCHEMA
-        self.db.executescript(SCHEMA + session_ledger.SCHEMA + DELIVERY_SCHEMA)
+        self.db.executescript(SCHEMA + session_ledger.SCHEMA + DELIVERY_SCHEMA + recording_archive.SCHEMA)
         self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
     @contextmanager
@@ -231,10 +233,10 @@ class Store:
                 db.execute("""DELETE FROM delivery_segments WHERE delivery_id IN
                     (SELECT id FROM deliveries WHERE auto_target=? AND stopped=1)""", (target_id,))
                 db.execute("""UPDATE recording_sessions SET stopped=1,
-                    status=CASE WHEN status!='recording' AND (arrangement_id IS NULL OR arrangement_id IN
+                    status=CASE WHEN status NOT IN ('recording','waiting_archive') AND (arrangement_id IS NULL OR arrangement_id IN
                        (SELECT id FROM deliveries WHERE auto_target=? AND stopped=1))
                        THEN 'only_record' ELSE status END
-                    WHERE target_id=? AND status IN ('recording','checking','pending','review')""",
+                    WHERE target_id=? AND status IN ('recording','waiting_archive','checking','pending','review')""",
                            (target_id, target_id))
 
     def add_target(self, raw: str, auto_record=True, allow_unconfirmed=False, now=None) -> str:
@@ -545,6 +547,7 @@ class Store:
                 if kind == "segment_started":
                     db.execute("UPDATE segments SET started=1,raw_path=?,started_at=? WHERE job_id=? AND segment_index=? AND started=0", (event.get("file_path"), stamp, job_id, idx))
                     session_ledger.first_segment(db, job_id, stamp, now, replay)
+                    recording_archive.number(db, job_id, idx)
                     # Popen 成功不等于开始录制；首片开始后才将任务标为 running，并把失败计数清零。
                     if not replay and db.execute("UPDATE jobs SET status='running' WHERE id=? AND status='starting'", (job_id,)).rowcount:
                         db.execute("UPDATE targets SET attempts=0 WHERE id=(SELECT target_id FROM jobs WHERE id=?)", (job_id,))
@@ -555,9 +558,9 @@ class Store:
                     if old and old["status"] in ("finished", "aborted", "conflicted"):
                         if old["status"] == "conflicted":
                             return
-                        if (old["status"] != status or old["file_path"] != event.get("file_path")
+                        if (old["status"] != status or (old["terminal_path"] or old["file_path"]) != event.get("file_path")
                                 or bool(old["is_final"]) != bool(event.get("is_final"))):
-                            db.execute("""UPDATE segments SET status='conflicted',file_path=NULL,
+                            db.execute("""UPDATE segments SET status='conflicted',file_path=NULL,archive_state='review',
                                 is_final=0,reason='segment_terminal_conflict' WHERE job_id=? AND segment_index=?""",
                                        (job_id, idx))
                             db.execute("""UPDATE jobs SET status='failed',exit_code=COALESCE(NULLIF(exit_code,0),30),
@@ -565,9 +568,10 @@ class Store:
                                 AND status IN ('finished','finished_with_warnings','failed','cancelled')""",
                                        (f"event_collection_incomplete: 切片 {idx} 终态冲突", job_id))
                         return
-                    db.execute("""UPDATE segments SET status=?,file_path=?,duration_sec=?,file_size_mb=?,is_final=?,reason=?,ended_at=?
+                    db.execute("""UPDATE segments SET status=?,file_path=?,duration_sec=?,file_size_mb=?,is_final=?,reason=?,ended_at=?,terminal_path=?
                         WHERE job_id=? AND segment_index=?""", (status, event.get("file_path"), event.get("duration_sec"),
-                        event.get("file_size_mb"), int(bool(event.get("is_final"))), event.get("reason"), stamp, job_id, idx))
+                        event.get("file_size_mb"), int(bool(event.get("is_final"))), event.get("reason"), stamp, event.get("file_path"), job_id, idx))
+                    recording_archive.terminal(db, job_id, idx, event, stamp, now)
         if quality_issue:
             logger.warning("迟到质量事件收集不完整：job_id=%s event_id=%s segment_index=%s reason=%s",
                            job_id, event.get("event_id"), idx, quality_issue)

@@ -11,6 +11,7 @@ import time
 import uuid
 
 import psutil
+from . import recording_archive
 from src.mvp.room_resolver import ResolvedRoom, RoomStatus
 from src.orchestrator.instance_pool import InstancePool
 from src.orchestrator.models import WorkerLaunchSpec
@@ -195,8 +196,16 @@ class Scheduler:
                     self._replays[job_id] = 0
                     self._replay_contexts[job_id] = event
                 else:
-                    self.store.finish_worker(job_id, self.clock(), self._handles[job_id].poll_exit_code())
-                    self._forget_worker(job_id)
+                    job = self.store.row("SELECT * FROM jobs WHERE id=?", (job_id,))
+                    if job["recording_root"] and self.process_probe(job) != "absent":
+                        self.store.mark_waiting_exit(job_id, self.clock(), quarantine=True,
+                            reason="worker_recording_process_still_present")
+                        self._forget_worker(job_id)
+                        self._check_old_worker(self.store.row("SELECT * FROM jobs WHERE id=?", (job_id,)))
+                    else:
+                        recording_archive.recover_unfinished(self.store, job_id, self.clock())
+                        self.store.finish_worker(job_id, self.clock(), self._handles[job_id].poll_exit_code())
+                        self._forget_worker(job_id)
                 self._event_pending = None
                 continue
             # 数据库失败时保留当前事件，不静默丢弃；主循环异常会停止本主控创建的 Worker。
@@ -594,17 +603,29 @@ class Scheduler:
             self.store.defer_start(job_id, self.clock(), reason)
             return
         journal = self.store.path.parent / "events" / f"{job_id}.ndjson"
+        session = self.store.row("""SELECT recording_root FROM recording_sessions
+            WHERE target_id=? AND session_key=?""", (job["target_id"], job["session_key"]))
+        root = Path(session["recording_root"]) if session and session["recording_root"] else self.output_dir
+        staging = root / "_录制中"
+        if not recording_archive.stable(staging) or (session and session["recording_root"] and not root.is_dir()):
+            self.store.defer_start(job_id, self.clock(), f"原录像根不可用：{root}")
+            return
+        try:
+            staging.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self.store.defer_start(job_id, self.clock(), f"无法创建录像暂存目录 {staging}：{exc}")
+            return
         spec = WorkerLaunchSpec(vmindex=job["vmindex"], target=room.room_id,
-            output_dir=self.output_dir / job_id, target_kind="room_id",
+            output_dir=staging / job_id, target_kind="room_id",
             web_rid=room.web_rid, expected_anchor_uid=getattr(room, "anchor_uid", None),
             allow_unconfirmed_identity=bool(target["allow_unconfirmed"]), job_id=job_id,
             event_log_path=journal, log_path=journal.with_suffix(".log"), segment_duration_sec=self.segment_duration,
             navigation_timeout_sec=self.navigation_timeout, require_local_tools=self.require_local_tools)
         # 先保存启动意图和产物关联，覆盖 Popen 后写 PID 前的异常窗口。
         with self.store.transaction() as db:
-            saved = db.execute("""UPDATE jobs SET room_id=?,event_log_path=?,launch_intent_at=?
+            saved = db.execute("""UPDATE jobs SET room_id=?,event_log_path=?,launch_intent_at=?,recording_root=?
                 WHERE id=? AND status='starting' AND event_log_path IS NULL""",
-                               (room.room_id, str(journal), self.clock(), job_id))
+                               (room.room_id, str(journal), self.clock(), str(root), job_id))
             if not saved.rowcount:
                 return
             db.execute("INSERT INTO recording_admissions VALUES(?,?,?,?,?,?)",
@@ -676,6 +697,11 @@ class Scheduler:
     def _finish_orphan(self, job, process_code=None, context=""):
         """每轮有界补账。坏行按物理行跳过，提交后才推进读取位置。"""
         job_id = job["id"]
+        if job["recording_root"] and not Path(job["recording_root"]).is_dir():
+            reason = f"原录像根不可用：{job['recording_root']}"
+            if job["error_reason"] != reason:
+                self.store.mark_waiting_exit(job_id, self.clock(), reason=reason, quarantine=True)
+            return
         offset = self._replays.get(job_id, 0)
         path = Path(job["event_log_path"]) if job["event_log_path"] else None
         try:
@@ -706,11 +732,17 @@ class Scheduler:
             logger.warning("任务 %s 事件日志暂不可读：%s", job_id, exc)
             self._replays[job_id] = offset
             return
+        if job["recording_root"] and self.process_probe(job) != "absent":
+            self._replays.pop(job_id, None)
+            self._check_old_worker(job)
+            return
+        recording_archive.recover_unfinished(self.store, job_id, self.clock())
         self.store.finish_worker(job_id, self.clock(), process_code, context)
         self._forget_worker(job_id)
 
     def tick(self):
         self._collect()
+        recording_archive.publish(self.store)
         if self._shutdown:
             return
         self._commands()
@@ -729,6 +761,7 @@ class Scheduler:
         self._reconcile_targets()
         self._dispatch()
         self._collect()
+        recording_archive.publish(self.store)
         self._session_titles()
 
     def close(self, timeout_sec: float = 70.0, *, preserve_ledger=False):
@@ -798,6 +831,11 @@ class Scheduler:
                                               "shutdown_incomplete", hold_instance=True)
                     except Exception:
                         pass
+            if not preserve_ledger:
+                try:
+                    recording_archive.publish(self.store)
+                except Exception as exc:
+                    shutdown_errors.append(str(exc))
         finally:
             try:
                 query_closed.result(timeout=6)

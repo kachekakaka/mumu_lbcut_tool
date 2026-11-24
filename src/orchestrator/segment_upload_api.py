@@ -85,6 +85,8 @@ def install_uploads(app, config, runtime, platform=None):
     @router.get("/panel")
     async def panel(page: Literal["accounts", "works", "tasks"], task_id: UUID | None = None):
         route = page
+        deployment = service.expected_deployment()
+        await service.core.binding(deployment)
         if task_id:
             if page != "tasks":
                 raise BridgeError("invalid_request", "请打开任务页面", 422)
@@ -93,10 +95,10 @@ def install_uploads(app, config, runtime, platform=None):
                                          "SELECT deployment FROM deliveries WHERE task_id=?", (task,))
             if not row:
                 raise BridgeError("task_not_found", "找不到这个本机交付任务", 404)
-            await service.core.binding(row["deployment"])
+            service.expected_deployment(row["deployment"])
             route += "/" + task
         await service.core.panel(route)
-        return {"ready": True}
+        return {"ready": True, "deployment": deployment}
 
     @router.get("/segment-uploads")
     async def summaries(keys: Annotated[list[SegmentKey], Query(min_length=1, max_length=200)]):

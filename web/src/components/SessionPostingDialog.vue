@@ -40,7 +40,8 @@ let timer: ReturnType<typeof setInterval> | undefined
 let statusGeneration = -1
 const path = computed(() => '/session-uploads/' + props.targetId)
 const statuses: Record<string, string> = {
-  recording: '录制中', waiting_close: '等待本场结束', checking: '正在核对切片', only_record: '只录',
+  recording: '录制中', waiting_close: '等待本场结束', waiting_archive: '等待录像归档',
+  checking: '正在核对切片', only_record: '只录',
   pending: '待交付', review: '待核对', delivered: '平台已受理',
 }
 

@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS recording_sessions (
  room_id TEXT NOT NULL, anchor_uid TEXT NOT NULL, nickname TEXT, web_rid TEXT NOT NULL,
  title TEXT, title_observed_at REAL, title_step TEXT NOT NULL, title_deadline REAL,
  close_reason TEXT, status TEXT NOT NULL DEFAULT 'recording', stopped INTEGER NOT NULL DEFAULT 0,
- binding TEXT, evidence TEXT,
+ binding TEXT, evidence TEXT, recording_root TEXT, recording_directory TEXT,
  problem TEXT, retry_at REAL NOT NULL DEFAULT 0,
  arrangement_id TEXT REFERENCES deliveries(id),
  PRIMARY KEY(target_id, session_key)
@@ -43,7 +43,8 @@ def gather_evidence(db, session):
     jobs = list(db.execute("""SELECT j.*,a.anchor_uid,a.room_id AS admitted_room
         FROM jobs j LEFT JOIN recording_admissions a ON a.job_id=j.id
         WHERE j.target_id=? AND j.session_key=?
-        ORDER BY (SELECT MIN(s.started_at) FROM segments s WHERE s.job_id=j.id) NULLS LAST, j.rowid""",
+        ORDER BY (SELECT MIN(s.session_index) FROM segments s WHERE s.job_id=j.id) NULLS LAST,
+            (SELECT MIN(s.started_at) FROM segments s WHERE s.job_id=j.id) NULLS LAST, j.rowid""",
                            (session['target_id'], session['session_key'])))
     issues, clips, paths = [], [], set()
     previous = None
@@ -88,7 +89,8 @@ def gather_evidence(db, session):
             if clip['file_path'] and clip['file_path'] in paths:
                 issues.append(f"{label} 与其他切片共用同一个文件")
             paths.add(clip['file_path'])
-            clips.append({k: clip[k] for k in ('job_id', 'segment_index', 'file_path', 'started_at')} | {'risks': risks})
+            clips.append({k: clip[k] for k in ('job_id', 'segment_index', 'file_path', 'started_at', 'session_index')}
+                         | {'risks': risks})
     if not clips:
         issues.append('本场没有正式成片')
     return clips, '；'.join(issues) or None
@@ -100,14 +102,22 @@ def close_session(db, target_id, session_key, reason=None):
         db.execute("""UPDATE recording_sessions SET close_reason=COALESCE(close_reason,?)
             WHERE target_id=? AND session_key=?""", (reason, *key))
     session = db.execute("SELECT * FROM recording_sessions WHERE target_id=? AND session_key=?", key).fetchone()
-    if not session or session['status'] != 'recording' or not session['close_reason']:
+    if not session or session['status'] not in ('recording', 'waiting_archive') or not session['close_reason']:
         return
     if db.execute("""SELECT 1 FROM jobs WHERE target_id=? AND session_key=?
         AND status IN ('pending','starting','running','stopping','needs_reconcile')""", key).fetchone():
         return
     setting = db.execute("SELECT * FROM posting_settings WHERE target_id=?", (target_id,)).fetchone()
-    binding = setting['binding'] if setting and setting['enabled'] and not session['stopped'] else None
-    clips, problem = gather_evidence(db, session) if binding else (None, None)
-    status = 'only_record' if not binding else 'review' if problem else 'checking'
+    binding = (session['binding'] if session['status'] == 'waiting_archive' else setting['binding']
+               if setting and setting['enabled'] else None)
+    if session['stopped']:
+        binding = None
+    if db.execute("""SELECT 1 FROM segments s JOIN jobs j ON j.id=s.job_id
+        WHERE j.target_id=? AND j.session_key=? AND s.archive_state IN ('pending','published') LIMIT 1""", key).fetchone():
+        db.execute("""UPDATE recording_sessions SET status='waiting_archive',binding=?
+            WHERE target_id=? AND session_key=?""", (binding, *key))
+        return
+    clips, problem = gather_evidence(db, session) if binding or session['recording_directory'] else (None, None)
+    status = 'review' if problem else 'checking' if binding else 'only_record'
     db.execute("""UPDATE recording_sessions SET status=?,binding=?,evidence=?,problem=?
         WHERE target_id=? AND session_key=?""", (status, binding, json.dumps(clips), problem, *key))

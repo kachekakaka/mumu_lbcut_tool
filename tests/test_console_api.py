@@ -497,6 +497,7 @@ def test_open_segment_folder_contract(api, monkeypatch):
     from src.orchestrator import desktop
     monkeypatch.setattr(desktop.platform, 'system', lambda: 'Windows')
     monkeypatch.setattr(desktop, 'run_file_manager', lambda cmd: launched.append(cmd))
+    monkeypatch.setattr(desktop, 'select_windows_file', lambda path: launched.append(path))
 
     # 1. 切片不存在
     assert client.post(f'/api/segments/{job}/0/open-folder').status_code == 404
@@ -523,7 +524,7 @@ def test_open_segment_folder_contract(api, monkeypatch):
     assert data['file_path'] == str(seg_file.resolve())
     assert data['folder_path'] == str(job_folder.resolve())
     assert len(launched) == 1
-    assert launched[0] == ['explorer.exe', f'/select,{seg_file.resolve()}']
+    assert launched[0] == seg_file.resolve()
 
     # 4. 文件不存在但父目录存在 (优雅降级)
     seg_file.unlink()
@@ -569,8 +570,9 @@ def test_open_segment_folder_launch_failure(api, monkeypatch, caplog, file_exist
     def fail_launch(*args, **kwargs):
         raise exception_type('模拟资源管理器启动失败')
 
-    # 在实际子进程边界注入失败，防止桌面辅助层再次吞掉异常。
+    # 在 Windows 文件选择或启动文件管理器的边界注入失败。
     from src.orchestrator import desktop
+    monkeypatch.setattr(desktop, 'select_windows_file', fail_launch)
     monkeypatch.setattr(desktop.subprocess, 'Popen', fail_launch)
     response = client.post(f'/api/segments/{job}/0/open-folder')
     assert response.status_code == 500

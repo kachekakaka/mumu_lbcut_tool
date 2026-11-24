@@ -7,10 +7,11 @@ import re
 import time
 from uuid import uuid4
 
+from . import recording_archive
 from .queries import Queries
 from .segment_upload_store import DeliveryStore, for_segments
 from .storage import ControlError
-from .upload_manifest import file_snapshot, manifest_for, read_yaml, save_manifest, version
+from .upload_manifest import file_snapshot, manifest_for, manifest_path, read_yaml, save_manifest, version
 from .upload_platform import BridgeError, DEFINITE_REJECTIONS, identifier, protocol
 
 
@@ -39,6 +40,21 @@ class SegmentUploads:
         if not self.writable():
             raise BridgeError("upload_paused", "控制台尚未就绪或正在关闭", 503)
 
+    def expected_deployment(self, requested=None):
+        path = self.runtime.config.data_dir / "settings.json"
+        try:
+            deployment = json.loads(path.read_text(encoding="utf-8")).get("upload_deployment")
+        except FileNotFoundError:
+            deployment = None
+        except (OSError, ValueError, AttributeError) as exc:
+            raise BridgeError("binding", f"无法读取工作区的上传绑定：{path}") from exc
+        if not deployment:
+            raise BridgeError("binding", f"此 MuMu 工作区尚未绑定上传平台：{path}")
+        deployment = identifier(deployment)
+        if requested is not None and requested != deployment:
+            raise BridgeError("binding", "此安排属于其他上传部署，请核对原单")
+        return deployment
+
     def current_clip(self, job, index):
         try:
             row = Queries(self.store.ledger).segment(job, index)
@@ -46,11 +62,24 @@ class SegmentUploads:
             raise BridgeError(exc.code, str(exc), exc.status) from None
         if row["status"] != "finished" or row["started_at"] is None:
             raise BridgeError("segment_unfinished", "只有已开录且已封口的正式切片可安排")
-        root = self.output_dir.resolve()
-        file = file_snapshot(row["file_path"], root)
-        if not Path(file["path"]).is_relative_to(root / job):
-            raise BridgeError("invalid_path", "正式录像位于其他录制任务目录")
-        return row, {"job_id": job, "segment_index": index, "file": file, "quality_flags": row["quality_flags"]}
+        location = recording_archive.location(self.store.ledger, job, index)
+        if location["archive_state"] != "archived" or location["status"] != "finished":
+            raise BridgeError("segment_unfinished", "切片尚未完成归档")
+        if not location["session_root"] or not location["recording_directory"]:
+            raise BridgeError("invalid_path", "找不到切片登记的录像根和场次目录")
+        root, directory = Path(location["session_root"]), Path(location["recording_directory"])
+        if (location["recording_root"] != str(root) or not root.is_dir()
+                or not recording_archive.stable(root) or not recording_archive.stable(directory)
+                or directory.parent.parent != root):
+            raise BridgeError("invalid_path", f"原录像根或场次目录不可用：{directory}")
+        expected = directory / f"{location['session_index']:03d}.mp4"
+        if location["archive_path"] != str(expected) or row["file_path"] != str(expected):
+            raise BridgeError("invalid_path", "切片路径与场次登记不符")
+        file = file_snapshot(str(expected), directory)
+        if [file["device"], file["file_id"], file["size"], file["mtime_ns"]] != json.loads(location["archive_identity"]):
+            raise BridgeError("segment_changed", "原安排的录像已变化，请核对")
+        return row, {"job_id": job, "segment_index": index, "file": file, "quality_flags": row["quality_flags"],
+                     "recording_root": str(root), "asset_root": str(directory), "session_index": location["session_index"]}
 
     def clip(self, job, index):
         return self.current_clip(job, index)[1]
@@ -58,7 +87,7 @@ class SegmentUploads:
     async def context(self, job, index, revise=None):
         self.require_writable()
         row, clip = await asyncio.to_thread(self.current_clip, job, index)
-        deployment = await self.core.binding()
+        deployment = await self.core.binding(self.expected_deployment())
         accounts = await self.core.accounts(deployment)
         records = await asyncio.to_thread(self.store.for_segments, [(job, index)])
         original = self.original(records, deployment, revise)
@@ -104,12 +133,13 @@ class SegmentUploads:
 
     def check_revision_source(self, original, saved, clip):
         if original["problem_code"] == "preview_expired" and (
-            saved["root"] != str(self.output_dir.resolve()) or saved["clips"][0]["file"] != clip["file"]
+            saved["recording_root"] != clip["recording_root"] or saved["asset_root"] != clip["asset_root"]
+            or saved["clips"][0]["file"] != clip["file"]
         ):
             raise BridgeError("segment_changed", "原安排的录像已变化，请核对")
 
     def draft(self, job, index, deployment, frozen, revise):
-        root = Path(frozen["root"])
+        root = Path(frozen["asset_root"])
         slot = (job, index, deployment, frozen["account"]["id"])
         with self.store.ledger.transaction() as db:
             records = list(for_segments(db, [(job, index)]))
@@ -143,27 +173,30 @@ class SegmentUploads:
                 raise BridgeError("stale_preview", "该切片的预览已变化，请重新预览")
             work_id = row["work_id"]
             manifest = manifest_for(root, work_id, frozen)
-            path, revision = save_manifest(root, work_id, manifest, row["config_version"])
+            path, revision = save_manifest(root, manifest, row["config_version"],
+                                           segment=frozen["clips"][0]["session_index"])
             db.execute("""UPDATE upload_drafts SET config_version=? WHERE
                 job_id=? AND segment_index=? AND deployment=? AND account_id=?""", (revision, *slot))
         return work_id, path, revision, manifest
 
     async def preview(self, job, index, deployment, account, params, revise=None):
         self.require_writable()
+        self.expected_deployment(deployment)
         if not params["title"] or any(not tag or "," in tag for tag in params["tags"]):
             raise BridgeError("invalid_metadata", "请填写标题和有效标签", 422)
         if (params["copyright"] == 2) != bool(params["source"]):
             raise BridgeError("invalid_metadata", "转载需填写来源，自制请留空", 422)
         account = await self.core.check_account(deployment, account)
         clip = await asyncio.to_thread(self.clip, job, index)
-        frozen = {"root": str(self.output_dir.resolve()), "clips": [clip], "account": account, "parameters": params}
+        frozen = {k: clip[k] for k in ("recording_root", "asset_root")} | {
+            "clips": [clip], "account": account, "parameters": params}
         try:
             work_id, path, revision, manifest = await asyncio.to_thread(
                 self.draft, job, index, deployment, frozen, revise
             )
         except OSError:
             raise BridgeError("manifest_write", "无法保存作品 YAML", 503) from None
-        data = await self.core.preview(deployment, {"manifest_path": path, "asset_root": frozen["root"]})
+        data = await self.core.preview(deployment, {"manifest_path": path, "asset_root": frozen["asset_root"]})
         platform_preview = identifier(data.get("preview_id"))
         warnings = data.get("warnings")
         if (data.get("work_id") != work_id or data.get("config_version") != revision
@@ -224,6 +257,7 @@ class SegmentUploads:
         if record := preview.get("record"):
             return public(await asyncio.to_thread(self.store.get, record))
         frozen = preview["frozen"]
+        self.expected_deployment(preview["deployment"])
         if frozen["clips"][0]["quality_flags"] and not quality_confirmed:
             raise BridgeError("quality_confirmation", "请先核对切片质量提示")
         original = await asyncio.to_thread(self.store.for_segments, [preview["part"]])
@@ -247,12 +281,14 @@ class SegmentUploads:
 
     def preflight(self, row):
         frozen = json.loads(row["frozen"])
-        root = self.output_dir.resolve()
-        if str(root) != frozen["root"]:
-            raise BridgeError("segment_changed", "录像输出目录已变化")
         for clip in frozen["clips"]:
-            if file_snapshot(clip["file"]["path"], root) != clip["file"]:
+            current = self.clip(clip["job_id"], clip["segment_index"])
+            if (current["recording_root"] != frozen["recording_root"] or current["asset_root"] != frozen["asset_root"]
+                    or current["session_index"] != clip["session_index"] or current["file"] != clip["file"]):
                 raise BridgeError("segment_changed", f"任务 {clip['job_id']} 第 {clip['segment_index']} 片已变化")
+        number = None if row["auto_target"] else frozen["clips"][0]["session_index"]
+        if str(manifest_path(Path(frozen["asset_root"]), number)) != row["manifest_path"]:
+            raise BridgeError("invalid_path", "作品 YAML 路径与场次登记不符")
         self.check_version(row["manifest_path"], row["config_version"])
 
     async def link(self, row, result):
@@ -281,6 +317,7 @@ class SegmentUploads:
             if not replay:
                 return row
             self.require_writable()
+            self.expected_deployment(row["deployment"])
             await asyncio.to_thread(self.preflight, row)
             await self.core.check_account(row["deployment"], json.loads(row["frozen"])["account"])
             self.require_writable()

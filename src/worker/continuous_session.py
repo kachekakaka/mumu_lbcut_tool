@@ -397,6 +397,11 @@ class ContinuousSession:
             scrcpy_exe=self.scrcpy,adb_exe=self.adb,ffmpeg_exe=self.media_tools.ffmpeg,
             segment_duration_sec=c.config.segment_duration_sec,
             start_index=start_index,total_duration_sec=self.remaining_duration() or 0)
+        if c.config.job_id and isinstance(self.pipe, ContinuousPipeline):
+            self.pipe.capture_identity = {
+                'job_id': c.config.job_id, 'run_id': c.run_id, 'room_id': c.target_room_id,
+                'anchor_uid': c.config.expected_anchor_uid, 'generation': c.current_generation_id,
+            }
         c._pipeline=self.pipe
         self.next_startup_probe=self.clock()
         self.pipe.wait_hook=self._startup_wait_tick
@@ -407,6 +412,11 @@ class ContinuousSession:
         if self.identity.status==IdentityStatus.VERIFIED and self.epoch in self.identity_risks:
             raise StartupSurfaceChanged('startup_identity_risk_boundary_reset')
         self.epoch_accepted=True
+        if getattr(self.pipe, 'capture_identity', None) and self.identity.status == IdentityStatus.VERIFIED:
+            with (self.pipe.directory / 'capture.verified').open('x', encoding='ascii') as stream:
+                stream.write(str(self.pipe.first_media_observed_at))
+                stream.flush()
+                os.fsync(stream.fileno())
         c.state_machine.transition_to(WorkerState.RECORDING)
         c.emitter.emit(CaptureSessionEvent(action='started',capture_pid=self.pipe._proc.pid,
             muxer_pid=self.pipe._mux.pid,generation_id=c.current_generation_id,
@@ -480,7 +490,7 @@ class ContinuousSession:
                 raise RuntimeError('segment_validation_backlog')
             row['submitted']=True
             row['final']=bool(final and f.index==latest)
-            target=c.task_output_dir/f'{c.target_room_id}_{c.run_id}_{f.index:06d}.mp4'
+            target=f.path if c.config.job_id else c.task_output_dir/f'{c.target_room_id}_{c.run_id}_{f.index:06d}.mp4'
             self.pending[f.index]=self.pool.submit(finalize_segment,f.path,target,
                 ffprobe_exe=self.media_tools.ffprobe,allow_short_tail=ending,timeout=8.0)
         self.collect()

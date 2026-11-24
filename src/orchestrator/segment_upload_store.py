@@ -39,7 +39,8 @@ def encode(value):
 def same_intent(first, second):
     def intent(frozen):
         return (
-            frozen["root"], frozen["parameters"], frozen["account"]["id"], frozen["account"]["remote_user_id"],
+            frozen["recording_root"], frozen["asset_root"], frozen["parameters"],
+            frozen["account"]["id"], frozen["account"]["remote_user_id"],
             [{k: clip[k] for k in ("job_id", "segment_index", "file", "quality_flags")} for clip in frozen["clips"]],
         )
     return intent(first) == intent(second)

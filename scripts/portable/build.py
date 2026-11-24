@@ -18,7 +18,6 @@ TEMPLATES = Path(__file__).resolve().parent
 ROOT = TEMPLATES.parents[1]
 DEV = ROOT.parent / "mumu_lbcut_tool_dev"
 PYTHON = "3.11.9"
-UPLOAD = "fileUploadPlatform-0.2.0-windows-x64-mumu-portable.4.zip"
 FFMPEG = "ffmpeg-9.0.2-full_build"
 SCRCPY = """scrcpy.exe scrcpy-server adb.exe AdbWinApi.dll AdbWinUsbApi.dll SDL3.dll
 avcodec-63.dll avformat-63.dll avutil-61.dll swresample-7.dll libusb-1.0.dll
@@ -87,7 +86,7 @@ def runtime(stage, work, embed, wheelhouse):
 
 
 def application(stage, work):
-    for name in git("ls-files", "-z", "--", "src", "web").split("\0"):
+    for name in git("ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", "src", "web").split("\0"):
         if not name:
             continue
         file = Path(name)
@@ -133,20 +132,22 @@ def main():
     parser.add_argument("--embed-zip", type=Path)
     parser.add_argument("--wheelhouse", type=Path)
     parser.add_argument("--tools-dir", type=Path, default=DEV / "tools")
+    parser.add_argument("--upload-zip", type=Path, help="同时制作含指定上传便携包的整合候选")
     args = parser.parse_args()
     if os.name != "nt" or sys.version_info[:2] != (3, 11) or struct.calcsize("P") != 8 or args.candidate < 1:
         parser.error("请使用 Windows x64 Python 3.11 和正数候选号")
     version = json.loads((ROOT / "web/package.json").read_text())["version"]
     name = f"mumu_lbcut_tool-{version}-windows-x64-portable-test.{args.candidate}"
     dist = DEV / "mumu_lbcut_tool_dists"
-    output = dist / (name + ".zip")
+    output = dist / (name + ("-combined" if args.upload_zip else "") + ".zip")
     if output.exists():
         raise FileExistsError(f"候选已存在，请使用新的编号：{output}")
     temp = DEV / "mumu_lbcut_tool_tmp"
     temp.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(dir=temp, prefix=f"T24-build-{args.candidate}-"))
-    stage = work / name
-    stage.mkdir()
+    package = work / ("MuMu录播与上传" if args.upload_zip else name)
+    stage = package / "录播" if args.upload_zip else package
+    stage.mkdir(parents=True)
     print(f"构建目录 {work}", flush=True)
     dependencies = runtime(stage, work, args.embed_zip, args.wheelhouse)
     application(stage, work)
@@ -167,9 +168,21 @@ def main():
                 "working_tree_dirty": bool(git("status", "--porcelain")), "build_input_changes": status.splitlines(),
                 "frontend": "web/package-lock.json / npm ci / npm run build", "python": PYTHON,
                 "dependencies": dependencies, "scrcpy": "5.0.1", "ffmpeg": "9.0.2-full_build-www.gyan.dev",
-                "upload_package": UPLOAD}
+                "upload_package": args.upload_zip.name if args.upload_zip else None}
     (stage / "release.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    archive_package(stage, work / output.name)
+    if args.upload_zip:
+        upload_stage = work / "upload-input"
+        with zipfile.ZipFile(args.upload_zip) as archive:
+            unpack(archive, upload_stage)
+        (upload,) = upload_stage.iterdir()
+        if not all((upload / path).is_file() for path in (
+            "runtime/pythonw.exe", "release.json", "启动上传平台.cmd",
+        )):
+            raise ValueError(f"上传 ZIP 不是完整的 Windows 便携包：{args.upload_zip}")
+        upload.rename(package / "上传")
+        text = (TEMPLATES / "启动MuMu.cmd").read_text(encoding="ascii")
+        (package / "启动MuMu.cmd").write_bytes(text.replace("\n", "\r\n").encode("ascii"))
+    archive_package(package, work / output.name)
     dist.mkdir(parents=True, exist_ok=True)
     # 临时目录与产物目录位于同一仓外工作盘。Windows rename 拒绝覆盖并发构建的同名成品。
     (work / output.name).rename(output)

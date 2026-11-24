@@ -12,6 +12,8 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
+from urllib.request import ProxyHandler, build_opener
 import uuid
 
 
@@ -20,7 +22,7 @@ WEB = BUNDLE / "app" / "web" / "dist"
 DB_NAME = "orchestrator.sqlite3"
 
 
-def choose_recordings():
+def choose_directory(title):
     """用 Windows 自带的文件夹选择器，返回用户选定的已有目录。"""
     class BrowseInfo(ctypes.Structure):
         _fields_ = [("hwndOwner", wintypes.HWND), ("pidlRoot", ctypes.c_void_p),
@@ -39,7 +41,7 @@ def choose_recordings():
     try:
         display = ctypes.create_unicode_buffer(260)
         info = BrowseInfo(pszDisplayName=ctypes.cast(display, wintypes.LPWSTR),
-                          lpszTitle="选择存放录像的文件夹（请选择便携包以外的位置）",
+                          lpszTitle=title,
                           ulFlags=0x01 | 0x40 | 0x10)
         item = shell.SHBrowseForFolderW(ctypes.byref(info))
         if not item:
@@ -83,42 +85,115 @@ def check_tools():
             raise FileNotFoundError(f"缺少网页资源 {file}")
 
 
-def writable_recordings(path, home):
-    if not path.is_absolute():
-        raise ValueError(f"录像目录需要绝对路径：{path}")
-    path = path.resolve()
-    if path.is_relative_to(BUNDLE) or path.is_relative_to(home):
-        raise ValueError(f"请将录像保存在程序和运行数据目录之外：{path}")
-    if not path.is_dir():
-        raise FileNotFoundError(f"原录像目录不可用，请连接原磁盘：{path}")
-    probe = path / (".mumu-write-" + uuid.uuid4().hex)
+def atomic_settings(path, value):
+    temporary = path.with_name("." + path.name + "-" + uuid.uuid4().hex)
     try:
-        # Windows 上 tempfile 可能将目录拒写反复当成重名，一次独占创建即可验证。
-        handle = probe.open("xb")
-        try:
-            with handle:
-                handle.write(b"\0")
-        finally:
-            probe.unlink()
+        with temporary.open("x", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
     except OSError as exc:
-        raise OSError(f"无法写入录像目录：{path}") from exc
-    return path
+        raise OSError(f"无法保存设置 {path}：{exc}") from exc
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
-def recordings_for(home):
+def absolute_directory(path):
+    value = Path(path)
+    if not value.is_absolute() or value.drive.startswith("\\\\") or value.resolve() != value:
+        raise ValueError(f"请选择直接指向本地目录的绝对路径：{path}")
+    return value
+
+
+def overlaps(path, *others):
+    return any(path.is_relative_to(other) or other.is_relative_to(path) for other in others)
+
+
+def probe_directory(path, *, hardlink=False):
+    source = path / (".mumu-write-" + uuid.uuid4().hex)
+    target = source.with_suffix(".link")
+    created = linked = False
+    try:
+        with source.open("xb") as stream:
+            created = True
+            stream.write(b"\0")
+        if hardlink:
+            os.link(source, target)
+            linked = True
+            try:
+                os.link(source, target)
+            except FileExistsError:
+                pass
+            else:
+                raise OSError("此卷无法保证无覆盖归档")
+    except OSError as exc:
+        raise OSError(f"无法在此目录写入或无覆盖归档 {path}：{exc}") from exc
+    finally:
+        if linked:
+            target.unlink()
+        if created:
+            source.unlink()
+
+
+def read_settings(path):
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            raise ValueError("需要 JSON 对象")
+        return value
+    except (ValueError, OSError) as exc:
+        raise ValueError(f"请恢复原设置文件 {path}：{exc}") from exc
+
+
+def choose_workspace(default):
+    answer = ctypes.WinDLL("user32").MessageBoxW(
+        None, f"使用默认工作目录？\n{default}\n\n是：使用默认目录\n否：选择其他目录",
+        "MuMu 工作目录", 0x23)
+    if answer == 6:
+        return default
+    if answer == 7:
+        return choose_directory("选择 MuMu 工作目录")
+    return None
+
+
+def workspace_for(bundle, home, recordings_override=None):
     from src.orchestrator.storage import SCHEMA_VERSION, Store
-    data = home / "data"
+    pointer = bundle / "workspace.json"
+    if pointer.is_symlink():
+        raise ValueError(f"工作目录指针必须在启动器旁：{pointer}")
+    saved_pointer = pointer.exists()
+    default = bundle.parent / "mumu_lbcut_tool_dev"
+    if saved_pointer:
+        saved = read_settings(pointer)
+        if set(saved) != {"dataDirectory"} or not isinstance(saved["dataDirectory"], str):
+            raise ValueError(f"工作目录指针损坏，请恢复 {pointer}")
+        try:
+            workspace = absolute_directory(saved["dataDirectory"])
+        except ValueError as exc:
+            raise ValueError(f"工作目录指针损坏 {pointer}：{exc}") from exc
+        if not workspace.is_dir():
+            raise FileNotFoundError(f"原工作目录不可用，请连接原磁盘：{workspace}")
+    else:
+        workspace = choose_workspace(default)
+        if workspace is None:
+            return None
+        workspace = absolute_directory(workspace)
+        probe_directory(bundle)
+    if overlaps(workspace, bundle, home):
+        raise ValueError(f"工作目录和程序或本机启动锁目录重叠：{workspace}")
+    data = absolute_directory(workspace / "runtime-console-unified")
+    upload = absolute_directory(workspace / "upload-platform")
     settings = data / "settings.json"
     db = data / DB_NAME
-    if data.exists():
-        try:
-            saved = json.loads(settings.read_text(encoding="utf-8"))["recordings"]
-            if not isinstance(saved, str) or not saved:
-                raise ValueError("缺少录像路径")
-        except (KeyError, TypeError, ValueError, OSError) as exc:
-            raise ValueError(f"请恢复原设置文件 {settings}：{exc}") from exc
-        path = writable_recordings(Path(saved), home)
-        if not db.is_file():
+    existing = saved_pointer or data.exists()
+    if existing and (settings.resolve() != settings or db.resolve() != db):
+        raise ValueError(f"原调度设置或数据库指向其他位置：{settings}，{db}")
+    values = read_settings(settings) if existing else {}
+    if existing:
+        if not isinstance(values.get("recordings"), str):
+            raise ValueError(f"原设置缺少录像路径，请恢复 {settings}")
+        if not db.is_file() or not db.stat().st_size:
             raise FileNotFoundError(f"原调度数据库丢失，请恢复 {db}")
         try:
             with closing(sqlite3.connect(db.as_uri() + "?mode=ro", uri=True)) as conn:
@@ -128,25 +203,82 @@ def recordings_for(home):
                 raise ValueError(f"要求 v{SCHEMA_VERSION} 的调度数据库")
         except (ValueError, sqlite3.Error) as exc:
             raise ValueError(f"原调度数据库不可用 {db}：{exc}") from exc
-        return path
-    selected = choose_recordings()
-    if selected is None:
-        return None
-    path = writable_recordings(selected, home)
-    # 设置与已关闭的首个数据库一同就位，中途失败可重新选择。
-    with tempfile.TemporaryDirectory(dir=home) as tmp:
-        stage = Path(tmp) / "data"
-        store = Store(stage / DB_NAME)
-        store.close()
-        (stage / "settings.json").write_text(
-            json.dumps({"recordings": str(path)}, ensure_ascii=False, indent=2), encoding="utf-8")
-        stage.rename(data)
-    return path
+    path = absolute_directory(recordings_override or values.get("recordings") or workspace / "recordings")
+    if overlaps(path, bundle, data, upload, home):
+        raise ValueError(f"录像根与程序、录播或上传数据目录重叠：{path}")
+    workspace.mkdir(parents=True, exist_ok=True)
+    if path == workspace / "recordings" and not existing:
+        path.mkdir(exist_ok=True)
+    if not path.is_dir():
+        raise FileNotFoundError(f"录像目录不可用，请连接磁盘或检查设置：{path}")
+    probe_directory(workspace)
+    probe_directory(path, hardlink=True)
+    if not existing:
+        # 设置与首个数据库一同就位，保留已存在的数据目录。
+        with tempfile.TemporaryDirectory(dir=workspace) as tmp:
+            stage = Path(tmp) / "data"
+            Store(stage / DB_NAME).close()
+            atomic_settings(stage / "settings.json", {"recordings": str(path)})
+            stage.rename(data)
+    else:
+        probe_directory(data)
+        if str(path) != values["recordings"]:
+            atomic_settings(settings, {**values, "recordings": str(path)})
+    if not saved_pointer:
+        atomic_settings(pointer, {"dataDirectory": str(workspace)})
+    return data, upload, path
+
+
+def start_upload(bundle, data, settings):
+    upload_bundle = bundle / "上传"
+    runtime = upload_bundle / "runtime/pythonw.exe"
+    values = read_settings(settings)
+    expected = values.get("upload_deployment")
+    if expected is not None and (not isinstance(expected, str) or str(uuid.UUID(expected, version=4)) != expected):
+        raise ValueError(f"上传部署编号损坏，请恢复 {settings}")
+    args = [str(runtime), "-B", "-X", "utf8", "-m", "upload_platform.portable_window",
+            "--bundle", str(upload_bundle), "--data-dir", str(data)]
+    if expected:
+        args += ["--expected-deployment", expected]
+    env = {key: value for key, value in os.environ.items() if not key.upper().startswith("PYTHON")}
+    process = subprocess.Popen(args, cwd=upload_bundle, env=env)
+    home = Path(os.environ["LOCALAPPDATA"]) / "fileUploadPlatform" / "MuMu"
+    opener = build_opener(ProxyHandler({}))
+    until = time.monotonic() + 45
+    while time.monotonic() < until and process.poll() is None:
+        try:
+            with opener.open("http://127.0.0.1:8765/api/v1/system/health", timeout=1) as response:
+                health = json.load(response)
+            deployment = health["deployment_id"]
+            if (not isinstance(deployment, str) or str(uuid.UUID(deployment, version=4)) != deployment
+                    or expected and expected != deployment):
+                raise ValueError(f"本机上传平台正在使用其他部署，请核对：{data}")
+            server, worker = (json.loads((home / (role + ".json")).read_text(encoding="utf-8"))
+                              for role in ("server", "worker"))
+            if not all(isinstance(record, dict) for record in (server, worker)):
+                raise ValueError(f"上传平台启动记录损坏：{home}")
+            for record in (server, worker):
+                if record.get("deployment_id") == deployment and Path(record.get("data") or "") != data:
+                    raise ValueError(f"上传平台数据目录冲突：{record.get('data')}\n请求目录：{data}")
+            if (health.get("api") == health.get("database") == "ready"
+                    and all(record.get("deployment_id") == deployment and Path(record.get("data") or "") == data
+                            for record in (server, worker))
+                    and any(row["active"] and row["id"] == worker["worker_id"] and row["pid"] == worker["pid"]
+                            for row in health["workers"])):
+                if not expected:
+                    atomic_settings(settings, {**values, "upload_deployment": deployment})
+                return
+        except (OSError, KeyError, json.JSONDecodeError):
+            pass
+        time.sleep(.25)
+    raise RuntimeError(f"上传平台未就绪，请查看上传启动窗口\n上传数据目录：{data}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="MuMu 便携录播")
     parser.add_argument("action", choices=("check", "start"))
+    parser.add_argument("--combined", action="store_true")
+    parser.add_argument("--recordings-dir", type=Path, help="专用录像根，需要已存在的绝对路径")
     parser.add_argument("--segment-duration", type=int, default=1800, help="每片秒数，默认 1800")
     args = parser.parse_args()
     if args.segment_duration < 1:
@@ -163,17 +295,25 @@ def main():
             print(f"环境自检通过。控制台 {server.SERVICE_VERSION}，采集工具和网页就绪。")
             return 0
         home = Path(os.environ["LOCALAPPDATA"]).resolve() / "MuMuLBCut"
-        if home.is_relative_to(BUNDLE):
-            raise ValueError(f"运行数据目录位于解压目录内，请另选解压位置：{home}")
+        bundle = BUNDLE.parent if args.combined or (
+            BUNDLE.name == "录播" and (BUNDLE.parent / "启动MuMu.cmd").is_file()) else BUNDLE
+        if overlaps(home, bundle):
+            raise ValueError(f"本机启动锁目录与解压目录重叠，请另选解压位置：{home}")
         with closing(HostLease(home / "portable.lock")):
-            output = recordings_for(home)
-            if output is None:
-                print("已取消选择录像目录。")
+            workspace = workspace_for(bundle, home, args.recordings_dir)
+            if workspace is None:
+                print("已取消选择工作目录。")
                 return 0
+            data, upload, output = workspace
+            if args.combined:
+                try:
+                    start_upload(bundle, upload, data / "settings.json")
+                except (OSError, RuntimeError, ValueError, TypeError) as exc:
+                    print(f"上传平台暂不可用：{exc}", file=sys.stderr)
             os.environ["MUMU_LBCUT_INSTANCE_LOCK_DIR"] = str(home / "instance-locks")
-            print(f"录像目录 {output}\n运行数据 {home / 'data'}\n"
+            print(f"录像目录 {output}\n运行数据 {data}\n"
                   "控制台 http://127.0.0.1:8000/\n按 Ctrl+C 平滑停止，等待尾片保存。", flush=True)
-            return run(["run", "--data-dir", str(home / "data"), "--output-dir", str(output),
+            return run(["run", "--data-dir", str(data), "--output-dir", str(output),
                         "--static-root", str(WEB), "--open-browser", "--require-local-tools",
                         "--segment-duration", str(args.segment_duration)])
     except (OSError, ValueError, RuntimeError, KeyError, ImportError, subprocess.SubprocessError) as exc:

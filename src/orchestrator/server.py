@@ -45,6 +45,9 @@ class ServerConfig:
         from src.worker.room_locator import validate_navigation_timeout
         import math
         validate_navigation_timeout(self.navigation_timeout)
+        data, media = self.data_dir.resolve(), self.output_dir.resolve()
+        if media.is_relative_to(data) or data.is_relative_to(media):
+            raise ValueError(f"录像根与调度数据目录重叠：{media}，{data}")
         if (self.instances is not None and (not self.instances or any(i < 0 for i in self.instances))) or not 1 <= self.port <= 65535:
             raise ValueError("实例编号或端口非法")
         if not all(math.isfinite(v) for v in (self.scan_interval, self.navigation_timeout, self.max_runtime)) or self.scan_interval <= 0 or self.segment_duration <= 0 or self.max_runtime < 0:

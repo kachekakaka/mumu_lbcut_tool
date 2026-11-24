@@ -17,8 +17,9 @@ from src.orchestrator.server import ServerConfig, create_app
 from src.orchestrator.storage import Store
 from src.orchestrator.upload_manifest import manifest_path, version
 from src.orchestrator.upload_platform import BridgeError
-from test_session_deliveries import FIELDS, STARTED, add_job, finish_clip, room, start_clip
-from upload_platform_fixture import Platform
+from src.orchestrator import recording_archive
+from test_session_deliveries import FIELDS, STARTED, add_job, binding_settings, capture, finish_clip, room, start_clip
+from upload_platform_fixture import DEPLOYMENT, Platform
 
 
 ORIGIN = "http://127.0.0.1:8000"
@@ -33,9 +34,12 @@ def host(tmp_path):
     store = Store(data / "orchestrator.sqlite3")
     target = store.add_target("live-a")
     job = add_job(store, target, room("测试"), STARTED - 1)
-    clip = root / job / "000001.mp4"
+    clip = capture(store, job, root) / "part_000001.mp4"
     start_clip(store, job, 1, clip, STARTED)
     finish_clip(store, job, 1, clip, STARTED + 2)
+    recording_archive.publish(store)
+    clip = Path(recording_archive.location(store, job, 1)["file_path"])
+    binding_settings(data)
     platform = Platform()
 
     def app():
@@ -82,6 +86,8 @@ def test_preview_only_writes_yaml_and_repeat_confirmation_links_one_task(host):
         path = platform.trace[1][2]
         assert Path(path["manifest_path"]).is_file()
         saved = store.row("SELECT * FROM deliveries")
+        assert Path(saved["manifest_path"]) == clip.parent / "投稿/001/upload.yaml"
+        assert platform.trace[0][2]["asset_root"] == str(clip.parent)
         assert saved["config_version"] == version(Path(saved["manifest_path"]).read_bytes())
         result = browser.get(UPLOADS + "/panel", params={"page": "tasks", "task_id": accepted["task_id"]})
         assert result.status_code == 200
@@ -142,7 +148,7 @@ def test_tampered_yaml_invalidates_preview_without_rewriting_file(host, change):
         elif change == "unknown":
             modified = content + b"unknown_option: true\n"
         else:
-            relative = f"{job}/000001.mp4".encode()
+            relative = b"001.mp4"
             assert relative in content
             modified = content.replace(relative, b"../outside.mp4")
         path.write_bytes(modified)
@@ -170,7 +176,7 @@ def test_accepted_manual_request_recovers_without_yaml_or_resubmit(host):
         assert current["task_id"] == platform.tasks[row["request_key"]][1]["task_ids"][0]
         assert [entry[0] for entry in platform.trace] == ["PREVIEW", "POST", "GET"]
         with pytest.raises(BridgeError, match="未完成"):
-            asyncio.run(platform.client.bound_request("A", "/submissions", body={"preview_id": current["task_id"]},
+            asyncio.run(platform.client.bound_request(DEPLOYMENT, "/submissions", body={"preview_id": current["task_id"]},
                                                       key=row["request_key"]))
 
 
@@ -272,8 +278,33 @@ def test_manifest_directory_cannot_point_outside_output_root(tmp_path):
     if os.name == "nt":
         subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-CommandWithArgs",
                         "New-Item -ItemType Junction -Path $args[0] -Target $args[1] | Out-Null",
-                        str(root / "sessions"), str(other)], check=True)
+                        str(root / "投稿"), str(other)], check=True)
     else:
-        (root / "sessions").symlink_to(other, target_is_directory=True)
+        (root / "投稿").symlink_to(other, target_is_directory=True)
     with pytest.raises(BridgeError, match="越界"):
-        manifest_path(root, "id")
+        manifest_path(root, 1)
+
+
+def test_preflight_rejects_frozen_neighbor_with_same_filename(host):
+    client, platform, store, job, clip = host
+
+    async def offline(request):
+        raise httpx.ConnectError("模拟平台未收到请求", request=request)
+
+    platform.on_submit = offline
+    with client() as browser:
+        stage = preview(browser, platform, job).json()
+        record = confirm(browser, stage).json()
+    neighbor = clip.parent.with_name(clip.parent.name + "-2")
+    neighbor.mkdir()
+    (neighbor / clip.name).write_bytes(clip.read_bytes())
+    row = store.row("SELECT * FROM deliveries WHERE id=?", (record["id"],))
+    snapshot = json.loads(row["frozen"])
+    snapshot["clips"][0]["file"]["path"] = str(neighbor / clip.name)
+    with store.transaction() as db:
+        db.execute("UPDATE deliveries SET frozen=? WHERE id=?", (json.dumps(snapshot), row["id"]))
+    platform.on_submit = None
+    with client() as browser:
+        result = browser.post(f"{BASE}/{row['id']}/continue", json={}).json()
+        assert "已变化" in result["problem"]
+    assert not platform.tasks and [r[0] for r in platform.trace].count("POST") == 1

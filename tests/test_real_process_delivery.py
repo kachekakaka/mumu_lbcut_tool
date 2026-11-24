@@ -11,11 +11,31 @@ import pytest
 from src.orchestrator.models import WorkerLaunchSpec
 from src.orchestrator.worker_process import WorkerProcessHandle, EventStreamIncomplete
 
-CHILD = r'''
+CAPTURE_FIXTURE = r'''
+def clip_path(a, root):
+    if root.parent.name != '_录制中':
+        return root / 'fixture.mp4', 'fixture-run'
+    run = 'run_1_' + a.job_id
+    directory = root / run / ('capture_' + a.job_id)
+    directory.mkdir(parents=True)
+    stamp = time.time()
+    (directory / 'capture.json').write_text(json.dumps({
+        'job_id': a.job_id, 'run_id': run, 'room_id': a.target,
+        'anchor_uid': a.expected_anchor_uid, 'directory': str(directory),
+        'generation': 1, 'start_index': 1, 'pattern': 'part_%06d.mp4',
+        'registered_at': stamp,
+    }), encoding='utf-8')
+    (directory / 'capture.verified').write_text(str(stamp), encoding='ascii')
+    return directory / 'part_000001.mp4', run
+'''
+
+CHILD = CAPTURE_FIXTURE + r'''
 import argparse, json, pathlib, shutil, signal, sys, time
 p = argparse.ArgumentParser()
 p.add_argument('--output-dir', required=True)
 p.add_argument('--job-id', default='fixture')
+p.add_argument('--target')
+p.add_argument('--expected-anchor-uid')
 p.add_argument('--media', required=True)
 p.add_argument('--stress', action='store_true')
 a, _ = p.parse_known_args()
@@ -29,12 +49,13 @@ if hasattr(signal, 'SIGBREAK'):
     signal.signal(signal.SIGBREAK, handle)
 root = pathlib.Path(a.output_dir)
 root.mkdir(parents=True, exist_ok=True)
-output = root / 'fixture.mp4'
+output, run = clip_path(a, root)
 def emit(kind, **fields):
     global seq
     seq += 1
     print(json.dumps(dict(event=kind, event_id=str(seq), job_id=a.job_id,
-                          run_id='fixture-run', event_seq=seq, **fields)), flush=True)
+                          run_id=run, event_seq=seq, timestamp=time.time(),
+                          room_identity_status='verified', **fields)), flush=True)
 emit('worker_started', pid=__import__('os').getpid())
 emit('segment_started', segment_index=1, file_path=str(output))
 if a.stress:
@@ -51,18 +72,18 @@ emit('worker_stopped', exit_code=0, reason='stop_requested')
 '''
 
 
-RESTART_WORKER = r'''
-import argparse, os, pathlib, shutil, signal, time
+RESTART_WORKER = CAPTURE_FIXTURE + r'''
+import argparse, json, os, pathlib, shutil, signal, time
 from src.worker.events import (WorkerEventEmitter, WorkerStartedEvent, HeartbeatEvent,
     SegmentStartedEvent, SegmentFinishedEvent, SegmentQualityWarningEvent, WorkerStoppedEvent)
 p = argparse.ArgumentParser()
-for flag in ('job-id', 'target', 'event-log', 'output-dir'):
+for flag in ('job-id', 'target', 'expected-anchor-uid', 'event-log', 'output-dir'):
     p.add_argument('--' + flag, required=True)
 a, _ = p.parse_known_args()
 gate = pathlib.Path(os.environ['LEDGER_TEST_GATE'])
 root = pathlib.Path(a.output_dir)
 root.mkdir(parents=True)
-path = root / 'finished.mp4'
+path, run = clip_path(a, root)
 stop = False
 def stopped(*_):
     global stop
@@ -71,7 +92,7 @@ signal.signal(signal.SIGINT, stopped)
 if hasattr(signal, 'SIGBREAK'):
     signal.signal(signal.SIGBREAK, stopped)
 emitter = WorkerEventEmitter(fallback_path=a.event_log, on_stream_lost=lambda: (root/'pipe-lost').touch())
-emitter.set_context(job_id=a.job_id, run_id='run-' + a.job_id)
+emitter.set_context(job_id=a.job_id, run_id=run, room_identity_status='verified')
 emitter.emit(WorkerStartedEvent())
 emitter.emit(SegmentStartedEvent(segment_index=1, file_path=str(path)))
 original = a.target.endswith('11')
@@ -176,7 +197,7 @@ def test_restart_holds_pidless_worker_through_replay_and_settlement(tmp_path, mo
         assert inspect_job_process(old) == 'alive'
         host.kill()
         host.wait(10)
-        wait_for(lambda: (output / old['id'] / 'pipe-lost').exists())
+        wait_for(lambda: (output / '_录制中' / old['id'] / 'pipe-lost').exists())
         assert owned.is_running()
         store = Store(state)
         slots = [1001, 1002]
@@ -375,8 +396,11 @@ def install_child_boundary(monkeypatch, tmp_path, media, stress=False):
     script.write_text(CHILD, encoding='utf-8')
     real_popen = subprocess.Popen
     def spawn(cmd, **kwargs):
-        if len(cmd) > 3 and cmd[2:4] == ['-m', 'src.worker.cli']:
-            cmd = [sys.executable, '-u', str(script), '--media', str(media)] + (['--stress'] if stress else []) + cmd[4:]
+        for index, pair in enumerate(zip(cmd, cmd[1:])):
+            if pair == ('-m', 'src.worker.cli'):
+                fixture_args = ['--media', str(media), *(['--stress'] if stress else [])]
+                cmd = [*cmd[:index], str(script), *fixture_args, *cmd[index + 2:]]
+                break
         return real_popen(cmd, **kwargs)
     monkeypatch.setattr('src.orchestrator.worker_process.subprocess.Popen', spawn)
 

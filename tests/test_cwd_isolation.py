@@ -450,12 +450,12 @@ def test_desktop_file_manager_windows_system_dir():
 
     with patch("platform.system", return_value="Windows"), \
          patch("subprocess.Popen", side_effect=mock_popen):
-        reveal_in_file_manager(target, is_file=True)
+        reveal_in_file_manager(target, is_file=False)
 
         assert len(captured_popens) == 1
         cmd, cwd = captured_popens[0]
         assert cmd[0] == "explorer.exe"
-        assert f"/select,{expected_target}" in cmd[1]
+        assert cmd[1] == str(expected_target)
         assert cwd is not None
         # 验证 cwd 是系统 Windows 目录
         sys_dir = get_windows_system_dir()

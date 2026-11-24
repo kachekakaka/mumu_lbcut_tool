@@ -4,7 +4,9 @@ import subprocess
 from scripts.check_docs import check
 
 
-def test_working_tree_links(tmp_path, capsys):
+def test_working_tree_links(tmp_path, capsys, monkeypatch):
+    # 临时 Git 仓库无需宿主进程注入的命令行配置。
+    monkeypatch.delenv("GIT_CONFIG_COUNT", raising=False)
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
     target = tmp_path / "说明.md"
     target.write_text("# 使用 方法\n## 使用 方法\n", encoding="utf8")

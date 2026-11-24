@@ -7,6 +7,7 @@ const emit = defineEmits<{ accountUpdated: [id: string]; taskUpdated: [id: strin
 const frame = ref<HTMLIFrameElement>()
 const loading = ref(false)
 const available = ref(false)
+const deployment = ref('')
 const error = ref('')
 const local = onLocalConsole()
 const validId = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/
@@ -14,7 +15,8 @@ const protocol = 'upload-platform-embed'
 let generation = 0
 let ready = false
 let deadline: ReturnType<typeof setTimeout> | undefined
-const url = computed(() => PLATFORM_ORIGIN + '/embed/' + props.page + (props.taskId ? '/' + props.taskId : ''))
+const url = computed(() => PLATFORM_ORIGIN + '/embed/' + props.page +
+  (props.taskId ? '/' + props.taskId : '') + '?deployment=' + encodeURIComponent(deployment.value))
 
 async function open() {
   clearTimeout(deadline)
@@ -31,8 +33,10 @@ async function open() {
   try {
     const query = new URLSearchParams({ page: props.page })
     if (props.taskId) query.set('task_id', props.taskId)
-    await request('/panel?' + query)
+    const panel = await request<{ deployment: string }>('/panel?' + query)
     if (current !== generation) return
+    if (!validId.test(panel.deployment)) throw new Error('上传平台没有可核对的工作区绑定')
+    deployment.value = panel.deployment
     available.value = true
     deadline = setTimeout(() => {
       if (!ready && current === generation) {

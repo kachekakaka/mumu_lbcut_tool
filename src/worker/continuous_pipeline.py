@@ -10,6 +10,7 @@ import csv
 import ctypes
 import ctypes.wintypes as W
 import io
+import json
 import math
 import logging
 import os
@@ -183,11 +184,19 @@ class ContinuousPipeline:
         self.manifest_rebuilt = False
         self.current_file_path = None
         self.current_segment_index = 0
+        self.capture_identity = None
 
     def start(self, timeout_sec=25):
         if self._proc or self._mux:
             raise RuntimeError('连续采集实例不可重用')
         self.directory.mkdir(parents=True, exist_ok=False)
+        if self.capture_identity:
+            with (self.directory / 'capture.json').open('x', encoding='utf-8') as stream:
+                json.dump({**self.capture_identity, 'directory': str(self.directory),
+                           'start_index': self.start_index, 'pattern': 'part_%06d.mp4',
+                           'registered_at': time.time()}, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
         self.bridge = NamedPipeBridge(self.output_dir.parent.name)
         flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0
         self._mux_log = (self.directory/'segmenter.stderr.log').open('xb')
